@@ -29,12 +29,12 @@ watchlist_service = WatchlistService()
 
 
 @strategies_router.get("", response_model=list[StrategyRead])
-def list_strategies(session: Session = Depends(get_db_session)) -> list[StrategyRead]:
+async def list_strategies(session: Session = Depends(get_db_session)) -> list[StrategyRead]:
     return strategy_service.list_strategies(session)
 
 
 @strategies_router.post("", response_model=StrategyRead, status_code=status.HTTP_201_CREATED)
-def create_strategy(payload: StrategyCreate, session: Session = Depends(get_db_session)) -> StrategyRead:
+async def create_strategy(payload: StrategyCreate, session: Session = Depends(get_db_session)) -> StrategyRead:
     try:
         return strategy_service.create_strategy(session, payload)
     except DuplicateResourceError as exc:
@@ -44,7 +44,7 @@ def create_strategy(payload: StrategyCreate, session: Session = Depends(get_db_s
 
 
 @strategies_router.post("/{strategy_id}/versions", response_model=StrategyVersionRead, status_code=status.HTTP_201_CREATED)
-def create_strategy_version(
+async def create_strategy_version(
     strategy_id: int,
     payload: StrategyVersionCreate,
     session: Session = Depends(get_db_session),
@@ -56,12 +56,12 @@ def create_strategy_version(
 
 
 @screeners_router.get("", response_model=list[ScreenerRead])
-def list_screeners(session: Session = Depends(get_db_session)) -> list[ScreenerRead]:
+async def list_screeners(session: Session = Depends(get_db_session)) -> list[ScreenerRead]:
     return screener_service.list_screeners(session)
 
 
 @screeners_router.post("", response_model=ScreenerRead, status_code=status.HTTP_201_CREATED)
-def create_screener(payload: ScreenerCreate, session: Session = Depends(get_db_session)) -> ScreenerRead:
+async def create_screener(payload: ScreenerCreate, session: Session = Depends(get_db_session)) -> ScreenerRead:
     try:
         return screener_service.create_screener(session, payload)
     except DuplicateResourceError as exc:
@@ -71,7 +71,7 @@ def create_screener(payload: ScreenerCreate, session: Session = Depends(get_db_s
 
 
 @screeners_router.post("/{screener_id}/versions", response_model=ScreenerVersionRead, status_code=status.HTTP_201_CREATED)
-def create_screener_version(
+async def create_screener_version(
     screener_id: int,
     payload: ScreenerVersionCreate,
     session: Session = Depends(get_db_session),
@@ -83,12 +83,12 @@ def create_screener_version(
 
 
 @watchlists_router.get("", response_model=list[WatchlistRead])
-def list_watchlists(session: Session = Depends(get_db_session)) -> list[WatchlistRead]:
+async def list_watchlists(session: Session = Depends(get_db_session)) -> list[WatchlistRead]:
     return watchlist_service.list_watchlists(session)
 
 
 @watchlists_router.post("", response_model=WatchlistRead, status_code=status.HTTP_201_CREATED)
-def create_watchlist(payload: WatchlistCreate, session: Session = Depends(get_db_session)) -> WatchlistRead:
+async def create_watchlist(payload: WatchlistCreate, session: Session = Depends(get_db_session)) -> WatchlistRead:
     try:
         return watchlist_service.create_watchlist(session, payload)
     except DuplicateResourceError as exc:
@@ -98,7 +98,7 @@ def create_watchlist(payload: WatchlistCreate, session: Session = Depends(get_db
 
 
 @watchlists_router.post("/{watchlist_id}/items", response_model=WatchlistItemRead, status_code=status.HTTP_201_CREATED)
-def add_watchlist_item(
+async def add_watchlist_item(
     watchlist_id: int,
     payload: WatchlistItemCreate,
     session: Session = Depends(get_db_session),

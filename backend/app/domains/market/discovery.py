@@ -36,11 +36,7 @@ class OpportunityDiscoveryService:
         benchmark = self.market_data_service.get_snapshot(self.settings.benchmark_ticker)
         discovered_items = 0
         top_candidates: list[dict] = []
-        tracked_tickers = {
-            item.ticker.upper()
-            for watchlist in watchlists
-            for item in watchlist.items
-        }
+        tracked_tickers = {item.ticker.upper() for watchlist in watchlists for item in watchlist.items}
 
         open_tickers = {
             ticker.upper()

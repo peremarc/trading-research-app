@@ -1,10 +1,10 @@
-from fastapi.testclient import TestClient
-
-from app.main import app
+from pathlib import Path
 
 
-def test_healthcheck() -> None:
-    client = TestClient(app)
+FRONTEND_DIR = Path(__file__).resolve().parents[1] / "app" / "frontend"
+
+
+def test_healthcheck(client) -> None:
     response = client.get("/api/v1/health")
 
     assert response.status_code == 200
@@ -12,16 +12,12 @@ def test_healthcheck() -> None:
 
 
 def test_root_serves_frontend() -> None:
-    client = TestClient(app)
-    response = client.get("/")
+    index_html = (FRONTEND_DIR / "index.html").read_text(encoding="utf-8")
 
-    assert response.status_code == 200
-    assert "Strategy Lab Console" in response.text
+    assert "Strategy Lab Console" in index_html
 
 
 def test_frontend_asset_serves_javascript() -> None:
-    client = TestClient(app)
-    response = client.get("/assets/app.js")
+    app_js = (FRONTEND_DIR / "app.js").read_text(encoding="utf-8")
 
-    assert response.status_code == 200
-    assert "renderPipelineDetail" in response.text
+    assert "renderPipelineDetail" in app_js

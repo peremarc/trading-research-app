@@ -14,17 +14,17 @@ seed_service = SeedService()
 
 
 @health_router.get("/health")
-def healthcheck() -> dict[str, str]:
+async def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @bootstrap_router.post("/seed", response_model=SeedResponse, status_code=status.HTTP_201_CREATED)
-def seed_initial_data(session: Session = Depends(get_db_session)) -> SeedResponse:
+async def seed_initial_data(session: Session = Depends(get_db_session)) -> SeedResponse:
     return SeedResponse.model_validate(seed_service.seed_initial_data(session))
 
 
 @scheduler_router.get("/status", response_model=SchedulerStatusRead)
-def get_scheduler_status() -> SchedulerStatusRead:
+async def get_scheduler_status() -> SchedulerStatusRead:
     scheduler_service.configure()
     jobs = [
         SchedulerJobRead(

@@ -121,7 +121,7 @@ class SignalService:
 
     def analyze_ticker(self, ticker: str) -> dict:
         if self.fused_analysis_service is None:
-            from app.services.fused_analysis_service import FusedAnalysisService
+            from app.domains.market.analysis import FusedAnalysisService
 
             self.fused_analysis_service = FusedAnalysisService()
         return self.fused_analysis_service.analyze_ticker(ticker)
@@ -307,7 +307,7 @@ class ResearchService:
 class WorkQueueService:
     def __init__(self, failure_analysis_service: object | None = None) -> None:
         if failure_analysis_service is None:
-            from app.services.failure_analysis_service import FailureAnalysisService
+            from app.domains.learning.services import FailureAnalysisService
 
             failure_analysis_service = FailureAnalysisService()
         self.failure_analysis_service = failure_analysis_service

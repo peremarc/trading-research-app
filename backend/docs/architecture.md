@@ -14,13 +14,12 @@ This backend is the initial modular monolith for the single-agent trading resear
 - `app/api/v1/routers/learning.py` groups journal, memory, failure analysis, auto-reviews, PDCA, and orchestrator endpoints.
 - `app/domains/strategy/` is the first extracted domain package and now owns the API assembly plus the primary schemas, repositories, and services for strategy, screener, watchlist, strategy health, strategy evolution, and strategy lab.
 - `app/domains/market/` now owns the API assembly plus the primary schemas, repositories, and services for analysis, market data, signals, research tasks, and work queue.
+- `app/domains/market/analysis.py` now owns fused analysis, quant analysis, visual analysis, chart rendering, and related market-analysis orchestration logic.
+- `app/domains/market/discovery.py` now owns autonomous opportunity discovery and watchlist refresh logic.
 - `app/domains/learning/` now owns the API assembly plus the primary schemas, repositories, and services for journal, memory, failure patterns, auto-reviews, PDCA, and orchestration.
 - `app/domains/execution/` now owns the API assembly plus the primary schemas, repositories, and services for positions, exits, and trade reviews.
 - `app/domains/system/` now owns the API assembly plus the primary schemas, runtime, and services for health, bootstrap, seeding, and scheduler status.
-- Legacy modules under `app/services/`, `app/db/repositories/`, and `app/schemas/` for the extracted strategy context now behave as compatibility import bridges.
-- Legacy modules under `app/api/v1/routes/`, `app/services/`, `app/schemas/`, and `app/db/repositories/` for the extracted market context now behave as compatibility import bridges.
-- Legacy modules under `app/api/v1/routes/`, `app/services/`, `app/schemas/`, and `app/db/repositories/` for the extracted learning context now behave as compatibility import bridges.
-- Legacy modules under `app/services/`, `app/db/repositories/`, and `app/schemas/` for the extracted execution context also behave as compatibility import bridges.
+- The legacy compatibility bridge packages under `app/services/`, `app/schemas/`, and `app/db/repositories/` have been removed.
 - The former `app/api/v1/routes/` compatibility layer has been removed; domain routers now own the HTTP entrypoints directly.
 
 ## Included in this bootstrap
@@ -46,10 +45,10 @@ This backend is the initial modular monolith for the single-agent trading resear
 
 ## Immediate next steps
 
-1. Consolidate configuration loading so app startup is independent from the working directory.
-2. Introduce scheduled jobs and explicit daily execution windows.
-3. Add market data provider adapters and the first paper execution flow.
-4. Add richer validation, business rules, and integration tests.
+1. Introduce richer validation and stricter domain-level business rules.
+2. Expand integration coverage around orchestrator flows and candidate lifecycle transitions.
+3. Add more market data provider adapters and execution-path realism.
+4. Keep consolidating domain boundaries where orchestration and strategy lifecycle still intersect too much.
 
 ## MVP bootstrap
 

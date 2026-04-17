@@ -46,7 +46,7 @@ def create_app() -> FastAPI:
     app.mount("/assets", StaticFiles(directory=frontend_dir), name="frontend-assets")
 
     @app.get("/", include_in_schema=False)
-    def serve_frontend() -> FileResponse:
+    async def serve_frontend() -> FileResponse:
         return FileResponse(frontend_dir / "index.html")
 
     return app

@@ -13,19 +13,17 @@ from app.domains.learning.schemas import (
     AutoReviewBatchResult,
     AutoReviewResult,
     DailyPlanRequest,
+    ExecutionCandidateResult,
     JournalEntryCreate,
     MemoryItemCreate,
     OrchestratorActResponse,
+    OrchestratorDoResponse,
     OrchestratorPhaseResponse,
     OrchestratorPlanResponse,
     PDCACycleCreate,
 )
-from app.schemas.analysis import AnalysisRunCreate
-from app.schemas.execution import ExecutionCandidateResult, OrchestratorDoResponse
-from app.schemas.exit_management import AutoExitBatchResult
-from app.schemas.position import PositionCreate
-from app.schemas.signal import SignalCreate
-from app.schemas.trade_review import TradeReviewCreate
+from app.domains.market.schemas import AnalysisRunCreate, SignalCreate
+from app.domains.execution.schemas import AutoExitBatchResult, PositionCreate, TradeReviewCreate
 
 
 class JournalService:
@@ -127,7 +125,7 @@ class FailureAnalysisService:
 class AutoReviewService:
     def __init__(self, trade_review_service: object | None = None) -> None:
         if trade_review_service is None:
-            from app.services.trade_review_service import TradeReviewService
+            from app.domains.execution.services import TradeReviewService
 
             trade_review_service = TradeReviewService()
         self.trade_review_service = trade_review_service
@@ -274,35 +272,35 @@ class OrchestratorService:
         self.journal_service = journal_service or JournalService()
         self.memory_service = memory_service or MemoryService()
         if analysis_service is None:
-            from app.services.analysis_service import AnalysisService
+            from app.domains.market.services import AnalysisService
 
             analysis_service = AnalysisService()
         if market_data_service is None:
-            from app.services.market_data_service import MarketDataService
+            from app.domains.market.services import MarketDataService
 
             market_data_service = MarketDataService()
         if signal_service is None:
-            from app.services.signal_service import SignalService
+            from app.domains.market.services import SignalService
 
             signal_service = SignalService()
         if position_service is None:
-            from app.services.position_service import PositionService
+            from app.domains.execution.services import PositionService
 
             position_service = PositionService()
         if strategy_lab_service is None:
-            from app.services.strategy_lab_service import StrategyLabService
+            from app.domains.strategy.services import StrategyLabService
 
             strategy_lab_service = StrategyLabService()
         if exit_management_service is None:
-            from app.services.exit_management_service import ExitManagementService
+            from app.domains.execution.services import ExitManagementService
 
             exit_management_service = ExitManagementService()
         if strategy_scoring_service is None:
-            from app.services.strategy_scoring_service import StrategyScoringService
+            from app.domains.strategy.services import StrategyScoringService
 
             strategy_scoring_service = StrategyScoringService()
         if research_service is None:
-            from app.services.research_service import ResearchService
+            from app.domains.market.services import ResearchService
 
             research_service = ResearchService()
         self.auto_review_service = auto_review_service or AutoReviewService()
@@ -315,11 +313,11 @@ class OrchestratorService:
         self.strategy_scoring_service = strategy_scoring_service
         self.research_service = research_service
         if strategy_evolution_service is None:
-            from app.services.strategy_evolution_service import StrategyEvolutionService
+            from app.domains.strategy.services import StrategyEvolutionService
 
             strategy_evolution_service = StrategyEvolutionService(research_service=self.research_service)
         if opportunity_discovery_service is None:
-            from app.services.opportunity_discovery_service import OpportunityDiscoveryService
+            from app.domains.market.discovery import OpportunityDiscoveryService
 
             opportunity_discovery_service = OpportunityDiscoveryService(
                 market_data_service=self.market_data_service,
@@ -329,7 +327,7 @@ class OrchestratorService:
         self.opportunity_discovery_service = opportunity_discovery_service
         self.failure_analysis_service = failure_analysis_service or FailureAnalysisService()
         if work_queue_service is None:
-            from app.services.work_queue_service import WorkQueueService
+            from app.domains.market.services import WorkQueueService
 
             work_queue_service = WorkQueueService(failure_analysis_service=self.failure_analysis_service)
         self.work_queue_service = work_queue_service

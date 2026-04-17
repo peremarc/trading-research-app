@@ -22,17 +22,17 @@ strategy_lab_service = StrategyLabService()
 
 
 @strategy_health_router.get("", response_model=list[StrategyScorecardRead])
-def list_strategy_health(session: Session = Depends(get_db_session)) -> list[StrategyScorecardRead]:
+async def list_strategy_health(session: Session = Depends(get_db_session)) -> list[StrategyScorecardRead]:
     return strategy_scoring_service.list_latest(session)
 
 
 @strategy_health_router.get("/pipelines", response_model=list[StrategyPipelineRead])
-def list_strategy_pipelines(session: Session = Depends(get_db_session)) -> list[StrategyPipelineRead]:
+async def list_strategy_pipelines(session: Session = Depends(get_db_session)) -> list[StrategyPipelineRead]:
     return strategy_scoring_service.list_pipelines(session)
 
 
 @strategy_health_router.get("/{strategy_id}", response_model=StrategyScorecardRead)
-def get_strategy_health(strategy_id: int, session: Session = Depends(get_db_session)) -> StrategyScorecardRead:
+async def get_strategy_health(strategy_id: int, session: Session = Depends(get_db_session)) -> StrategyScorecardRead:
     scorecard = strategy_scoring_service.get_latest(session, strategy_id)
     if scorecard is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Strategy scorecard not found")
@@ -40,7 +40,7 @@ def get_strategy_health(strategy_id: int, session: Session = Depends(get_db_sess
 
 
 @strategy_health_router.get("/{strategy_id}/pipeline", response_model=StrategyPipelineRead)
-def get_strategy_pipeline(strategy_id: int, session: Session = Depends(get_db_session)) -> StrategyPipelineRead:
+async def get_strategy_pipeline(strategy_id: int, session: Session = Depends(get_db_session)) -> StrategyPipelineRead:
     try:
         return strategy_scoring_service.get_pipeline(session, strategy_id)
     except ValueError as exc:
@@ -48,25 +48,25 @@ def get_strategy_pipeline(strategy_id: int, session: Session = Depends(get_db_se
 
 
 @strategy_health_router.post("/recalculate", response_model=list[StrategyScorecardRead], status_code=status.HTTP_200_OK)
-def recalculate_strategy_health(session: Session = Depends(get_db_session)) -> list[StrategyScorecardRead]:
+async def recalculate_strategy_health(session: Session = Depends(get_db_session)) -> list[StrategyScorecardRead]:
     return strategy_scoring_service.recalculate_all(session)
 
 
 @strategy_evolution_router.get("/changes", response_model=list[StrategyChangeEventRead])
-def list_strategy_change_events(session: Session = Depends(get_db_session)) -> list[StrategyChangeEventRead]:
+async def list_strategy_change_events(session: Session = Depends(get_db_session)) -> list[StrategyChangeEventRead]:
     return strategy_evolution_service.list_change_events(session)
 
 
 @strategy_evolution_router.get("/activations", response_model=list[StrategyActivationEventRead])
-def list_strategy_activation_events(session: Session = Depends(get_db_session)) -> list[StrategyActivationEventRead]:
+async def list_strategy_activation_events(session: Session = Depends(get_db_session)) -> list[StrategyActivationEventRead]:
     return strategy_evolution_service.list_activation_events(session)
 
 
 @strategy_evolution_router.get("/candidate-validations", response_model=list[CandidateValidationSnapshotRead])
-def list_candidate_validations(session: Session = Depends(get_db_session)) -> list[CandidateValidationSnapshotRead]:
+async def list_candidate_validations(session: Session = Depends(get_db_session)) -> list[CandidateValidationSnapshotRead]:
     return strategy_evolution_service.list_candidate_validation_summaries(session)
 
 
 @strategy_lab_router.post("/evolve-success-patterns", response_model=StrategyLabBatchResult, status_code=status.HTTP_200_OK)
-def evolve_success_patterns(session: Session = Depends(get_db_session)) -> StrategyLabBatchResult:
+async def evolve_success_patterns(session: Session = Depends(get_db_session)) -> StrategyLabBatchResult:
     return StrategyLabBatchResult.model_validate(strategy_lab_service.evolve_from_success_patterns(session))

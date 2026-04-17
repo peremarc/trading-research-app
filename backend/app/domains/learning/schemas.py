@@ -2,8 +2,8 @@ from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
-from app.schemas.execution import OrchestratorDoResponse
 from app.domains.market.schemas import WorkQueueRead
+from app.domains.execution.schemas import AutoExitBatchResult
 
 
 class JournalEntryCreate(BaseModel):
@@ -137,6 +137,28 @@ class OrchestratorPhaseResponse(BaseModel):
     status: str
     summary: str
     metrics: dict
+
+
+class ExecutionCandidateResult(BaseModel):
+    ticker: str
+    watchlist_item_id: int
+    analysis_run_id: int
+    signal_id: int | None = None
+    decision: str
+    score: float
+    position_id: int | None = None
+
+
+class OrchestratorDoResponse(BaseModel):
+    phase: str
+    status: str
+    summary: str
+    metrics: dict
+    generated_analyses: int
+    opened_positions: int
+    candidates: list[ExecutionCandidateResult]
+    exits: AutoExitBatchResult | None = None
+    discovery: dict | None = None
 
 
 class OrchestratorActResponse(BaseModel):

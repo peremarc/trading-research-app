@@ -12,11 +12,11 @@ from app.db.models.signal import Signal
 from app.db.models.strategy import Strategy, StrategyVersion
 from app.db.models.strategy_scorecard import StrategyScorecard
 from app.db.models.trade_review import TradeReview
-from app.db.repositories.candidate_validation_snapshot_repository import CandidateValidationSnapshotRepository
 from app.domains.learning.schemas import JournalEntryCreate, MemoryItemCreate
 from app.domains.learning.services import JournalService, MemoryService
 from app.domains.market.services import MarketDataService, ResearchService
 from app.domains.strategy.repositories import (
+    CandidateValidationSnapshotRepository,
     ScreenerRepository,
     StrategyEvolutionRepository,
     StrategyRepository,

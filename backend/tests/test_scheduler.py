@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.services.scheduler_service import SchedulerService
+from app.domains.system.services import SchedulerService
 
 
 def test_scheduler_status_exposes_pdca_jobs(client: TestClient) -> None:
