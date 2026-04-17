@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Strategy Lab Console</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Trading Research App</p>
+        <h1>Strategy Lab Console</h1>
+        <p class="hero-text">
+          Una vista operativa para vigilar el laboratorio de estrategias: pipeline,
+          backlog, validacion de candidatas y ejecucion manual del ciclo
+          <span class="inline-code">PLAN -&gt; DO -&gt; CHECK -&gt; ACT</span>.
+        </p>
+      </div>
+      <aside class="hero-side">
+        <div class="hero-callout">
+          <span class="callout-label">Estado</span>
+          <strong id="status-badge" class="status-badge">Inicializando</strong>
+        </div>
+        <div class="hero-callout">
+          <span class="callout-label">Siguiente foco</span>
+          <strong id="next-focus">Cargando backlog...</strong>
+        </div>
+        <div class="hero-actions">
+          <button data-action="seed" class="action action-muted">Seed</button>
+          <button data-action="refresh" class="action action-muted">Refrescar</button>
+          <button data-action="recalculate" class="action action-muted">Recalcular</button>
+          <button data-action="plan" class="action">PLAN</button>
+          <button data-action="do" class="action">DO</button>
+          <button data-action="check" class="action">CHECK</button>
+          <button data-action="act" class="action action-alert">ACT</button>
+        </div>
+      </aside>
+    </header>
+
+    <main class="dashboard-grid">
+      <section class="panel panel-span-8">
+        <div class="panel-heading">
+          <div>
+            <h2>Radar Operativo</h2>
+            <p>Resumen del estado actual del laboratorio.</p>
+          </div>
+        </div>
+        <div id="metrics-grid" class="metrics-grid"></div>
+      </section>
+
+      <section class="panel panel-span-4">
+        <div class="panel-heading">
+          <div>
+            <h2>Foco Inmediato</h2>
+            <p>Lo primero que la IA deberia atacar.</p>
+          </div>
+        </div>
+        <div id="focus-board" class="focus-board"></div>
+      </section>
+
+      <section class="panel panel-span-7">
+        <div class="panel-heading">
+          <div>
+            <h2>Pipeline de Estrategias</h2>
+            <p>Activas, candidatas, degradadas y validadas.</p>
+          </div>
+        </div>
+        <div id="pipelines-list" class="pipelines-list"></div>
+      </section>
+
+      <section class="panel panel-span-5">
+        <div class="panel-heading">
+          <div>
+            <h2>Inspector</h2>
+            <p>Detalle de la estrategia seleccionada.</p>
+          </div>
+        </div>
+        <div id="pipeline-detail" class="pipeline-detail"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Cola de Trabajo</h2>
+            <p>Prioridades explicitas del sistema.</p>
+          </div>
+        </div>
+        <div id="work-queue" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Candidate Validations</h2>
+            <p>Snapshots persistidos de paper trading.</p>
+          </div>
+        </div>
+        <div id="candidate-validations" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Research Tasks</h2>
+            <p>Investigacion activa y recuperacion de lineas fallidas.</p>
+          </div>
+        </div>
+        <div id="research-tasks" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Activity Feed</h2>
+            <p>Cambios y activaciones recientes.</p>
+          </div>
+        </div>
+        <div id="activity-feed" class="activity-feed"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Open Positions</h2>
+            <p>Posiciones abiertas con la estrategia usada y la razon por la que se abrieron.</p>
+          </div>
+        </div>
+        <div id="open-positions" class="positions-board"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Decision Journal</h2>
+            <p>Decisiones tomadas, ticker afectado y estrategia base usada.</p>
+          </div>
+        </div>
+        <div id="journal-feed" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Consola del Orquestador</h2>
+            <p>Respuesta de la ultima accion manual ejecutada.</p>
+          </div>
+        </div>
+        <pre id="cycle-output" class="terminal-card">Todavia no se ha ejecutado ninguna fase manual.</pre>
+      </section>
+    </main>
+  </div>
+
+  <template id="metric-card-template">
+    <article class="metric-card">
+      <span class="metric-label"></span>
+      <strong class="metric-value"></strong>
+      <small class="metric-footnote"></small>
+    </article>
+  </template>
+
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

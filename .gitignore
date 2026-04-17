@@ -1,0 +1,27 @@
+.codex/
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+.venv/
+backend/.venv/
+
+# Local environment files
+.env
+.env.*
+backend/.env
+backend/.env.*
+
+# Test and tooling caches
+.pytest_cache/
+backend/.pytest_cache/
+
+# Local build metadata
+*.egg-info/
+backend/*.egg-info/
+
+# Local databases and archives
+*.db
+*.sqlite
+*.sqlite3
+*.7z

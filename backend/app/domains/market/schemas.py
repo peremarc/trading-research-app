@@ -1,0 +1,148 @@
+from datetime import datetime
+
+from pydantic import BaseModel, Field
+
+
+class AnalysisRunCreate(BaseModel):
+    ticker: str
+    strategy_version_id: int | None = None
+    watchlist_item_id: int | None = None
+    quant_summary: dict = Field(default_factory=dict)
+    visual_summary: dict = Field(default_factory=dict)
+    combined_score: float | None = None
+    entry_price: float | None = None
+    stop_price: float | None = None
+    target_price: float | None = None
+    risk_reward: float | None = None
+    decision: str = "watch"
+    decision_confidence: float | None = None
+    rationale: str | None = None
+
+
+class AnalysisRunRead(BaseModel):
+    id: int
+    ticker: str
+    strategy_version_id: int | None
+    watchlist_item_id: int | None
+    quant_summary: dict
+    visual_summary: dict
+    combined_score: float | None
+    entry_price: float | None
+    stop_price: float | None
+    target_price: float | None
+    risk_reward: float | None
+    decision: str
+    decision_confidence: float | None
+    rationale: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class MarketSnapshotRead(BaseModel):
+    ticker: str
+    price: float
+    sma_20: float
+    sma_50: float
+    sma_200: float
+    rsi_14: float
+    relative_volume: float
+    atr_14: float
+    week_performance: float
+    month_performance: float
+
+
+class OHLCVCandleRead(BaseModel):
+    timestamp: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+class SignalCreate(BaseModel):
+    strategy_id: int | None = None
+    strategy_version_id: int | None = None
+    watchlist_item_id: int | None = None
+    ticker: str
+    timeframe: str = "1D"
+    signal_type: str = "trend_following"
+    thesis: str | None = None
+    entry_zone: dict = Field(default_factory=dict)
+    stop_zone: dict = Field(default_factory=dict)
+    target_zone: dict = Field(default_factory=dict)
+    signal_context: dict = Field(default_factory=dict)
+    quality_score: float | None = None
+    status: str = "new"
+    rejection_reason: str | None = None
+
+
+class SignalStatusUpdate(BaseModel):
+    status: str
+    rejection_reason: str | None = None
+
+
+class SignalRead(BaseModel):
+    id: int
+    strategy_id: int | None
+    strategy_version_id: int | None
+    watchlist_item_id: int | None
+    ticker: str
+    timeframe: str
+    signal_type: str
+    signal_time: datetime
+    thesis: str | None
+    entry_zone: dict
+    stop_zone: dict
+    target_zone: dict
+    signal_context: dict
+    quality_score: float | None
+    status: str
+    rejection_reason: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ResearchTaskCreate(BaseModel):
+    strategy_id: int | None = None
+    task_type: str
+    priority: str = "normal"
+    status: str = "open"
+    title: str
+    hypothesis: str
+    scope: dict = Field(default_factory=dict)
+
+
+class ResearchTaskComplete(BaseModel):
+    result_summary: str
+
+
+class ResearchTaskRead(BaseModel):
+    id: int
+    strategy_id: int | None
+    task_type: str
+    priority: str
+    status: str
+    title: str
+    hypothesis: str
+    scope: dict
+    result_summary: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class WorkItemRead(BaseModel):
+    priority: str
+    item_type: str
+    reference_id: int | None = None
+    title: str
+    context: dict = Field(default_factory=dict)
+
+
+class WorkQueueRead(BaseModel):
+    total_items: int
+    items: list[WorkItemRead]
