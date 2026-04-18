@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Strategy Lab Console</title>
+  <link rel="stylesheet" href="/assets/styles.css?v=20260418-market-state-1">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Trading Research App</p>
+        <h1>Strategy Lab Console</h1>
+        <p class="hero-text">
+          Un puesto de control para un bot autonomo que investiga, ejecuta,
+          aprende y mejora en continuo. El usuario solo decide si el bot
+          esta <span class="inline-code">RUNNING</span> o
+          <span class="inline-code">PAUSED</span> y revisa incidencias
+          antes de reanudarlo.
+        </p>
+      </div>
+      <aside class="hero-side">
+        <div class="hero-callout">
+          <span class="callout-label">Estado del Bot</span>
+          <strong id="status-badge" class="status-badge">Inicializando</strong>
+        </div>
+        <div class="hero-callout">
+          <span class="callout-label">Siguiente foco</span>
+          <strong id="next-focus">Cargando backlog...</strong>
+        </div>
+        <div class="hero-callout">
+          <span class="callout-label">Salud operativa</span>
+          <strong id="runtime-summary">Sincronizando runtime...</strong>
+        </div>
+        <div class="hero-actions">
+          <button id="bot-toggle" data-action="toggle-bot" class="action">Arrancar Bot</button>
+          <button data-action="refresh" class="action action-muted">Refrescar</button>
+        </div>
+      </aside>
+    </header>
+
+    <main class="dashboard-grid">
+      <section class="panel panel-span-12 runtime-panel">
+        <div class="runtime-grid">
+          <article class="runtime-card runtime-card-primary">
+            <span class="runtime-label">Estado del Bot</span>
+            <strong id="bot-status-headline" class="runtime-headline">Inicializando</strong>
+            <p id="bot-runtime-detail" class="runtime-copy">Esperando sincronizacion del runtime.</p>
+            <div class="runtime-meta-grid">
+              <div class="runtime-meta">
+                <span>Fase</span>
+                <strong id="bot-phase">-</strong>
+              </div>
+              <div class="runtime-meta">
+                <span>Proxima ejecucion</span>
+                <strong id="bot-next-run">-</strong>
+              </div>
+              <div class="runtime-meta">
+                <span>Ciclos completados</span>
+                <strong id="bot-cycle-runs">0</strong>
+              </div>
+              <div class="runtime-meta">
+                <span>Ultima fase OK</span>
+                <strong id="bot-last-success">-</strong>
+              </div>
+            </div>
+          </article>
+
+          <article id="bot-attention-card" class="runtime-card runtime-card-incident">
+            <span class="runtime-label">Atencion Operativa</span>
+            <strong id="bot-attention-headline" class="runtime-headline">Sin incidencias</strong>
+            <p id="bot-attention-detail" class="runtime-copy">
+              Si una API falla o el ciclo autonomo encuentra un error, el bot se pausara y se mostrara aqui.
+            </p>
+            <div class="runtime-tags">
+              <span id="bot-attention-pill" class="pill pill-active">Estable</span>
+              <span id="bot-pause-reason" class="pill pill-approved">Sin bloqueo</span>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel panel-span-8">
+        <div class="panel-heading">
+          <div>
+            <h2>Market State Snapshot</h2>
+            <p>La foto persistida del mundo que el bot usa para observar, clasificar el regimen y decidir.</p>
+          </div>
+        </div>
+        <div id="market-state-overview" class="market-state-layout"></div>
+      </section>
+
+      <section class="panel panel-span-4">
+        <div class="panel-heading">
+          <div>
+            <h2>Snapshot Trail</h2>
+            <p>Ultimas capturas del regimen, la fase PDCA y el contexto operativo.</p>
+          </div>
+        </div>
+        <div id="market-state-trail" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-12 chat-panel">
+        <div class="panel-heading">
+          <div>
+            <h2>Chat con el Bot</h2>
+            <p>Preguntale que ha descubierto, que esta haciendo, que le falta o un resumen de operaciones.</p>
+          </div>
+        </div>
+        <div class="chat-layout">
+          <div class="chat-suggestions">
+            <button class="chat-chip" data-chat-prompt="Dame un resumen general">Resumen general</button>
+            <button class="chat-chip" data-chat-prompt="Que has descubierto hoy">Descubrimientos</button>
+            <button class="chat-chip" data-chat-prompt="Que estas haciendo ahora">Estado actual</button>
+            <button class="chat-chip" data-chat-prompt="Que herramientas te faltan para mejorar resultados">Herramientas</button>
+            <button class="chat-chip" data-chat-prompt="Resumen de las ultimas operaciones">Operaciones</button>
+            <button class="chat-chip" data-chat-prompt="Noticias de NVDA">Noticias</button>
+          </div>
+          <div id="chat-thread" class="chat-thread"></div>
+          <form id="chat-form" class="chat-form">
+            <textarea
+              id="chat-input"
+              class="chat-input"
+              rows="3"
+              placeholder="Ejemplo: que has descubierto, que estas haciendo ahora, que te falta para mejorar..."
+            ></textarea>
+            <div class="chat-actions">
+              <span class="muted">El chat responde con datos reales del runtime y la base de datos actual.</span>
+              <button id="chat-send" type="submit" class="action">Preguntar</button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Incidencias y APIs</h2>
+            <p>Si una API externa o el ciclo autonomo fallan, el bot se pausa hasta revision manual.</p>
+          </div>
+        </div>
+        <div id="incident-board" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-8">
+        <div class="panel-heading">
+          <div>
+            <h2>Radar Operativo</h2>
+            <p>Resumen del estado actual del bot autonomo.</p>
+          </div>
+        </div>
+        <div id="metrics-grid" class="metrics-grid"></div>
+      </section>
+
+      <section class="panel panel-span-4">
+        <div class="panel-heading">
+          <div>
+            <h2>Foco Inmediato</h2>
+            <p>Lo primero que la IA deberia atacar.</p>
+          </div>
+        </div>
+        <div id="focus-board" class="focus-board"></div>
+      </section>
+
+      <section class="panel panel-span-7">
+        <div class="panel-heading">
+          <div>
+            <h2>Pipeline de Estrategias</h2>
+            <p>Activas, candidatas, degradadas y validadas.</p>
+          </div>
+        </div>
+        <div id="pipelines-list" class="pipelines-list"></div>
+      </section>
+
+      <section class="panel panel-span-5">
+        <div class="panel-heading">
+          <div>
+            <h2>Inspector</h2>
+            <p>Detalle de la estrategia seleccionada.</p>
+          </div>
+        </div>
+        <div id="pipeline-detail" class="pipeline-detail"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Cola de Trabajo</h2>
+            <p>Prioridades explicitas del sistema.</p>
+          </div>
+        </div>
+        <div id="work-queue" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Candidate Validations</h2>
+            <p>Snapshots persistidos de paper trading.</p>
+          </div>
+        </div>
+        <div id="candidate-validations" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Research Tasks</h2>
+            <p>Investigacion activa y recuperacion de lineas fallidas.</p>
+          </div>
+        </div>
+        <div id="research-tasks" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Activity Feed</h2>
+            <p>Cambios y activaciones recientes.</p>
+          </div>
+        </div>
+        <div id="activity-feed" class="activity-feed"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Open Positions</h2>
+            <p>Posiciones abiertas con la estrategia usada y la razon por la que se abrieron.</p>
+          </div>
+        </div>
+        <div id="open-positions" class="positions-board"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Decision Journal</h2>
+            <p>Decisiones tomadas, ticker afectado y estrategia base usada.</p>
+          </div>
+        </div>
+        <div id="journal-feed" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Consola del Bot</h2>
+            <p>Ultimo evento de control, respuesta del runtime o error capturado.</p>
+          </div>
+        </div>
+        <pre id="cycle-output" class="terminal-card">Todavia no hay eventos de control del bot.</pre>
+      </section>
+    </main>
+  </div>
+
+  <template id="metric-card-template">
+    <article class="metric-card">
+      <span class="metric-label"></span>
+      <strong class="metric-value"></strong>
+      <small class="metric-footnote"></small>
+    </article>
+  </template>
+
+  <script type="module" src="/assets/app.js?v=20260418-market-state-1"></script>
+</body>
+</html>
