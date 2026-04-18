@@ -15,6 +15,7 @@ class Strategy(Base):
     code: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(120))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hypothesis_id: Mapped[int | None] = mapped_column(ForeignKey("hypotheses.id"), nullable=True, index=True)
     market: Mapped[str] = mapped_column(String(50), default="US_EQUITIES")
     horizon: Mapped[str] = mapped_column(String(50))
     bias: Mapped[str] = mapped_column(String(20))

@@ -13,7 +13,12 @@ class Position(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     ticker: Mapped[str] = mapped_column(String(12), index=True)
+    hypothesis_id: Mapped[int | None] = mapped_column(ForeignKey("hypotheses.id"), nullable=True, index=True)
     signal_id: Mapped[int | None] = mapped_column(ForeignKey("signals.id"), nullable=True)
+    setup_id: Mapped[int | None] = mapped_column(ForeignKey("setups.id"), nullable=True, index=True)
+    signal_definition_id: Mapped[int | None] = mapped_column(
+        ForeignKey("signal_definitions.id"), nullable=True, index=True
+    )
     strategy_version_id: Mapped[int | None] = mapped_column(ForeignKey("strategy_versions.id"), nullable=True)
     analysis_run_id: Mapped[int | None] = mapped_column(ForeignKey("analysis_runs.id"), nullable=True)
     account_mode: Mapped[str] = mapped_column(String(20), default="paper")
@@ -42,6 +47,10 @@ class Position(Base):
         back_populates="position",
         cascade="all, delete-orphan",
     )
+
+    @property
+    def trade_signal_id(self) -> int | None:
+        return self.signal_id
 
 
 class PositionEvent(Base):

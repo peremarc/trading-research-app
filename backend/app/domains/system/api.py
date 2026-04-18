@@ -1,16 +1,20 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db_session
+from app.domains.learning.services import OrchestratorService
+from app.domains.system.events import EventLogService
 from app.domains.system.runtime import scheduler_service
-from app.domains.system.schemas import SchedulerJobRead, SchedulerStatusRead, SeedResponse
+from app.domains.system.schemas import SchedulerStatusRead, SeedResponse, SystemEventDispatchRead, SystemEventRead
 from app.domains.system.services import SeedService
 
 health_router = APIRouter()
 bootstrap_router = APIRouter()
 scheduler_router = APIRouter()
+events_router = APIRouter()
 
 seed_service = SeedService()
+event_log_service = EventLogService()
 
 
 @health_router.get("/health")
@@ -26,15 +30,47 @@ async def seed_initial_data(session: Session = Depends(get_db_session)) -> SeedR
 @scheduler_router.get("/status", response_model=SchedulerStatusRead)
 async def get_scheduler_status() -> SchedulerStatusRead:
     scheduler_service.configure()
-    jobs = [
-        SchedulerJobRead(
-            job_id=job.id,
-            next_run_time=next_run_time.isoformat() if (next_run_time := getattr(job, "next_run_time", None)) else None,
+    return SchedulerStatusRead.model_validate(scheduler_service.get_status_payload())
+
+
+@scheduler_router.post("/start", response_model=SchedulerStatusRead, status_code=status.HTTP_200_OK)
+async def start_scheduler_bot() -> SchedulerStatusRead:
+    return SchedulerStatusRead.model_validate(scheduler_service.start_bot())
+
+
+@scheduler_router.post("/pause", response_model=SchedulerStatusRead, status_code=status.HTTP_200_OK)
+async def pause_scheduler_bot() -> SchedulerStatusRead:
+    return SchedulerStatusRead.model_validate(scheduler_service.pause_bot())
+
+
+@events_router.get("", response_model=list[SystemEventRead], status_code=status.HTTP_200_OK)
+async def list_system_events(
+    limit: int = Query(default=50, ge=1, le=200),
+    event_type: str | None = Query(default=None),
+    entity_type: str | None = Query(default=None),
+    pdca_phase_hint: str | None = Query(default=None),
+    dispatch_status: str | None = Query(default=None),
+    session: Session = Depends(get_db_session),
+) -> list[SystemEventRead]:
+    return event_log_service.list_events(
+        session,
+        limit=limit,
+        event_type=event_type,
+        entity_type=entity_type,
+        pdca_phase_hint=pdca_phase_hint,
+        dispatch_status=dispatch_status,
+    )
+
+
+@events_router.post("/dispatch", response_model=SystemEventDispatchRead, status_code=status.HTTP_200_OK)
+async def dispatch_pending_system_events(
+    limit: int = Query(default=50, ge=1, le=200),
+    session: Session = Depends(get_db_session),
+) -> SystemEventDispatchRead:
+    return SystemEventDispatchRead.model_validate(
+        event_log_service.dispatch_pending(
+            session,
+            orchestrator_service=OrchestratorService(),
+            limit=limit,
         )
-        for job in scheduler_service.scheduler.get_jobs()
-    ]
-    return SchedulerStatusRead(
-        enabled=scheduler_service.settings.scheduler_enabled,
-        running=scheduler_service.scheduler.running,
-        jobs=jobs,
     )

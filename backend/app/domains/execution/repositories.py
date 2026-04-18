@@ -7,7 +7,13 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db.models.position import Position, PositionEvent
 from app.db.models.trade_review import TradeReview
-from app.domains.execution.schemas import PositionCloseRequest, PositionCreate, PositionEventCreate, TradeReviewCreate
+from app.domains.execution.schemas import (
+    PositionCloseRequest,
+    PositionCreate,
+    PositionEventCreate,
+    PositionManageRequest,
+    TradeReviewCreate,
+)
 
 
 class PositionRepository:
@@ -20,8 +26,27 @@ class PositionRepository:
         return session.scalars(statement).first()
 
     def create(self, session: Session, payload: PositionCreate) -> Position:
-        position = Position(**payload.model_dump())
+        payload_data = payload.model_dump()
+        opening_reason = payload_data.pop("opening_reason", None)
+        position = Position(**payload_data)
         session.add(position)
+        session.flush()
+        session.add(
+            PositionEvent(
+                position_id=position.id,
+                event_type="open",
+                payload={
+                    "entry_price": position.entry_price,
+                    "stop_price": position.stop_price,
+                    "target_price": position.target_price,
+                    "size": position.size,
+                    "thesis": position.thesis,
+                    "entry_context": position.entry_context or {},
+                    "opening_reason": opening_reason or position.thesis,
+                },
+                note="Position opened via API",
+            )
+        )
         session.commit()
         session.refresh(position)
         return self.get(session, position.id) or position
@@ -36,6 +61,47 @@ class PositionRepository:
         session.commit()
         session.refresh(event)
         return event
+
+    def manage(self, session: Session, position_id: int, payload: PositionManageRequest) -> Position:
+        position = self.get(session, position_id)
+        if position is None:
+            raise ValueError("Position not found")
+        if position.status != "open":
+            raise ValueError("Only open positions can be managed")
+
+        previous_stop_price = position.stop_price
+        previous_target_price = position.target_price
+        previous_thesis = position.thesis
+
+        if payload.stop_price is not None:
+            position.stop_price = payload.stop_price
+        if payload.target_price is not None:
+            position.target_price = payload.target_price
+        if payload.thesis is not None:
+            position.thesis = payload.thesis
+
+        event_payload = {
+            "observed_price": payload.observed_price,
+            "previous_stop_price": previous_stop_price,
+            "new_stop_price": position.stop_price,
+            "previous_target_price": previous_target_price,
+            "new_target_price": position.target_price,
+            "previous_thesis": previous_thesis,
+            "new_thesis": position.thesis,
+            "rationale": payload.rationale,
+            "management_context": payload.management_context,
+        }
+        session.add(
+            PositionEvent(
+                position_id=position.id,
+                event_type=payload.event_type,
+                payload=event_payload,
+                note=payload.note or "Position managed via API",
+            )
+        )
+        session.commit()
+        session.refresh(position)
+        return self.get(session, position.id) or position
 
     def close(self, session: Session, position_id: int, payload: PositionCloseRequest) -> Position:
         position = self.get(session, position_id)

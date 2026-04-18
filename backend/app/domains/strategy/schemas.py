@@ -3,6 +3,107 @@ from datetime import date, datetime
 from pydantic import BaseModel, Field
 
 
+class HypothesisCreate(BaseModel):
+    code: str
+    name: str
+    description: str | None = None
+    proposition: str
+    market: str = "US_EQUITIES"
+    horizon: str
+    bias: str
+    success_criteria: dict = Field(default_factory=dict)
+    status: str = "draft"
+    version: int = 1
+
+
+class HypothesisRead(BaseModel):
+    id: int
+    code: str
+    name: str
+    description: str | None
+    proposition: str
+    market: str
+    horizon: str
+    bias: str
+    success_criteria: dict
+    status: str
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class SetupCreate(BaseModel):
+    code: str
+    name: str
+    description: str | None = None
+    hypothesis_id: int | None = None
+    strategy_id: int | None = None
+    timeframe: str = "1D"
+    ideal_context: dict = Field(default_factory=dict)
+    conditions: dict = Field(default_factory=dict)
+    parameters: dict = Field(default_factory=dict)
+    status: str = "draft"
+    version: int = 1
+
+
+class SetupRead(BaseModel):
+    id: int
+    code: str
+    name: str
+    description: str | None
+    hypothesis_id: int | None
+    strategy_id: int | None
+    timeframe: str
+    ideal_context: dict
+    conditions: dict
+    parameters: dict
+    status: str
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class SignalDefinitionCreate(BaseModel):
+    code: str
+    name: str
+    description: str | None = None
+    hypothesis_id: int | None = None
+    strategy_id: int | None = None
+    setup_id: int | None = None
+    signal_kind: str = "trigger"
+    definition: str
+    parameters: dict = Field(default_factory=dict)
+    activation_conditions: dict = Field(default_factory=dict)
+    intended_usage: str | None = None
+    status: str = "draft"
+    version: int = 1
+
+
+class SignalDefinitionRead(BaseModel):
+    id: int
+    code: str
+    name: str
+    description: str | None
+    hypothesis_id: int | None
+    strategy_id: int | None
+    setup_id: int | None
+    signal_kind: str
+    definition: str
+    parameters: dict
+    activation_conditions: dict
+    intended_usage: str | None
+    status: str
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class StrategyVersionCreate(BaseModel):
     hypothesis: str
     general_rules: dict = Field(default_factory=dict)
@@ -16,6 +117,7 @@ class StrategyCreate(BaseModel):
     code: str
     name: str
     description: str | None = None
+    hypothesis_id: int | None = None
     market: str = "US_EQUITIES"
     horizon: str
     bias: str
@@ -42,6 +144,7 @@ class StrategyRead(BaseModel):
     code: str
     name: str
     description: str | None
+    hypothesis_id: int | None
     market: str
     horizon: str
     bias: str
@@ -99,6 +202,7 @@ class ScreenerRead(BaseModel):
 
 class WatchlistItemCreate(BaseModel):
     ticker: str
+    setup_id: int | None = None
     strategy_hypothesis: str | None = None
     score: float | None = None
     reason: str | None = None
@@ -109,6 +213,7 @@ class WatchlistItemCreate(BaseModel):
 class WatchlistItemRead(BaseModel):
     id: int
     ticker: str
+    setup_id: int | None
     strategy_hypothesis: str | None
     score: float | None
     added_at: datetime
@@ -122,16 +227,21 @@ class WatchlistItemRead(BaseModel):
 class WatchlistCreate(BaseModel):
     code: str
     name: str
+    hypothesis_id: int | None = None
     strategy_id: int | None = None
+    setup_id: int | None = None
     hypothesis: str
     status: str = "active"
+    initial_items: list[WatchlistItemCreate] = Field(default_factory=list)
 
 
 class WatchlistRead(BaseModel):
     id: int
     code: str
     name: str
+    hypothesis_id: int | None
     strategy_id: int | None
+    setup_id: int | None
     hypothesis: str
     status: str
     created_at: datetime
@@ -150,7 +260,15 @@ class CandidateValidationSummaryRead(BaseModel):
     avg_pnl_pct: float | None
     avg_drawdown_pct: float | None
     win_rate: float | None
+    profit_factor: float | None = None
+    distinct_tickers: int = 0
+    window_count: int = 0
+    rolling_pass_rate: float | None = None
+    replay_score: float | None = None
+    validation_mode: str = "candidate_validation"
     evaluation_status: str
+    decision_reason: str | None = None
+    validation_payload: dict = Field(default_factory=dict)
 
 
 class CandidateValidationSnapshotRead(CandidateValidationSummaryRead):
@@ -192,8 +310,9 @@ class StrategyLabResult(BaseModel):
     source_version_id: int
     new_version_id: int
     change_event_id: int
-    activation_event_id: int
+    activation_event_id: int | None = None
     trigger: str
+    validation_required: bool = False
 
 
 class StrategyLabBatchResult(BaseModel):

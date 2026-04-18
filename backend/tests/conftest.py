@@ -11,14 +11,28 @@ from sqlalchemy.pool import StaticPool
 os.environ["BOOTSTRAP_SEED_ON_STARTUP"] = "false"
 os.environ["SCHEDULER_ENABLED"] = "false"
 os.environ["SCHEDULER_RUN_ON_STARTUP"] = "false"
-os.environ["SCHEDULER_MODE"] = "cron"
+os.environ["SCHEDULER_MODE"] = "continuous"
+os.environ["SCHEDULER_CONTINUOUS_IDLE_SECONDS"] = "5"
 os.environ["MARKET_DATA_PROVIDER"] = "stub"
 os.environ["TWELVE_DATA_API_KEY"] = ""
+os.environ["AI_AGENT_ENABLED"] = "false"
+os.environ["AI_PRIMARY_PROVIDER"] = "gemini"
+os.environ["AI_PRIMARY_MODEL"] = "gemini-2.5-flash"
+os.environ["GEMINI_API_KEY"] = ""
+os.environ["GEMINI_API_KEY_FREE1"] = ""
+os.environ["GEMINI_API_KEY_FREE2"] = ""
+os.environ["AI_FALLBACK_PROVIDER"] = "openai_compatible"
+os.environ["AI_FALLBACK_MODEL"] = "qwen2.5:3b"
+os.environ["AI_FALLBACK_API_KEY"] = ""
+os.environ["AI_FALLBACK_API_BASE"] = ""
 
 import app.db.models  # noqa: F401
 from app.db.base import Base
 from app.db.session import get_db_session
 from app.domains.execution.services import ExitManagementService, PositionService, TradeReviewService
+from app.domains.learning.macro import MacroContextService
+from app.domains.learning.world_state import MarketStateService
+from app.domains.learning.tools import AgentToolGatewayService
 from app.domains.learning.services import (
     AutoReviewService,
     FailureAnalysisService,
@@ -27,9 +41,13 @@ from app.domains.learning.services import (
     OrchestratorService,
     PDCACycleService,
 )
-from app.domains.market.services import AnalysisService, MarketDataService, ResearchService, SignalService, WorkQueueService
+from app.domains.market.services import AnalysisService, CalendarService, MarketDataService, ResearchService, SignalService, WorkQueueService
+from app.domains.market.services import NewsService
 from app.domains.strategy.services import (
+    HypothesisService,
+    SignalDefinitionService,
     ScreenerService,
+    SetupService,
     StrategyEvolutionService,
     StrategyLabService,
     StrategyScoringService,
@@ -75,13 +93,22 @@ def _reset_api_service_singletons() -> None:
     learning_api.auto_review_service = AutoReviewService()
     learning_api.pdca_service = PDCACycleService()
     learning_api.orchestrator_service = OrchestratorService()
+    learning_api.bot_chat_service = learning_api.BotChatService()
+    learning_api.macro_context_service = MacroContextService()
+    learning_api.market_state_service = MarketStateService()
+    learning_api.agent_tool_gateway_service = AgentToolGatewayService()
 
     market_api.analysis_service = AnalysisService()
     market_api.market_data_service = MarketDataService()
+    market_api.news_service = NewsService()
+    market_api.calendar_service = CalendarService()
     market_api.signal_service = SignalService()
     market_api.research_service = ResearchService()
     market_api.work_queue_service = WorkQueueService()
 
+    strategy_api.hypothesis_service = HypothesisService()
+    strategy_api.signal_definition_service = SignalDefinitionService()
+    strategy_api.setup_service = SetupService()
     strategy_api.strategy_service = StrategyService()
     strategy_api.screener_service = ScreenerService()
     strategy_api.watchlist_service = WatchlistService()
@@ -95,6 +122,7 @@ def _reset_api_service_singletons() -> None:
     execution_api.trade_review_service = TradeReviewService()
 
     system_api.seed_service = SeedService()
+    system_api.event_log_service = system_api.EventLogService()
 
 
 @pytest.fixture()
@@ -102,6 +130,7 @@ def session() -> Generator[Session, None, None]:
     scheduler_service.shutdown()
     scheduler_service._configured = False
     scheduler_service.scheduler.remove_all_jobs()
+    scheduler_service.reset_runtime_state()
     _reset_api_service_singletons()
 
     engine = create_engine(

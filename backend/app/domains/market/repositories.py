@@ -7,8 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.db.models.analysis import AnalysisRun
 from app.db.models.research_task import ResearchTask
-from app.db.models.signal import Signal
-from app.domains.market.schemas import AnalysisRunCreate, ResearchTaskCreate, SignalCreate
+from app.db.models.signal import TradeSignal
+from app.domains.market.schemas import AnalysisRunCreate, ResearchTaskCreate, TradeSignalCreate
 
 
 class AnalysisRepository:
@@ -24,16 +24,16 @@ class AnalysisRepository:
         return analysis
 
 
-class SignalRepository:
-    def list(self, session: Session) -> list[Signal]:
-        statement = select(Signal).order_by(Signal.signal_time.desc(), Signal.created_at.desc())
+class TradeSignalRepository:
+    def list(self, session: Session) -> list[TradeSignal]:
+        statement = select(TradeSignal).order_by(TradeSignal.signal_time.desc(), TradeSignal.created_at.desc())
         return list(session.scalars(statement).all())
 
-    def get(self, session: Session, signal_id: int) -> Signal | None:
-        return session.get(Signal, signal_id)
+    def get(self, session: Session, signal_id: int) -> TradeSignal | None:
+        return session.get(TradeSignal, signal_id)
 
-    def create(self, session: Session, payload: SignalCreate) -> Signal:
-        signal = Signal(**payload.model_dump())
+    def create(self, session: Session, payload: TradeSignalCreate) -> TradeSignal:
+        signal = TradeSignal(**payload.model_dump())
         session.add(signal)
         session.commit()
         session.refresh(signal)
@@ -46,16 +46,20 @@ class SignalRepository:
         *,
         status: str,
         rejection_reason: str | None = None,
-    ) -> Signal:
+    ) -> TradeSignal:
         signal = self.get(session, signal_id)
         if signal is None:
-            raise ValueError("Signal not found")
+            raise ValueError("Trade signal not found")
 
         signal.status = status
         signal.rejection_reason = rejection_reason
         session.commit()
         session.refresh(signal)
         return signal
+
+
+# Backward-compatible alias while the service layer migrates.
+SignalRepository = TradeSignalRepository
 
 
 class ResearchTaskRepository:

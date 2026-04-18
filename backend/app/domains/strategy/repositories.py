@@ -6,14 +6,20 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db.exceptions import DuplicateResourceError, IntegrityConstraintError
 from app.db.models.candidate_validation_snapshot import CandidateValidationSnapshot
+from app.db.models.hypothesis import Hypothesis
 from app.db.models.screener import Screener, ScreenerVersion
+from app.db.models.signal_definition import SignalDefinition
+from app.db.models.setup import Setup
 from app.db.models.strategy import Strategy, StrategyVersion
 from app.db.models.strategy_evolution import StrategyActivationEvent, StrategyChangeEvent
 from app.db.models.strategy_scorecard import StrategyScorecard
 from app.db.models.watchlist import Watchlist, WatchlistItem
 from app.domains.strategy.schemas import (
+    HypothesisCreate,
+    SignalDefinitionCreate,
     ScreenerCreate,
     ScreenerVersionCreate,
+    SetupCreate,
     StrategyCreate,
     StrategyVersionCreate,
     WatchlistCreate,
@@ -58,6 +64,119 @@ class CandidateValidationSnapshotRepository:
         return list(session.scalars(statement).all())
 
 
+class HypothesisRepository:
+    def list(self, session: Session) -> list[Hypothesis]:
+        statement = select(Hypothesis).order_by(Hypothesis.created_at.desc())
+        return list(session.scalars(statement).all())
+
+    def create(self, session: Session, payload: HypothesisCreate) -> Hypothesis:
+        hypothesis = Hypothesis(
+            code=payload.code,
+            name=payload.name,
+            description=payload.description,
+            proposition=payload.proposition,
+            market=payload.market,
+            horizon=payload.horizon,
+            bias=payload.bias,
+            success_criteria=payload.success_criteria,
+            status=payload.status,
+            version=payload.version,
+        )
+        try:
+            session.add(hypothesis)
+            session.commit()
+            session.refresh(hypothesis)
+            return hypothesis
+        except IntegrityError as exc:
+            session.rollback()
+            self._raise_integrity_error(payload.code, exc)
+
+    @staticmethod
+    def _raise_integrity_error(code: str, exc: IntegrityError) -> None:
+        message = str(exc.orig).lower() if exc.orig is not None else str(exc).lower()
+        if "unique" in message and "hypotheses.code" in message:
+            raise DuplicateResourceError(f"Hypothesis with code '{code}' already exists") from exc
+        raise IntegrityConstraintError("Hypothesis could not be saved because of a database constraint") from exc
+
+
+class SetupRepository:
+    def list(self, session: Session) -> list[Setup]:
+        statement = select(Setup).order_by(Setup.created_at.desc())
+        return list(session.scalars(statement).all())
+
+    def create(self, session: Session, payload: SetupCreate) -> Setup:
+        setup = Setup(
+            code=payload.code,
+            name=payload.name,
+            description=payload.description,
+            hypothesis_id=payload.hypothesis_id,
+            strategy_id=payload.strategy_id,
+            timeframe=payload.timeframe,
+            ideal_context=payload.ideal_context,
+            conditions=payload.conditions,
+            parameters=payload.parameters,
+            status=payload.status,
+            version=payload.version,
+        )
+        try:
+            session.add(setup)
+            session.commit()
+            session.refresh(setup)
+            return setup
+        except IntegrityError as exc:
+            session.rollback()
+            self._raise_integrity_error(payload.code, exc)
+
+    @staticmethod
+    def _raise_integrity_error(code: str, exc: IntegrityError) -> None:
+        message = str(exc.orig).lower() if exc.orig is not None else str(exc).lower()
+        if "unique" in message and "setups.code" in message:
+            raise DuplicateResourceError(f"Setup with code '{code}' already exists") from exc
+        raise IntegrityConstraintError("Setup could not be saved because of a database constraint") from exc
+
+
+class SignalDefinitionRepository:
+    def list(self, session: Session) -> list[SignalDefinition]:
+        statement = select(SignalDefinition).order_by(SignalDefinition.created_at.desc())
+        return list(session.scalars(statement).all())
+
+    def create(self, session: Session, payload: SignalDefinitionCreate) -> SignalDefinition:
+        signal_definition = SignalDefinition(
+            code=payload.code,
+            name=payload.name,
+            description=payload.description,
+            hypothesis_id=payload.hypothesis_id,
+            strategy_id=payload.strategy_id,
+            setup_id=payload.setup_id,
+            signal_kind=payload.signal_kind,
+            definition=payload.definition,
+            parameters=payload.parameters,
+            activation_conditions=payload.activation_conditions,
+            intended_usage=payload.intended_usage,
+            status=payload.status,
+            version=payload.version,
+        )
+        try:
+            session.add(signal_definition)
+            session.commit()
+            session.refresh(signal_definition)
+            return signal_definition
+        except IntegrityError as exc:
+            session.rollback()
+            self._raise_integrity_error(payload.code, exc)
+
+    def find_by_code(self, session: Session, code: str) -> SignalDefinition | None:
+        statement = select(SignalDefinition).where(SignalDefinition.code == code)
+        return session.scalars(statement).first()
+
+    @staticmethod
+    def _raise_integrity_error(code: str, exc: IntegrityError) -> None:
+        message = str(exc.orig).lower() if exc.orig is not None else str(exc).lower()
+        if "unique" in message and "signal_definitions.code" in message:
+            raise DuplicateResourceError(f"Signal definition with code '{code}' already exists") from exc
+        raise IntegrityConstraintError("Signal definition could not be saved because of a database constraint") from exc
+
+
 class StrategyRepository:
     def list(self, session: Session) -> list[Strategy]:
         statement = select(Strategy).options(selectinload(Strategy.versions)).order_by(Strategy.created_at.desc())
@@ -72,6 +191,7 @@ class StrategyRepository:
             code=payload.code,
             name=payload.name,
             description=payload.description,
+            hypothesis_id=payload.hypothesis_id,
             market=payload.market,
             horizon=payload.horizon,
             bias=payload.bias,
@@ -213,7 +333,9 @@ class WatchlistRepository:
         watchlist = Watchlist(
             code=payload.code,
             name=payload.name,
+            hypothesis_id=payload.hypothesis_id,
             strategy_id=payload.strategy_id,
+            setup_id=payload.setup_id,
             hypothesis=payload.hypothesis,
             status=payload.status,
         )
@@ -238,6 +360,7 @@ class WatchlistRepository:
         item = WatchlistItem(
             watchlist_id=watchlist_id,
             ticker=payload.ticker,
+            setup_id=payload.setup_id,
             strategy_hypothesis=payload.strategy_hypothesis,
             score=payload.score,
             reason=payload.reason,

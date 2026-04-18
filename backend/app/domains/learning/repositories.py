@@ -12,7 +12,7 @@ from app.domains.learning.schemas import JournalEntryCreate, MemoryItemCreate, P
 
 class JournalRepository:
     def list(self, session: Session) -> list[JournalEntry]:
-        statement = select(JournalEntry).order_by(JournalEntry.event_time.desc())
+        statement = select(JournalEntry).order_by(JournalEntry.event_time.desc(), JournalEntry.id.desc())
         return list(session.scalars(statement).all())
 
     def create(self, session: Session, payload: JournalEntryCreate) -> JournalEntry:
@@ -25,7 +25,7 @@ class JournalRepository:
 
 class MemoryRepository:
     def list(self, session: Session) -> list[MemoryItem]:
-        statement = select(MemoryItem).order_by(desc(MemoryItem.importance), MemoryItem.created_at.desc())
+        statement = select(MemoryItem).order_by(desc(MemoryItem.importance), MemoryItem.created_at.desc(), MemoryItem.id.desc())
         return list(session.scalars(statement).all())
 
     def create(self, session: Session, payload: MemoryItemCreate) -> MemoryItem:
@@ -39,7 +39,7 @@ class MemoryRepository:
         statement = (
             select(MemoryItem)
             .where(MemoryItem.scope == scope)
-            .order_by(desc(MemoryItem.importance), MemoryItem.created_at.desc())
+            .order_by(desc(MemoryItem.importance), MemoryItem.created_at.desc(), MemoryItem.id.desc())
             .limit(limit)
         )
         return list(session.scalars(statement).all())

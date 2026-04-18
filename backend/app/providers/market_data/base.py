@@ -2,6 +2,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+class MarketDataProviderError(RuntimeError):
+    pass
+
+
 @dataclass
 class OHLCVCandle:
     timestamp: str

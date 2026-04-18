@@ -61,9 +61,12 @@ class OHLCVCandleRead(BaseModel):
     volume: float
 
 
-class SignalCreate(BaseModel):
+class TradeSignalCreate(BaseModel):
+    hypothesis_id: int | None = None
     strategy_id: int | None = None
     strategy_version_id: int | None = None
+    setup_id: int | None = None
+    signal_definition_id: int | None = None
     watchlist_item_id: int | None = None
     ticker: str
     timeframe: str = "1D"
@@ -78,15 +81,18 @@ class SignalCreate(BaseModel):
     rejection_reason: str | None = None
 
 
-class SignalStatusUpdate(BaseModel):
+class TradeSignalStatusUpdate(BaseModel):
     status: str
     rejection_reason: str | None = None
 
 
-class SignalRead(BaseModel):
+class TradeSignalRead(BaseModel):
     id: int
+    hypothesis_id: int | None
     strategy_id: int | None
     strategy_version_id: int | None
+    setup_id: int | None
+    signal_definition_id: int | None
     watchlist_item_id: int | None
     ticker: str
     timeframe: str
@@ -103,6 +109,12 @@ class SignalRead(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# Backward-compatible aliases while the API migrates to the clearer naming.
+SignalCreate = TradeSignalCreate
+SignalStatusUpdate = TradeSignalStatusUpdate
+SignalRead = TradeSignalRead
 
 
 class ResearchTaskCreate(BaseModel):
@@ -133,6 +145,31 @@ class ResearchTaskRead(BaseModel):
     completed_at: datetime | None
 
     model_config = {"from_attributes": True}
+
+
+class NewsArticleRead(BaseModel):
+    title: str
+    description: str | None = None
+    url: str
+    source_name: str
+    published_at: str
+    image: str | None = None
+
+
+class CalendarEventRead(BaseModel):
+    event_type: str
+    title: str
+    event_date: str
+    ticker: str | None = None
+    exchange: str | None = None
+    country: str | None = None
+    impact: str | None = None
+    estimate: str | None = None
+    actual: str | None = None
+    previous: str | None = None
+    currency: str | None = None
+    source: str
+    raw: dict | None = None
 
 
 class WorkItemRead(BaseModel):

@@ -4,10 +4,16 @@ from sqlalchemy.orm import Session
 from app.db.exceptions import DuplicateResourceError, IntegrityConstraintError
 from app.db.session import get_db_session
 from app.domains.strategy.schemas import (
+    HypothesisCreate,
+    HypothesisRead,
+    SignalDefinitionCreate,
+    SignalDefinitionRead,
     ScreenerCreate,
     ScreenerRead,
     ScreenerVersionCreate,
     ScreenerVersionRead,
+    SetupCreate,
+    SetupRead,
     StrategyCreate,
     StrategyRead,
     StrategyVersionCreate,
@@ -17,15 +23,76 @@ from app.domains.strategy.schemas import (
     WatchlistItemRead,
     WatchlistRead,
 )
-from app.domains.strategy.services import ScreenerService, StrategyService, WatchlistService
+from app.domains.strategy.services import (
+    HypothesisService,
+    SignalDefinitionService,
+    ScreenerService,
+    SetupService,
+    StrategyService,
+    WatchlistService,
+)
 
+hypotheses_router = APIRouter()
+signal_definitions_router = APIRouter()
+setups_router = APIRouter()
 strategies_router = APIRouter()
 screeners_router = APIRouter()
 watchlists_router = APIRouter()
 
+hypothesis_service = HypothesisService()
+signal_definition_service = SignalDefinitionService()
+setup_service = SetupService()
 strategy_service = StrategyService()
 screener_service = ScreenerService()
 watchlist_service = WatchlistService()
+
+
+@hypotheses_router.get("", response_model=list[HypothesisRead])
+async def list_hypotheses(session: Session = Depends(get_db_session)) -> list[HypothesisRead]:
+    return hypothesis_service.list_hypotheses(session)
+
+
+@hypotheses_router.post("", response_model=HypothesisRead, status_code=status.HTTP_201_CREATED)
+async def create_hypothesis(payload: HypothesisCreate, session: Session = Depends(get_db_session)) -> HypothesisRead:
+    try:
+        return hypothesis_service.create_hypothesis(session, payload)
+    except DuplicateResourceError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except IntegrityConstraintError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@signal_definitions_router.get("", response_model=list[SignalDefinitionRead])
+async def list_signal_definitions(session: Session = Depends(get_db_session)) -> list[SignalDefinitionRead]:
+    return signal_definition_service.list_signal_definitions(session)
+
+
+@signal_definitions_router.post("", response_model=SignalDefinitionRead, status_code=status.HTTP_201_CREATED)
+async def create_signal_definition(
+    payload: SignalDefinitionCreate,
+    session: Session = Depends(get_db_session),
+) -> SignalDefinitionRead:
+    try:
+        return signal_definition_service.create_signal_definition(session, payload)
+    except DuplicateResourceError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except IntegrityConstraintError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@setups_router.get("", response_model=list[SetupRead])
+async def list_setups(session: Session = Depends(get_db_session)) -> list[SetupRead]:
+    return setup_service.list_setups(session)
+
+
+@setups_router.post("", response_model=SetupRead, status_code=status.HTTP_201_CREATED)
+async def create_setup(payload: SetupCreate, session: Session = Depends(get_db_session)) -> SetupRead:
+    try:
+        return setup_service.create_setup(session, payload)
+    except DuplicateResourceError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except IntegrityConstraintError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @strategies_router.get("", response_model=list[StrategyRead])

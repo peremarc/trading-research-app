@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class PositionEventCreate(BaseModel):
@@ -21,7 +21,11 @@ class PositionEventRead(BaseModel):
 
 class PositionCreate(BaseModel):
     ticker: str
+    hypothesis_id: int | None = None
     signal_id: int | None = None
+    trade_signal_id: int | None = Field(default=None, exclude=True)
+    setup_id: int | None = None
+    signal_definition_id: int | None = None
     strategy_version_id: int | None = None
     analysis_run_id: int | None = None
     account_mode: str = "paper"
@@ -32,6 +36,42 @@ class PositionCreate(BaseModel):
     size: float
     thesis: str | None = None
     entry_context: dict | None = None
+    opening_reason: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_trade_signal_id(cls, data):
+        if not isinstance(data, dict):
+            return data
+
+        signal_id = data.get("signal_id")
+        trade_signal_id = data.get("trade_signal_id")
+        if signal_id is not None and trade_signal_id is not None and signal_id != trade_signal_id:
+            raise ValueError("signal_id and trade_signal_id must match when both are provided")
+
+        if signal_id is None and trade_signal_id is not None:
+            normalized = dict(data)
+            normalized["signal_id"] = trade_signal_id
+            return normalized
+
+        return data
+
+    @model_validator(mode="after")
+    def _populate_trade_signal_id(self):
+        if self.trade_signal_id is None:
+            self.trade_signal_id = self.signal_id
+        return self
+
+
+class PositionManageRequest(BaseModel):
+    event_type: str = "risk_update"
+    observed_price: float | None = None
+    stop_price: float | None = None
+    target_price: float | None = None
+    thesis: str | None = None
+    rationale: str
+    management_context: dict = Field(default_factory=dict)
+    note: str | None = None
 
 
 class PositionCloseRequest(BaseModel):
@@ -45,7 +85,11 @@ class PositionCloseRequest(BaseModel):
 class PositionRead(BaseModel):
     id: int
     ticker: str
+    hypothesis_id: int | None
     signal_id: int | None
+    trade_signal_id: int | None
+    setup_id: int | None
+    signal_definition_id: int | None
     strategy_version_id: int | None
     analysis_run_id: int | None
     account_mode: str
@@ -77,13 +121,17 @@ class AutoExitResult(BaseModel):
     position_id: int
     ticker: str
     closed: bool
+    adjusted: bool = False
     exit_price: float | None = None
     exit_reason: str
+    stop_price: float | None = None
+    target_price: float | None = None
 
 
 class AutoExitBatchResult(BaseModel):
     evaluated_positions: int
     closed_positions: int
+    adjusted_positions: int = 0
     results: list[AutoExitResult]
 
 

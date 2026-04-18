@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -29,10 +31,12 @@ class OpportunityDiscoveryService:
                 "discovered_items": 0,
                 "top_candidates": [],
                 "benchmark_ticker": self.settings.benchmark_ticker,
+                "universe_source": "disabled",
+                "scanner_types_used": [],
             }
 
         watchlists = [watchlist for watchlist in self.watchlist_service.list_watchlists(session) if watchlist.status == "active"]
-        universe = self._parse_universe(self.settings.opportunity_discovery_universe)
+        universe, universe_source, scanner_types_used = self._resolve_universe()
         benchmark = self.market_data_service.get_snapshot(self.settings.benchmark_ticker)
         discovered_items = 0
         top_candidates: list[dict] = []
@@ -93,6 +97,7 @@ class OpportunityDiscoveryService:
                         },
                         state="watching",
                     ),
+                    event_source="opportunity_discovery",
                 )
                 discovered_items += 1
                 existing.add(candidate["ticker"])
@@ -113,8 +118,53 @@ class OpportunityDiscoveryService:
             "discovered_items": discovered_items,
             "top_candidates": top_candidates[:5],
             "benchmark_ticker": self.settings.benchmark_ticker,
+            "universe_source": universe_source,
+            "scanner_types_used": scanner_types_used,
         }
+
+    def _resolve_universe(self) -> tuple[list[str], str, list[str]]:
+        fallback_universe = self._parse_universe(self.settings.opportunity_discovery_universe)
+        universe_source = str(getattr(self.settings, "opportunity_discovery_universe_source", "configured_list")).strip().lower()
+        if universe_source != "ibkr_scanner":
+            return fallback_universe, "configured_list", []
+
+        provider = getattr(self.market_data_service, "provider", None)
+        get_scanner_universe = getattr(provider, "get_scanner_universe", None)
+        if not callable(get_scanner_universe):
+            return fallback_universe, "configured_list_fallback", []
+
+        scanner_types = self._parse_universe(self.settings.opportunity_discovery_scanner_types)
+        if not scanner_types:
+            return fallback_universe, "configured_list_fallback", []
+
+        try:
+            universe = get_scanner_universe(
+                scanner_types,
+                instrument=self.settings.opportunity_discovery_scanner_instrument,
+                location=self.settings.opportunity_discovery_scanner_location,
+                filters=self._parse_scanner_filters(self.settings.opportunity_discovery_scanner_filters_json),
+                limit=self.settings.opportunity_discovery_universe_limit,
+            )
+        except (RuntimeError, TypeError, ValueError):
+            return fallback_universe, "configured_list_fallback", []
+
+        normalized_universe = [ticker.strip().upper() for ticker in universe if isinstance(ticker, str) and ticker.strip()]
+        if normalized_universe:
+            return normalized_universe, "ibkr_scanner", scanner_types
+        return fallback_universe, "configured_list_fallback", scanner_types
 
     @staticmethod
     def _parse_universe(raw_universe: str) -> list[str]:
         return [ticker.strip().upper() for ticker in raw_universe.split(",") if ticker.strip()]
+
+    @staticmethod
+    def _parse_scanner_filters(raw_filters: str) -> list[dict]:
+        if not raw_filters.strip():
+            return []
+        try:
+            payload = json.loads(raw_filters)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]

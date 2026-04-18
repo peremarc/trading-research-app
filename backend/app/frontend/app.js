@@ -1,11 +1,31 @@
 const API_PREFIX = "/api/v1";
+const AUTO_REFRESH_MS = 10000;
 
 const elements = {
   activityFeed: document.getElementById("activity-feed"),
+  botAttentionCard: document.getElementById("bot-attention-card"),
+  botAttentionDetail: document.getElementById("bot-attention-detail"),
+  botAttentionHeadline: document.getElementById("bot-attention-headline"),
+  botAttentionPill: document.getElementById("bot-attention-pill"),
+  botCycleRuns: document.getElementById("bot-cycle-runs"),
+  botLastSuccess: document.getElementById("bot-last-success"),
+  botNextRun: document.getElementById("bot-next-run"),
+  botPauseReason: document.getElementById("bot-pause-reason"),
+  botPhase: document.getElementById("bot-phase"),
+  botRuntimeDetail: document.getElementById("bot-runtime-detail"),
+  botStatusHeadline: document.getElementById("bot-status-headline"),
+  botToggle: document.getElementById("bot-toggle"),
   candidateValidations: document.getElementById("candidate-validations"),
+  chatForm: document.getElementById("chat-form"),
+  chatInput: document.getElementById("chat-input"),
+  chatSend: document.getElementById("chat-send"),
+  chatThread: document.getElementById("chat-thread"),
   cycleOutput: document.getElementById("cycle-output"),
   focusBoard: document.getElementById("focus-board"),
+  incidentBoard: document.getElementById("incident-board"),
   journalFeed: document.getElementById("journal-feed"),
+  marketStateOverview: document.getElementById("market-state-overview"),
+  marketStateTrail: document.getElementById("market-state-trail"),
   metricsGrid: document.getElementById("metrics-grid"),
   metricTemplate: document.getElementById("metric-card-template"),
   nextFocus: document.getElementById("next-focus"),
@@ -13,20 +33,23 @@ const elements = {
   pipelineDetail: document.getElementById("pipeline-detail"),
   pipelinesList: document.getElementById("pipelines-list"),
   researchTasks: document.getElementById("research-tasks"),
+  runtimeSummary: document.getElementById("runtime-summary"),
   statusBadge: document.getElementById("status-badge"),
   workQueue: document.getElementById("work-queue"),
 };
 
 const state = {
+  chatMessages: [],
   dashboards: null,
   lastCycleResponse: null,
+  scheduler: null,
   selectedStrategyId: null,
 };
 
 document.querySelectorAll("[data-action]").forEach((button) => {
   button.addEventListener("click", async () => {
     button.disabled = true;
-    setStatus(`Ejecutando ${button.dataset.action.toUpperCase()}...`);
+    setStatus(button.dataset.action === "toggle-bot" ? "Actualizando bot..." : "Refrescando...");
     try {
       await handleAction(button.dataset.action);
     } catch (error) {
@@ -37,62 +60,65 @@ document.querySelectorAll("[data-action]").forEach((button) => {
   });
 });
 
+elements.chatForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const message = elements.chatInput.value.trim();
+  if (!message) return;
+  await sendChatMessage(message);
+});
+
+document.querySelectorAll("[data-chat-prompt]").forEach((button) => {
+  button.addEventListener("click", async () => {
+    const message = button.dataset.chatPrompt?.trim();
+    if (!message) return;
+    await sendChatMessage(message);
+  });
+});
+
 boot();
+window.setInterval(() => {
+  refreshDashboard().catch(setError);
+}, AUTO_REFRESH_MS);
 
 async function boot() {
   setStatus("Cargando consola...");
+  seedChat();
   try {
     await refreshDashboard();
-    setStatus("Sincronizado");
   } catch (error) {
     setError(error);
   }
 }
 
+function seedChat() {
+  if (state.chatMessages.length) return;
+  state.chatMessages = [
+    {
+      role: "assistant",
+      topic: "overview",
+      text: "Puedes preguntarme que he descubierto, que estoy haciendo, que herramientas faltan o un resumen de las ultimas operaciones.",
+    },
+  ];
+  renderChatThread();
+}
+
 async function handleAction(action) {
   if (action === "refresh") {
     await refreshDashboard();
-    setStatus("Sincronizado");
     return;
   }
 
-  if (action === "seed") {
-    state.lastCycleResponse = await request("/bootstrap/seed", { method: "POST" });
+  if (action === "toggle-bot") {
+    const isRunning = state.scheduler?.bot?.status === "running";
+    state.lastCycleResponse = await request(isRunning ? "/scheduler/pause" : "/scheduler/start", { method: "POST" });
+    renderCycleOutput();
+    await refreshDashboard();
   }
-
-  if (action === "recalculate") {
-    state.lastCycleResponse = await request("/strategy-health/recalculate", { method: "POST" });
-  }
-
-  if (action === "plan") {
-    state.lastCycleResponse = await request("/orchestrator/plan", {
-      method: "POST",
-      body: JSON.stringify({
-        cycle_date: new Date().toISOString().slice(0, 10),
-        market_context: { source: "frontend-console" },
-      }),
-    });
-  }
-
-  if (action === "do") {
-    state.lastCycleResponse = await request("/orchestrator/do", { method: "POST" });
-  }
-
-  if (action === "check") {
-    state.lastCycleResponse = await request("/orchestrator/check", { method: "POST" });
-  }
-
-  if (action === "act") {
-    state.lastCycleResponse = await request("/orchestrator/act", { method: "POST" });
-  }
-
-  renderCycleOutput();
-  await refreshDashboard();
-  setStatus(`Ultima accion: ${action.toUpperCase()}`);
 }
 
 async function refreshDashboard() {
   const [
+    scheduler,
     health,
     pipelines,
     queue,
@@ -102,7 +128,10 @@ async function refreshDashboard() {
     activations,
     journal,
     positions,
+    marketStateSnapshots,
+    macroContext,
   ] = await Promise.all([
+    request("/scheduler/status"),
     request("/strategy-health"),
     request("/strategy-health/pipelines"),
     request("/work-queue"),
@@ -112,14 +141,19 @@ async function refreshDashboard() {
     request("/strategy-evolution/activations"),
     request("/journal"),
     request("/positions"),
+    request("/macro/state-snapshots?limit=6"),
+    request("/macro/context?limit=6"),
   ]);
 
+  state.scheduler = scheduler;
   state.dashboards = {
     activations,
     candidateValidations,
     changes,
     health,
     journal,
+    macroContext,
+    marketStateSnapshots,
     positions,
     pipelines,
     queue,
@@ -136,30 +170,77 @@ async function refreshDashboard() {
 }
 
 function renderDashboard() {
-  const { health, pipelines, queue, researchTasks, candidateValidations, changes, activations, journal, positions } = state.dashboards;
+  const {
+    health,
+    pipelines,
+    queue,
+    researchTasks,
+    candidateValidations,
+    changes,
+    activations,
+    journal,
+    macroContext,
+    marketStateSnapshots,
+    positions,
+  } = state.dashboards;
+  const bot = state.scheduler.bot;
+  const ai = state.scheduler.ai || {
+    enabled: false,
+    provider: "gemini",
+    model: "gemini-2.5-flash",
+    ready: false,
+    fallback_provider: "openai_compatible",
+    fallback_model: "qwen2.5:3b",
+    active_provider: null,
+    active_model: null,
+    decision_count: 0,
+    fallback_count: 0,
+    last_error: null,
+    last_decision_summary: null,
+  };
+  const incidents = bot.incidents || [];
+  const openIncidents = incidents.filter((incident) => incident.status === "open");
   const openResearch = researchTasks.filter((task) => task.status !== "completed");
   const topItem = queue.items[0] || null;
   const activeStrategies = pipelines.filter((item) => item.active_version).length;
-  const degradedStrategies = pipelines.filter((item) => item.strategy_status === "degraded").length;
   const candidateVersions = pipelines.reduce((acc, item) => acc + item.candidate_versions.length, 0);
   const promotedCandidates = candidateValidations.filter((item) => item.evaluation_status === "promote").length;
   const rejectedCandidates = candidateValidations.filter((item) => item.evaluation_status === "reject").length;
-  const validationTrades = candidateValidations.reduce((acc, item) => acc + item.trade_count, 0);
+  const latestMarketState = marketStateSnapshots[0] || null;
 
-  elements.nextFocus.textContent = topItem ? topItem.title : "Sin backlog prioritario";
+  elements.nextFocus.textContent = openIncidents.length
+    ? openIncidents[0].title
+    : topItem
+      ? topItem.title
+      : "Sin backlog prioritario";
+  elements.runtimeSummary.textContent = summarizeRuntime(bot);
+  updateBotBadge(bot);
+  updateBotToggle(bot);
+  renderRuntimeCards(bot, state.scheduler.jobs || []);
 
   renderMetrics([
+    ["Bot", bot.status.toUpperCase(), bot.pause_reason || "Sin bloqueo activo"],
+    ["Fase", bot.current_phase ? bot.current_phase.toUpperCase() : (bot.last_successful_phase || "idle").toUpperCase(), bot.current_phase ? "Ciclo en ejecucion" : `Ultima fase OK: ${bot.last_successful_phase || "ninguna"}`],
+    ["Motor IA", ai.enabled ? (ai.ready ? "ACTIVO" : "DEGRADADO") : "OFF", ai.last_error || ai.last_decision_summary || "Sin decision registrada"],
+    ["Proveedor IA", ai.active_provider || ai.provider || "-", ai.active_model ? `${ai.active_model} · decisiones ${ai.decision_count}` : "Sin proveedor activo"],
+    ["Fallback IA", ai.fallback_model || "-", ai.enabled ? `${ai.fallback_provider || "-"} · usos ${ai.fallback_count || 0}` : "Cadena IA desactivada"],
+    ["Incidencias abiertas", openIncidents.length, openIncidents.length ? "Revisar antes de reanudar" : "Sin errores bloqueantes"],
+    ["Ciclos autonomos", bot.cycle_runs, bot.last_cycle_completed_at ? `Ultimo cierre: ${formatDate(bot.last_cycle_completed_at)}` : "Aun no ha cerrado ciclos"],
+    ["Cadencia", formatCadence(bot), cadenceDescription(bot)],
+    ["Regimen activo", latestMarketState ? humanizeLabel(latestMarketState.regime_label) : "PENDIENTE", latestMarketState ? `${(latestMarketState.pdca_phase || "general").toUpperCase()} · ${formatDate(latestMarketState.created_at)}` : "Ejecuta PLAN o DO para fijarlo"],
     ["Estrategias activas", activeStrategies, `${pipelines.length} pipelines visibles`],
-    ["Estrategias degradadas", degradedStrategies, "Piden validacion o rediseno"],
     ["Versiones candidatas", candidateVersions, "Pendientes de validar o promover"],
     ["Research abierto", openResearch.length, "Incluye recovery research"],
     ["Backlog total", queue.total_items, topItem ? `Primero: ${topItem.priority}` : "Sin cola activa"],
     ["Promociones validadas", promotedCandidates, "Candidatas que ya demostraron edge"],
-    ["Candidatas rechazadas", rejectedCandidates, "Miden lineas de recuperacion fallidas"],
-    ["Trades de validacion", validationTrades, `${average(health.map((item) => item.fitness_score)).toFixed(2)} fitness medio`],
+    ["Candidatas rechazadas", rejectedCandidates, "Versiones archivadas tras validacion"],
+    ["Posiciones abiertas", positions.filter((position) => position.status === "open").length, "Exposicion paper actual"],
+    ["Fitness medio", average(health.map((item) => item.fitness_score)).toFixed(2), "Salud agregada del laboratorio"],
   ]);
 
-  renderFocusBoard(queue, pipelines, openResearch);
+  renderIncidents(incidents);
+  renderMarketState(marketStateSnapshots, macroContext);
+  renderFocusBoard(queue, pipelines, openResearch, bot);
   renderPipelines(pipelines);
   renderPipelineDetail(pipelines.find((item) => item.strategy_id === state.selectedStrategyId) || null);
   renderWorkQueue(queue);
@@ -169,6 +250,210 @@ function renderDashboard() {
   renderOpenPositions(positions, pipelines);
   renderJournalFeed(journal);
   renderCycleOutput();
+}
+
+function renderMarketState(snapshots, macroContext) {
+  if (!elements.marketStateOverview || !elements.marketStateTrail) return;
+
+  const latest = Array.isArray(snapshots) && snapshots.length ? snapshots[0] : null;
+  const fallbackMacro = asObject(macroContext);
+
+  if (!latest) {
+    elements.marketStateOverview.innerHTML = `
+      <article class="world-state-card">
+        <span class="focus-kicker">Snapshot pendiente</span>
+        <h3>El bot todavia no ha capturado un Market State Snapshot persistido.</h3>
+        <p class="muted">${escapeHtml(fallbackMacro.summary || "Ejecuta PLAN o DO para fijar el estado del mundo antes de decidir.")}</p>
+        <div class="row">${renderPillList((fallbackMacro.active_regimes || []).slice(0, 4), "pill-candidate", "Sin regimen activo")}</div>
+      </article>
+    `;
+    renderStackList(
+      elements.marketStateTrail,
+      [],
+      () => "",
+      "Aun no hay snapshots. Ejecuta PLAN o DO para abrir la traza del regimen operativo.",
+    );
+    return;
+  }
+
+  const payload = asObject(latest.snapshot_payload);
+  const protocolState = asObject(payload.market_state_snapshot);
+  const benchmark = asObject(payload.benchmark_snapshot);
+  const backlog = asObject(payload.backlog);
+  const macro = asObject(payload.macro_context, fallbackMacro);
+  const regime = asObject(payload.market_regime);
+  const calendarEvents = Array.isArray(payload.calendar_events)
+    ? payload.calendar_events
+    : (Array.isArray(protocolState.corporate_calendar) ? protocolState.corporate_calendar : []);
+  const activeWatchlists = Array.isArray(protocolState.active_watchlists) ? protocolState.active_watchlists : [];
+  const openPositions = Array.isArray(protocolState.open_positions) ? protocolState.open_positions : [];
+  const activeRegimes = Array.isArray(macro.active_regimes) ? macro.active_regimes : [];
+  const calendarError = typeof payload.calendar_error === "string" && payload.calendar_error ? payload.calendar_error : null;
+  const executionMode = protocolState.execution_mode || latest.execution_mode || "global";
+  const regimeLabel = latest.regime_label || regime.label || "range_mixed";
+  const confidence = latest.regime_confidence ?? regime.confidence ?? null;
+  const exposureItems = [
+    ...activeWatchlists.slice(0, 3).map((watchlist) => ({
+      title: watchlist.name || watchlist.code || "Watchlist",
+      detail: watchlist.tickers?.length ? `tickers ${watchlist.tickers.slice(0, 3).join(", ")}` : "Sin tickers destacados",
+      aside: `${watchlist.active_item_count ?? watchlist.item_count ?? 0} activos`,
+    })),
+    ...openPositions.slice(0, 3).map((position) => ({
+      title: `${position.ticker || "?"} · ${position.side || "long"}`,
+      detail: position.thesis || "Sin thesis persistida",
+      aside: position.stop_price ? `stop ${formatPrice(position.stop_price)}` : "sin stop",
+    })),
+  ];
+  const benchmarkSummary = [
+    Number.isFinite(benchmark.price) ? `price ${formatPrice(benchmark.price)}` : null,
+    Number.isFinite(benchmark.month_performance) ? `MTD ${formatSignedPctFromDecimal(benchmark.month_performance)}` : null,
+  ].filter(Boolean).join(" · ") || `ticker ${latest.benchmark_ticker || "SPY"}`;
+
+  elements.marketStateOverview.innerHTML = `
+    <article class="world-state-card">
+      <div class="world-state-top">
+        <div>
+          <span class="focus-kicker">Snapshot activo</span>
+          <h3>${escapeHtml(humanizeLabel(regimeLabel))}</h3>
+          <p class="muted">${escapeHtml(latest.summary || "Sin resumen operativo.")}</p>
+        </div>
+        <div class="row">
+          ${pill((latest.pdca_phase || "general").toUpperCase(), "pill-info")}
+          ${pill(humanizeLabel(latest.trigger || "snapshot"), "pill-approved")}
+          ${pill(`conf ${formatConfidencePct(confidence)}`, regimePillClass(regimeLabel))}
+        </div>
+      </div>
+
+      <div class="world-state-stat-grid">
+        ${snapshotStat("Benchmark", latest.benchmark_ticker || "SPY", benchmarkSummary)}
+        ${snapshotStat("Modo", humanizeLabel(executionMode), `trigger ${latest.trigger || "snapshot"}`)}
+        ${snapshotStat("Posiciones", String(backlog.open_positions_count ?? openPositions.length ?? 0), openPositions.length ? `${openPositions.length} capturadas` : "Sin exposicion abierta")}
+        ${snapshotStat("Watchlists", String(backlog.active_watchlists_count ?? activeWatchlists.length ?? 0), activeWatchlists.length ? activeWatchlists.slice(0, 2).map((item) => item.code || item.name || "watchlist").join(" · ") : "Sin listas activas")}
+        ${snapshotStat("Research", String(backlog.open_research_tasks ?? 0), `${backlog.pending_reviews ?? 0} reviews pendientes`)}
+        ${snapshotStat("Confianza", formatConfidencePct(confidence), humanizeLabel(regimeLabel))}
+      </div>
+
+      <div class="world-state-detail-grid">
+        <div class="meta-block">
+          <strong>Macro y calendario</strong>
+          <div class="muted">${escapeHtml(macro.summary || fallbackMacro.summary || "Sin resumen macro persistido.")}</div>
+          <div class="row">${renderPillList(activeRegimes.slice(0, 4), "pill-candidate", "Sin tags macro activas")}</div>
+          <div class="snapshot-list">
+            ${renderSnapshotItems(
+              calendarEvents.slice(0, 4).map((event) => ({
+                title: event.title || event.event_type || "Evento",
+                detail: event.source || event.event_type || "Calendario",
+                aside: event.event_date || "sin fecha",
+              })),
+              calendarError || "Sin eventos macro proximos registrados.",
+            )}
+          </div>
+        </div>
+
+        <div class="meta-block">
+          <strong>Watchlists y exposicion</strong>
+          <div class="muted">${escapeHtml(`Snapshot ${latest.id} · ${formatDate(latest.created_at)} · mode ${executionMode}`)}</div>
+          <div class="snapshot-list">
+            ${renderSnapshotItems(exposureItems, "Sin watchlists ni posiciones abiertas en esta captura.")}
+          </div>
+        </div>
+      </div>
+    </article>
+  `;
+
+  renderStackList(
+    elements.marketStateTrail,
+    snapshots.slice(0, 6),
+    (snapshot) => {
+      const snapshotPayload = asObject(snapshot.snapshot_payload);
+      const snapshotBacklog = asObject(snapshotPayload.backlog);
+      return `
+        <h3>${escapeHtml(humanizeLabel(snapshot.regime_label || "snapshot"))}</h3>
+        <div class="row">
+          ${pill((snapshot.pdca_phase || "general").toUpperCase(), "pill-info")}
+          ${pill(humanizeLabel(snapshot.trigger || "snapshot"), "pill-approved")}
+          ${pill(`conf ${formatConfidencePct(snapshot.regime_confidence)}`, regimePillClass(snapshot.regime_label))}
+        </div>
+        <p class="muted">${escapeHtml(snapshot.summary || "Sin resumen.")}</p>
+        <p class="muted">
+          open=${snapshotBacklog.open_positions_count ?? 0}
+          · watchlists=${snapshotBacklog.active_watchlists_count ?? 0}
+          · ${escapeHtml(formatDate(snapshot.created_at))}
+        </p>
+      `;
+    },
+    "Aun no hay snapshots registrados.",
+  );
+}
+
+function renderRuntimeCards(bot, jobs) {
+  const nextRun = jobs[0]?.next_run_time || null;
+  const openIncident = bot.incidents.find((incident) => incident.status === "open") || null;
+
+  elements.botStatusHeadline.textContent = bot.status.toUpperCase();
+  elements.botRuntimeDetail.textContent = summarizeRuntime(bot);
+  elements.botPhase.textContent = (bot.current_phase || bot.last_successful_phase || "idle").toUpperCase();
+  elements.botNextRun.textContent = nextRun ? formatDate(nextRun) : "sin programar";
+  elements.botCycleRuns.textContent = String(bot.cycle_runs ?? 0);
+  elements.botLastSuccess.textContent = (bot.last_successful_phase || "ninguna").toUpperCase();
+
+  if (openIncident) {
+    elements.botAttentionCard.classList.add("is-alert");
+    elements.botAttentionHeadline.textContent = openIncident.title;
+    elements.botAttentionDetail.textContent = openIncident.detail;
+    elements.botAttentionPill.textContent = "Incidencia abierta";
+    elements.botAttentionPill.className = "pill pill-reject";
+    elements.botPauseReason.textContent = bot.pause_reason || "Bloqueado";
+    elements.botPauseReason.className = "pill pill-degraded";
+  } else {
+    elements.botAttentionCard.classList.remove("is-alert");
+    elements.botAttentionHeadline.textContent = bot.status === "running" ? "Bot operativo" : "Sin incidencias";
+    elements.botAttentionDetail.textContent = bot.status === "running"
+      ? "El bot esta ejecutando su bucle autonomo y seguira mientras no aparezcan incidencias."
+      : "No hay incidencias abiertas. Puedes arrancar el bot cuando quieras.";
+    elements.botAttentionPill.textContent = bot.status === "running" ? "Operando" : "Estable";
+    elements.botAttentionPill.className = `pill ${bot.status === "running" ? "pill-active" : "pill-approved"}`;
+    elements.botPauseReason.textContent = bot.pause_reason || "Sin bloqueo";
+    elements.botPauseReason.className = "pill pill-approved";
+  }
+}
+
+function updateBotBadge(bot) {
+  elements.statusBadge.textContent = bot.status.toUpperCase();
+  elements.statusBadge.className = `status-badge ${botStatusClass(bot)}`;
+}
+
+function updateBotToggle(bot) {
+  const isRunning = bot.status === "running";
+  elements.botToggle.textContent = isRunning ? "Pausar Bot" : "Arrancar Bot";
+  elements.botToggle.className = `action ${isRunning ? "action-alert" : "action-success"}`;
+}
+
+function summarizeRuntime(bot) {
+  if (bot.requires_attention && bot.incidents.length) {
+    return `Bloqueado por incidencia desde ${formatDate(bot.incidents[0].detected_at)}`;
+  }
+  if (bot.status === "running") {
+    if (bot.current_phase) {
+      return `Ejecutando fase ${bot.current_phase.toUpperCase()} · ciclos completados ${bot.cycle_runs}`;
+    }
+    return `Bot en ${formatCadence(bot).toLowerCase()} · ultimo cierre ${formatDate(bot.last_cycle_completed_at)}`;
+  }
+  return bot.pause_reason || "Bot en pausa.";
+}
+
+function formatCadence(bot) {
+  if (bot.cadence_mode === "continuous") {
+    return `CONTINUO · ${bot.continuous_idle_seconds}s`;
+  }
+  return `CADA ${bot.interval_minutes}M`;
+}
+
+function cadenceDescription(bot) {
+  if (bot.cadence_mode === "continuous") {
+    return "Lanza el siguiente ciclo al terminar el anterior";
+  }
+  return "Cadencia del bucle autonomo";
 }
 
 function renderMetrics(cards) {
@@ -182,26 +467,54 @@ function renderMetrics(cards) {
   });
 }
 
-function renderFocusBoard(queue, pipelines, openResearch) {
+function renderIncidents(incidents) {
+  renderStackList(
+    elements.incidentBoard,
+    incidents,
+    (incident) => `
+      <div class="stack-item incident-card${incident.status === "resolved" ? " is-resolved" : ""}">
+        <h3>${escapeHtml(incident.title)}</h3>
+        <div class="row">
+          ${pill(incident.source, "pill-info")}
+          ${pill(incident.status, incident.status === "open" ? "pill-reject" : "pill-active")}
+        </div>
+        <p class="muted">${escapeHtml(incident.detail)}</p>
+        <p class="muted">detectada=${escapeHtml(formatDate(incident.detected_at))}${incident.resolved_at ? ` · resuelta=${escapeHtml(formatDate(incident.resolved_at))}` : ""}</p>
+      </div>
+    `,
+    "Sin incidencias registradas. Si una API falla, el bot se pausara automaticamente aqui.",
+    true,
+  );
+}
+
+function renderFocusBoard(queue, pipelines, openResearch, bot) {
   const topItem = queue.items[0];
   const degradedWithCandidates = pipelines.filter(
     (item) => item.strategy_status === "degraded" && item.candidate_versions.length > 0,
   );
+  const latestIncident = bot.incidents.find((incident) => incident.status === "open") || null;
 
   const cards = [
-    topItem
+    latestIncident
       ? {
-          kicker: "Proximo paso",
-          title: topItem.title,
-          pills: [pill(topItem.priority, priorityClass(topItem.priority)), pill(topItem.item_type, "pill-info")],
-          body: formatContext(topItem.context),
+          kicker: "Bloqueo activo",
+          title: latestIncident.title,
+          pills: [pill("Incidencia", "pill-reject"), pill(latestIncident.source, "pill-info")],
+          body: latestIncident.detail,
         }
-      : {
-          kicker: "Proximo paso",
-          title: "No hay trabajo urgente",
-          pills: [pill("IDLE", "pill-approved")],
-          body: "El sistema no tiene cola priorizada en este momento.",
-        },
+      : topItem
+        ? {
+            kicker: "Siguiente foco",
+            title: topItem.title,
+            pills: [pill(topItem.priority, priorityClass(topItem.priority)), pill(topItem.item_type, "pill-info")],
+            body: formatContext(topItem.context),
+          }
+        : {
+            kicker: "Siguiente foco",
+            title: "No hay trabajo urgente",
+            pills: [pill("IDLE", "pill-active")],
+            body: "El sistema no tiene cola priorizada en este momento.",
+          },
     {
       kicker: "Recuperacion",
       title: `${degradedWithCandidates.length} estrategias degradadas con candidata`,
@@ -213,7 +526,7 @@ function renderFocusBoard(queue, pipelines, openResearch) {
     {
       kicker: "Research",
       title: `${openResearch.length} tareas abiertas`,
-      pills: [pill("Backlog", "pill-approved")],
+      pills: [pill(bot.status === "running" ? "Autonomous" : "Paused", botStatusClass(bot))],
       body: openResearch.length
         ? openResearch.slice(0, 3).map((task) => task.title).join(" - ")
         : "No hay research tasks abiertas.",
@@ -499,7 +812,7 @@ function renderOpenPositions(positions, pipelines) {
   });
 }
 
-function renderStackList(container, items, renderer, emptyMessage) {
+function renderStackList(container, items, renderer, emptyMessage, renderAlreadyWrapped = false) {
   container.innerHTML = "";
   if (!items.length) {
     container.innerHTML = `<div class="stack-item"><p class="muted">${emptyMessage}</p></div>`;
@@ -507,6 +820,10 @@ function renderStackList(container, items, renderer, emptyMessage) {
   }
 
   items.forEach((item) => {
+    if (renderAlreadyWrapped) {
+      container.insertAdjacentHTML("beforeend", renderer(item));
+      return;
+    }
     const node = document.createElement("article");
     node.className = "stack-item";
     node.innerHTML = renderer(item);
@@ -517,7 +834,76 @@ function renderStackList(container, items, renderer, emptyMessage) {
 function renderCycleOutput() {
   elements.cycleOutput.textContent = state.lastCycleResponse
     ? JSON.stringify(state.lastCycleResponse, null, 2)
-    : "Todavia no se ha ejecutado ninguna fase manual.";
+    : JSON.stringify(state.scheduler?.bot || { status: "idle" }, null, 2);
+}
+
+function renderChatThread() {
+  if (!elements.chatThread) return;
+
+  elements.chatThread.innerHTML = "";
+  state.chatMessages.forEach((message) => {
+    const node = document.createElement("article");
+    node.className = `chat-bubble ${message.role === "user" ? "chat-bubble-user" : "chat-bubble-assistant"}`;
+    node.innerHTML = `
+      <div class="chat-meta">
+        <span>${message.role === "user" ? "Tu" : "Bot"}</span>
+        ${message.topic ? pill(message.topic, message.role === "user" ? "pill-approved" : "pill-info") : ""}
+      </div>
+      <div class="chat-text">${escapeHtml(message.text)}</div>
+    `;
+    elements.chatThread.appendChild(node);
+  });
+  elements.chatThread.scrollTop = elements.chatThread.scrollHeight;
+}
+
+async function sendChatMessage(message) {
+  state.chatMessages.push({ role: "user", text: message });
+  renderChatThread();
+  elements.chatInput.value = "";
+  elements.chatSend.disabled = true;
+
+  try {
+    const payload = await request("/chat", {
+      method: "POST",
+      body: JSON.stringify({ message }),
+    });
+    state.chatMessages.push({
+      role: "assistant",
+      topic: payload.topic,
+      text: payload.reply,
+    });
+    renderChatThread();
+    renderSuggestedPrompts(payload.suggested_prompts || []);
+  } catch (error) {
+    state.chatMessages.push({
+      role: "assistant",
+      topic: "error",
+      text: error instanceof Error ? error.message : String(error),
+    });
+    renderChatThread();
+    throw error;
+  } finally {
+    elements.chatSend.disabled = false;
+  }
+}
+
+function renderSuggestedPrompts(prompts) {
+  const container = document.querySelector(".chat-suggestions");
+  if (!container || !Array.isArray(prompts) || !prompts.length) return;
+  container.innerHTML = prompts
+    .map(
+      (prompt) => `
+        <button class="chat-chip" data-chat-prompt="${escapeHtml(prompt)}">${escapeHtml(prompt)}</button>
+      `,
+    )
+    .join("");
+  container.querySelectorAll("[data-chat-prompt]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const message = button.dataset.chatPrompt?.trim();
+      if (!message) return;
+      await sendChatMessage(message);
+    });
+  });
 }
 
 async function request(path, options = {}) {
@@ -551,9 +937,17 @@ function setStatus(text) {
 
 function setError(error) {
   const message = error instanceof Error ? error.message : String(error);
-  setStatus("Error");
-  state.lastCycleResponse = { error: message };
+  state.lastCycleResponse = { error: message, captured_at: new Date().toISOString() };
   renderCycleOutput();
+  elements.statusBadge.textContent = "ERROR";
+  elements.statusBadge.className = "status-badge pill-reject";
+  elements.runtimeSummary.textContent = message;
+}
+
+function botStatusClass(bot) {
+  if (bot.requires_attention) return "pill-reject";
+  if (bot.status === "running") return "pill-active";
+  return "pill-approved";
 }
 
 function pill(text, className) {
@@ -595,6 +989,42 @@ function formatJournalMeta(entry) {
   return parts.join(" - ");
 }
 
+function snapshotStat(label, value, footnote) {
+  return `
+    <div class="snapshot-stat">
+      <span class="snapshot-stat-label">${escapeHtml(label)}</span>
+      <strong class="snapshot-stat-value">${escapeHtml(value)}</strong>
+      <small class="snapshot-stat-footnote">${escapeHtml(footnote)}</small>
+    </div>
+  `;
+}
+
+function renderSnapshotItems(items, emptyMessage) {
+  if (!Array.isArray(items) || !items.length) {
+    return `<div class="muted">${escapeHtml(emptyMessage)}</div>`;
+  }
+  return items
+    .map(
+      (item) => `
+        <div class="snapshot-item">
+          <div>
+            <strong>${escapeHtml(item.title || "Item")}</strong>
+            <p>${escapeHtml(item.detail || "Sin detalle")}</p>
+          </div>
+          <span>${escapeHtml(item.aside || "")}</span>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderPillList(values, className, emptyText) {
+  if (!Array.isArray(values) || !values.length) {
+    return emptyText ? pill(emptyText, "pill-approved") : "";
+  }
+  return values.map((value) => pill(value, className)).join("");
+}
+
 function formatDate(value) {
   if (!value) return "sin fecha";
   const date = new Date(value);
@@ -612,11 +1042,39 @@ function formatNumber(value) {
 }
 
 function formatPct(value) {
-  return Number.isFinite(value) ? `${(Number(value) * 100).toFixed(1)}%` : "n/a";
+  return Number.isFinite(value) ? `${Number(value).toFixed(1)}%` : "n/a";
+}
+
+function formatConfidencePct(value) {
+  return Number.isFinite(value) ? `${Math.round(Number(value) * 100)}%` : "n/a";
 }
 
 function formatPrice(value) {
   return Number.isFinite(value) ? Number(value).toFixed(2) : "n/a";
+}
+
+function formatSignedPctFromDecimal(value) {
+  if (!Number.isFinite(value)) return "n/a";
+  const pct = Number(value) * 100;
+  return `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%`;
+}
+
+function humanizeLabel(value) {
+  const cleaned = String(value || "").trim().replaceAll("_", " ").replaceAll("-", " ");
+  if (!cleaned) return "Sin definir";
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
+function regimePillClass(label) {
+  const normalized = String(label || "").toLowerCase();
+  if (normalized.includes("bull")) return "pill-active";
+  if (normalized.includes("risk") || normalized.includes("uncert")) return "pill-reject";
+  if (normalized.includes("range") || normalized.includes("mixed") || normalized.includes("selective")) return "pill-degraded";
+  return "pill-info";
+}
+
+function asObject(value, fallback = {}) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : fallback;
 }
 
 function describeStrategy(position, strategy) {

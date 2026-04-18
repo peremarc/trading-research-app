@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import date, datetime
 
 from pydantic import BaseModel, Field
@@ -129,6 +131,7 @@ class OrchestratorPlanResponse(BaseModel):
     status: str
     summary: str
     market_context: dict
+    market_state_snapshot: MarketStateSnapshotRead | None = None
     work_queue: WorkQueueRead | None = None
 
 
@@ -137,6 +140,7 @@ class OrchestratorPhaseResponse(BaseModel):
     status: str
     summary: str
     metrics: dict
+    market_state_snapshot: MarketStateSnapshotRead | None = None
 
 
 class ExecutionCandidateResult(BaseModel):
@@ -144,6 +148,7 @@ class ExecutionCandidateResult(BaseModel):
     watchlist_item_id: int
     analysis_run_id: int
     signal_id: int | None = None
+    trade_signal_id: int | None = None
     decision: str
     score: float
     position_id: int | None = None
@@ -157,6 +162,7 @@ class OrchestratorDoResponse(BaseModel):
     generated_analyses: int
     opened_positions: int
     candidates: list[ExecutionCandidateResult]
+    market_state_snapshot: MarketStateSnapshotRead | None = None
     exits: AutoExitBatchResult | None = None
     discovery: dict | None = None
 
@@ -167,3 +173,86 @@ class OrchestratorActResponse(BaseModel):
     summary: str
     metrics: dict
     generated_variants: int
+    market_state_snapshot: MarketStateSnapshotRead | None = None
+
+
+class BotChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class BotChatResponse(BaseModel):
+    topic: str
+    reply: str
+    suggested_prompts: list[str] = Field(default_factory=list)
+    context: dict = Field(default_factory=dict)
+
+
+class MacroSignalCreate(BaseModel):
+    key: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1, max_length=4000)
+    regime: str = Field(default="neutral", min_length=1, max_length=40)
+    relevance: str = Field(default="general", min_length=1, max_length=60)
+    tickers: list[str] = Field(default_factory=list)
+    timeframe: str | None = Field(default=None, max_length=60)
+    scenario: str | None = Field(default=None, max_length=500)
+    source: str | None = Field(default=None, max_length=120)
+    evidence: dict = Field(default_factory=dict)
+    importance: float = Field(default=0.7, ge=0.0, le=1.0)
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+
+
+class MacroSignalRead(BaseModel):
+    id: int
+    memory_type: str
+    scope: str
+    key: str
+    content: str
+    meta: dict
+    importance: float
+    valid_from: datetime | None
+    valid_to: datetime | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class MacroContextRead(BaseModel):
+    summary: str
+    active_regimes: list[str] = Field(default_factory=list)
+    relevance_tags: list[str] = Field(default_factory=list)
+    tracked_tickers: list[str] = Field(default_factory=list)
+    signals: list[dict] = Field(default_factory=list)
+
+
+class MarketStateSnapshotRead(BaseModel):
+    id: int
+    trigger: str
+    pdca_phase: str | None
+    execution_mode: str
+    benchmark_ticker: str
+    regime_label: str
+    regime_confidence: float | None
+    summary: str
+    snapshot_payload: dict
+    source_context: dict
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AgentToolDefinitionRead(BaseModel):
+    name: str
+    category: str
+    description: str
+    input_schema: dict = Field(default_factory=dict)
+
+
+class AgentToolCallRequest(BaseModel):
+    tool_name: str
+    arguments: dict = Field(default_factory=dict)
+
+
+class AgentToolCallResponse(BaseModel):
+    tool_name: str
+    result: dict = Field(default_factory=dict)

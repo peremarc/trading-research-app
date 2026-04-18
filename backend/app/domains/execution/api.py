@@ -7,6 +7,7 @@ from app.domains.execution.schemas import (
     PositionCloseRequest,
     PositionCreate,
     PositionEventCreate,
+    PositionManageRequest,
     PositionEventRead,
     PositionRead,
     TradeReviewCreate,
@@ -43,6 +44,20 @@ async def add_position_event(
         return position_service.add_event(session, position_id, payload)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@positions_router.post("/{position_id}/manage", response_model=PositionRead, status_code=status.HTTP_200_OK)
+async def manage_position(
+    position_id: int,
+    payload: PositionManageRequest,
+    session: Session = Depends(get_db_session),
+) -> PositionRead:
+    try:
+        return position_service.manage_position(session, position_id, payload)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = status.HTTP_400_BAD_REQUEST if "open positions" in detail else status.HTTP_404_NOT_FOUND
+        raise HTTPException(status_code=status_code, detail=detail) from exc
 
 
 @positions_router.post("/{position_id}/close", response_model=PositionRead, status_code=status.HTTP_200_OK)

@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
-from app.providers.market_data.base import MarketDataProvider, MarketSnapshot, OHLCVCandle
+from app.providers.market_data.base import MarketDataProvider, MarketDataProviderError, MarketSnapshot, OHLCVCandle
 
 
-class TwelveDataError(RuntimeError):
+class TwelveDataError(MarketDataProviderError):
     pass
 
 
@@ -62,8 +62,15 @@ class TwelveDataProvider(MarketDataProvider):
             }
         )
         url = f"{self.base_url}?{query}"
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "trading-research-app/0.1 (+https://localhost)",
+                "Accept": "application/json",
+            },
+        )
         try:
-            with urlopen(url, timeout=15) as response:
+            with urlopen(request, timeout=15) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except (HTTPError, URLError, TimeoutError) as exc:
             raise TwelveDataError(f"Twelve Data request failed for {ticker}: {exc}") from exc

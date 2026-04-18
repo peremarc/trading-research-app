@@ -1,21 +1,39 @@
 from __future__ import annotations
 
+import unicodedata
+import re
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import Settings, get_settings
 from app.db.models.analysis import AnalysisRun
+from app.db.models.candidate_validation_snapshot import CandidateValidationSnapshot
+from app.db.models.decision_context import DecisionContextSnapshot
+from app.db.models.journal import JournalEntry
+from app.db.models.memory import MemoryItem
 from app.db.models.position import Position
+from app.db.models.research_task import ResearchTask
+from app.db.models.signal_definition import SignalDefinition
 from app.db.models.strategy import Strategy, StrategyVersion
+from app.db.models.strategy_evolution import StrategyActivationEvent, StrategyChangeEvent
 from app.db.models.trade_review import TradeReview
 from app.db.models.watchlist import Watchlist, WatchlistItem
+from app.domains.learning.agent import AIDecisionError, AutonomousTradingAgentService
+from app.domains.learning.decisioning import DecisionContextAssemblerService, EntryScoringService, PositionSizingService
+from app.domains.learning.relevance import DecisionContextService, FeatureRelevanceService, StrategyContextAdaptationService
+from app.domains.learning.world_state import MarketStateService
+from app.domains.learning.tools import AgentToolGatewayService
 from app.domains.learning.repositories import FailurePatternRepository, JournalRepository, MemoryRepository, PDCACycleRepository
 from app.domains.learning.schemas import (
     AutoReviewBatchResult,
     AutoReviewResult,
+    BotChatResponse,
     DailyPlanRequest,
     ExecutionCandidateResult,
     JournalEntryCreate,
     MemoryItemCreate,
+    MarketStateSnapshotRead,
     OrchestratorActResponse,
     OrchestratorDoResponse,
     OrchestratorPhaseResponse,
@@ -23,10 +41,20 @@ from app.domains.learning.schemas import (
     PDCACycleCreate,
 )
 from app.domains.market.schemas import AnalysisRunCreate, SignalCreate
-from app.domains.execution.schemas import AutoExitBatchResult, PositionCreate, TradeReviewCreate
+from app.domains.execution.schemas import AutoExitBatchResult, TradeReviewCreate
+from app.domains.learning.macro import MacroContextService
+from app.providers.calendar import CalendarProviderError
+from app.providers.news import NewsProviderError
 
 
 class JournalService:
+    RETENTION_LIMITS: dict[str, int] = {
+        "pdca_do": 288,
+        "pdca_check": 288,
+        "pdca_act": 288,
+        "strategy_evolution_success": 160,
+    }
+
     def __init__(self, repository: JournalRepository | None = None) -> None:
         self.repository = repository or JournalRepository()
 
@@ -34,10 +62,50 @@ class JournalService:
         return self.repository.list(session)
 
     def create_entry(self, session: Session, payload: JournalEntryCreate):
-        return self.repository.create(session, payload)
+        entry = self.repository.create(session, payload)
+        self._apply_retention(session, entry.entry_type)
+        return entry
+
+    @classmethod
+    def _stale_entry_ids(cls, session: Session, *, entry_type: str, keep_latest: int) -> list[int]:
+        if keep_latest <= 0:
+            return [
+                item_id
+                for (item_id,) in session.query(JournalEntry.id)
+                .filter(JournalEntry.entry_type == entry_type)
+                .all()
+            ]
+        rows = (
+            session.query(JournalEntry.id)
+            .filter(JournalEntry.entry_type == entry_type)
+            .order_by(JournalEntry.event_time.desc(), JournalEntry.id.desc())
+            .offset(keep_latest)
+            .all()
+        )
+        return [item_id for (item_id,) in rows]
+
+    @classmethod
+    def _apply_retention(cls, session: Session, entry_type: str) -> int:
+        keep_latest = cls.RETENTION_LIMITS.get(entry_type)
+        if keep_latest is None:
+            return 0
+        stale_ids = cls._stale_entry_ids(session, entry_type=entry_type, keep_latest=keep_latest)
+        if not stale_ids:
+            return 0
+        session.query(JournalEntry).filter(JournalEntry.id.in_(stale_ids)).delete(synchronize_session=False)
+        session.commit()
+        return len(stale_ids)
 
 
 class MemoryService:
+    RETENTION_LIMITS_EXACT: dict[tuple[str, str], int] = {
+        ("episodic", "pdca_check"): 288,
+        ("episodic", "pdca_act"): 288,
+    }
+    RETENTION_LIMITS_PREFIX: dict[tuple[str, str], int] = {
+        ("strategy_evolution", "strategy:"): 120,
+    }
+
     def __init__(self, repository: MemoryRepository | None = None) -> None:
         self.repository = repository or MemoryRepository()
 
@@ -45,10 +113,651 @@ class MemoryService:
         return self.repository.list(session)
 
     def create_item(self, session: Session, payload: MemoryItemCreate):
-        return self.repository.create(session, payload)
+        item = self.repository.create(session, payload)
+        self._apply_retention(session, item.memory_type, item.scope)
+        return item
 
     def retrieve_scope(self, session: Session, scope: str, limit: int = 10):
         return self.repository.retrieve(session, scope=scope, limit=limit)
+
+    @classmethod
+    def _retention_limit(cls, memory_type: str, scope: str) -> int | None:
+        exact = cls.RETENTION_LIMITS_EXACT.get((memory_type, scope))
+        if exact is not None:
+            return exact
+        for (rule_type, prefix), keep_latest in cls.RETENTION_LIMITS_PREFIX.items():
+            if memory_type == rule_type and scope.startswith(prefix):
+                return keep_latest
+        return None
+
+    @classmethod
+    def _stale_item_ids(cls, session: Session, *, memory_type: str, scope: str, keep_latest: int) -> list[int]:
+        if keep_latest <= 0:
+            return [
+                item_id
+                for (item_id,) in session.query(MemoryItem.id)
+                .filter(MemoryItem.memory_type == memory_type, MemoryItem.scope == scope)
+                .all()
+            ]
+        rows = (
+            session.query(MemoryItem.id)
+            .filter(MemoryItem.memory_type == memory_type, MemoryItem.scope == scope)
+            .order_by(MemoryItem.created_at.desc(), MemoryItem.id.desc())
+            .offset(keep_latest)
+            .all()
+        )
+        return [item_id for (item_id,) in rows]
+
+    @classmethod
+    def _apply_retention(cls, session: Session, memory_type: str, scope: str) -> int:
+        keep_latest = cls._retention_limit(memory_type, scope)
+        if keep_latest is None:
+            return 0
+        stale_ids = cls._stale_item_ids(
+            session,
+            memory_type=memory_type,
+            scope=scope,
+            keep_latest=keep_latest,
+        )
+        if not stale_ids:
+            return 0
+        session.query(MemoryItem).filter(MemoryItem.id.in_(stale_ids)).delete(synchronize_session=False)
+        session.commit()
+        return len(stale_ids)
+
+
+class LearningHistoryMaintenanceService:
+    def trim_history(self, session: Session, *, dry_run: bool = True) -> dict:
+        journal_summary = self.prune_journal_entries(session, dry_run=dry_run)
+        memory_summary = self.prune_memory_items(session, dry_run=dry_run)
+        return {
+            "dry_run": dry_run,
+            "journal": journal_summary,
+            "memory": memory_summary,
+            "deleted_total": journal_summary["deleted_count"] + memory_summary["deleted_count"],
+        }
+
+    def prune_journal_entries(self, session: Session, *, dry_run: bool = True) -> dict:
+        deleted_ids: list[int] = []
+        rules: list[dict] = []
+        for entry_type, keep_latest in JournalService.RETENTION_LIMITS.items():
+            stale_ids = JournalService._stale_entry_ids(session, entry_type=entry_type, keep_latest=keep_latest)
+            if stale_ids and not dry_run:
+                session.query(JournalEntry).filter(JournalEntry.id.in_(stale_ids)).delete(synchronize_session=False)
+            deleted_ids.extend(stale_ids)
+            rules.append(
+                {
+                    "entry_type": entry_type,
+                    "keep_latest": keep_latest,
+                    "deleted_count": len(stale_ids),
+                }
+            )
+        if deleted_ids and not dry_run:
+            session.commit()
+        return {
+            "deleted_count": len(deleted_ids),
+            "deleted_ids": deleted_ids,
+            "rules": rules,
+        }
+
+    def prune_memory_items(self, session: Session, *, dry_run: bool = True) -> dict:
+        deleted_ids: list[int] = []
+        rules: list[dict] = []
+
+        for (memory_type, scope), keep_latest in MemoryService.RETENTION_LIMITS_EXACT.items():
+            stale_ids = MemoryService._stale_item_ids(
+                session,
+                memory_type=memory_type,
+                scope=scope,
+                keep_latest=keep_latest,
+            )
+            if stale_ids and not dry_run:
+                session.query(MemoryItem).filter(MemoryItem.id.in_(stale_ids)).delete(synchronize_session=False)
+            deleted_ids.extend(stale_ids)
+            rules.append(
+                {
+                    "memory_type": memory_type,
+                    "scope": scope,
+                    "keep_latest": keep_latest,
+                    "deleted_count": len(stale_ids),
+                }
+            )
+
+        for (memory_type, prefix), keep_latest in MemoryService.RETENTION_LIMITS_PREFIX.items():
+            scopes = [
+                scope
+                for (scope,) in session.query(MemoryItem.scope)
+                .filter(MemoryItem.memory_type == memory_type, MemoryItem.scope.like(f"{prefix}%"))
+                .distinct()
+                .all()
+            ]
+            for scope in scopes:
+                stale_ids = MemoryService._stale_item_ids(
+                    session,
+                    memory_type=memory_type,
+                    scope=scope,
+                    keep_latest=keep_latest,
+                )
+                if stale_ids and not dry_run:
+                    session.query(MemoryItem).filter(MemoryItem.id.in_(stale_ids)).delete(synchronize_session=False)
+                deleted_ids.extend(stale_ids)
+                rules.append(
+                    {
+                        "memory_type": memory_type,
+                        "scope": scope,
+                        "keep_latest": keep_latest,
+                        "deleted_count": len(stale_ids),
+                    }
+                )
+
+        if deleted_ids and not dry_run:
+            session.commit()
+        return {
+            "deleted_count": len(deleted_ids),
+            "deleted_ids": deleted_ids,
+            "rules": rules,
+        }
+
+
+class BotChatService:
+    def __init__(
+        self,
+        *,
+        settings: Settings | None = None,
+        research_service: object | None = None,
+        work_queue_service: object | None = None,
+        news_service: object | None = None,
+        calendar_service: object | None = None,
+        macro_context_service: MacroContextService | None = None,
+        market_state_service: MarketStateService | None = None,
+    ) -> None:
+        self.settings = settings or get_settings()
+        if research_service is None:
+            from app.domains.market.services import ResearchService
+
+            research_service = ResearchService()
+        if work_queue_service is None:
+            from app.domains.market.services import WorkQueueService
+
+            work_queue_service = WorkQueueService()
+        if news_service is None:
+            from app.domains.market.services import NewsService
+
+            news_service = NewsService()
+        if calendar_service is None:
+            from app.domains.market.services import CalendarService
+
+            calendar_service = CalendarService()
+        if macro_context_service is None:
+            macro_context_service = MacroContextService()
+        if market_state_service is None:
+            market_state_service = MarketStateService(settings=self.settings)
+        self.research_service = research_service
+        self.work_queue_service = work_queue_service
+        self.news_service = news_service
+        self.calendar_service = calendar_service
+        self.macro_context_service = macro_context_service
+        self.market_state_service = market_state_service
+
+    def _get_latest_market_state_context(self, session: Session) -> dict | None:
+        snapshot = self.market_state_service.get_latest_snapshot(session)
+        if snapshot is None:
+            return None
+        payload = snapshot.snapshot_payload if isinstance(snapshot.snapshot_payload, dict) else {}
+        backlog = payload.get("backlog") if isinstance(payload.get("backlog"), dict) else {}
+        macro_context = payload.get("macro_context") if isinstance(payload.get("macro_context"), dict) else {}
+        active_regimes = macro_context.get("active_regimes") if isinstance(macro_context.get("active_regimes"), list) else []
+        return {
+            "snapshot_id": snapshot.id,
+            "trigger": snapshot.trigger,
+            "pdca_phase": snapshot.pdca_phase,
+            "regime_label": snapshot.regime_label,
+            "regime_confidence": snapshot.regime_confidence,
+            "summary": snapshot.summary,
+            "created_at": snapshot.created_at.isoformat() if snapshot.created_at is not None else None,
+            "open_positions_count": backlog.get("open_positions_count"),
+            "active_watchlists_count": backlog.get("active_watchlists_count"),
+            "open_research_tasks": backlog.get("open_research_tasks"),
+            "active_regimes": active_regimes,
+        }
+
+    def reply(self, session: Session, message: str) -> BotChatResponse:
+        topic = self._classify_topic(message)
+
+        if topic == "discoveries":
+            reply, context = self._build_discoveries_reply(session)
+        elif topic == "news":
+            reply, context = self._build_news_reply(session, message)
+        elif topic == "calendar":
+            reply, context = self._build_calendar_reply(session, message)
+        elif topic == "macro":
+            reply, context = self._build_macro_reply(session)
+        elif topic == "status":
+            reply, context = self._build_status_reply(session)
+        elif topic == "tools":
+            reply, context = self._build_tools_reply(session)
+        elif topic == "operations":
+            reply, context = self._build_operations_reply(session)
+        else:
+            reply, context = self._build_overview_reply(session)
+
+        return BotChatResponse(
+            topic=topic,
+            reply=reply,
+            suggested_prompts=self._suggested_prompts(topic),
+            context=context,
+        )
+
+    def _build_status_reply(self, session: Session) -> tuple[str, dict]:
+        from app.domains.system.runtime import scheduler_service
+
+        status = scheduler_service.get_status_payload()
+        bot = status["bot"]
+        queue = self.work_queue_service.get_queue(session)
+        open_research = [task for task in self.research_service.list_tasks(session) if task.status != "completed"]
+        open_positions = session.query(Position).filter(Position.status == "open").count()
+        latest_incident = next((item for item in bot["incidents"] if item["status"] == "open"), None)
+        top_item = queue.items[0] if queue.items else None
+        latest_market_state = self._get_latest_market_state_context(session)
+
+        lines = [
+            f"Ahora mismo el bot está {bot['status'].upper()}.",
+            (
+                f"Fase actual: {bot['current_phase']}."
+                if bot["current_phase"]
+                else f"Última fase correcta: {bot['last_successful_phase'] or 'ninguna'}."
+            ),
+            f"Ciclos completados: {bot['cycle_runs']}. Posiciones abiertas: {open_positions}.",
+        ]
+        if latest_market_state is not None:
+            lines.append(
+                "Último market state: "
+                f"régimen {latest_market_state['regime_label']} en fase {latest_market_state['pdca_phase'] or 'general'}."
+            )
+        if latest_incident is not None:
+            lines.append(f"Está bloqueado por una incidencia: {latest_incident['title']}.")
+        elif top_item is not None:
+            lines.append(f"El foco inmediato es: {top_item.title}.")
+        else:
+            lines.append("No veo una incidencia abierta ni una cola prioritaria urgente.")
+        if open_research:
+            lines.append(f"Tiene {len(open_research)} tareas de research activas.")
+
+        return " ".join(lines), {
+            "bot_status": bot["status"],
+            "current_phase": bot["current_phase"],
+            "cycle_runs": bot["cycle_runs"],
+            "open_positions": open_positions,
+            "open_research_tasks": len(open_research),
+            "top_queue_item": top_item.title if top_item is not None else None,
+            "latest_incident": latest_incident["title"] if latest_incident is not None else None,
+            "market_state": latest_market_state,
+        }
+
+    def _build_discoveries_reply(self, session: Session) -> tuple[str, dict]:
+        open_tasks = list(
+            session.scalars(
+                select(ResearchTask).where(ResearchTask.status != "completed").order_by(ResearchTask.created_at.desc()).limit(3)
+            ).all()
+        )
+        latest_changes = list(
+            session.scalars(select(StrategyChangeEvent).order_by(StrategyChangeEvent.created_at.desc()).limit(3)).all()
+        )
+        latest_activations = list(
+            session.scalars(
+                select(StrategyActivationEvent).order_by(StrategyActivationEvent.created_at.desc()).limit(3)
+            ).all()
+        )
+        latest_validations = list(
+            session.scalars(
+                select(CandidateValidationSnapshot).order_by(CandidateValidationSnapshot.generated_at.desc()).limit(3)
+            ).all()
+        )
+
+        discoveries: list[str] = []
+        if latest_validations:
+            for snapshot in latest_validations:
+                discoveries.append(
+                    f"validación candidata v{snapshot.strategy_version_id} de estrategia {snapshot.strategy_id}: "
+                    f"{snapshot.evaluation_status} con win rate {snapshot.win_rate or 0:.1f}% y {snapshot.trade_count} trades"
+                )
+        if latest_activations:
+            discoveries.append(f"última activación automática: {latest_activations[0].activation_reason}")
+        if latest_changes:
+            discoveries.append(f"último cambio de estrategia: {latest_changes[0].change_reason}")
+        if open_tasks:
+            discoveries.append(f"research abierto: {open_tasks[0].title}")
+
+        if not discoveries:
+            reply = (
+                "Todavía no tengo descubrimientos materiales persistidos. "
+                "Ahora mismo conviene ejecutar ciclos DO/CHECK o arrancar el scheduler para generar señales, research y cambios."
+            )
+        else:
+            reply = "Lo más relevante que he descubierto o dejado preparado es: " + "; ".join(discoveries[:4]) + "."
+
+        return reply, {
+            "open_research_titles": [task.title for task in open_tasks],
+            "latest_change_reasons": [item.change_reason for item in latest_changes],
+            "latest_activation_reasons": [item.activation_reason for item in latest_activations],
+            "candidate_validation_statuses": [item.evaluation_status for item in latest_validations],
+        }
+
+    def _build_tools_reply(self, session: Session) -> tuple[str, dict]:
+        from app.domains.system.runtime import scheduler_service
+
+        ai_status = scheduler_service.get_status_payload()["ai"]
+        gaps: list[str] = []
+
+        if not ai_status["enabled"]:
+            gaps.append("activar un proveedor de IA operativo para que el bot pueda razonar y explicar mejor sus decisiones")
+        elif not ai_status["ready"]:
+            gaps.append("credenciales válidas para el proveedor de IA configurado")
+
+        if self.settings.market_data_provider == "stub":
+            gaps.append("activar el proxy interno de IBKR para dejar de depender del proveedor stub")
+        elif self.settings.market_data_provider == "twelve_data" and not self.settings.twelve_data_api_key:
+            gaps.append("una API key de Twelve Data para dejar de depender del proveedor stub")
+
+        if session.query(Position).filter(Position.account_mode != "paper").count() == 0:
+            gaps.append("integración de broker o execution gateway, porque ahora mismo solo veo paper trading")
+
+        if session.query(AnalysisRun).count() == 0:
+            gaps.append("más flujo de análisis persistido para comparar setups y medir mejor qué funciona")
+
+        gaps.append("alguna fuente externa de noticias, catalysts o sentimiento, que hoy no aparece integrada en esta MVP")
+        gaps.append("un módulo de backtesting/replay más explícito para validar cambios antes de promover estrategias")
+
+        reply = (
+            "Viendo el código y la configuración actual, las herramientas que más faltan para mejorar resultados son: "
+            + "; ".join(gaps[:5])
+            + "."
+        )
+        return reply, {
+            "ai_enabled": ai_status["enabled"],
+            "ai_ready": ai_status["ready"],
+            "market_data_provider": self.settings.market_data_provider,
+            "using_stub_market_data": self.settings.market_data_provider == "stub",
+            "has_twelve_data_key": bool(self.settings.twelve_data_api_key),
+            "paper_only_positions": session.query(Position).filter(Position.account_mode != "paper").count() == 0,
+        }
+
+    def _build_news_reply(self, session: Session, message: str) -> tuple[str, dict]:
+        ticker = self._extract_ticker_candidate(message)
+        query = ticker if ticker else message
+
+        try:
+            articles = (
+                self.news_service.list_news_for_ticker(ticker, max_results=5)
+                if ticker
+                else self.news_service.list_news(query, max_results=5)
+            )
+        except NewsProviderError as exc:
+            return (
+                f"No puedo traer noticias ahora mismo: {exc}.",
+                {"query": query, "articles": [], "ticker": ticker, "error": str(exc)},
+            )
+
+        if not articles:
+            if not self.settings.gnews_api_key:
+                return (
+                    "No puedo traer noticias porque GNews no está configurado todavía en el backend activo.",
+                    {"query": query, "articles": [], "ticker": ticker},
+                )
+            return (
+                f"No encontré noticias recientes para {ticker or query}.",
+                {"query": query, "articles": [], "ticker": ticker},
+            )
+
+        summaries = [
+            f"{article.title} ({article.source_name}, {article.published_at[:10]})"
+            for article in articles[:3]
+        ]
+        prefix = f"Noticias recientes para {ticker}: " if ticker else f"Noticias recientes para '{query}': "
+        return prefix + "; ".join(summaries) + ".", {
+            "query": query,
+            "ticker": ticker,
+            "articles": [
+                {
+                    "title": article.title,
+                    "source_name": article.source_name,
+                    "published_at": article.published_at,
+                    "url": article.url,
+                }
+                for article in articles
+            ],
+        }
+
+    def _build_operations_reply(self, session: Session) -> tuple[str, dict]:
+        latest_positions = list(
+            session.scalars(
+                select(Position).order_by(Position.exit_date.desc().nullslast(), Position.entry_date.desc()).limit(5)
+            ).all()
+        )
+        closed_positions = list(session.scalars(select(Position).where(Position.status == "closed")).all())
+        open_positions = [position for position in latest_positions if position.status == "open"]
+        wins = [position for position in closed_positions if (position.pnl_pct or 0.0) > 0]
+        losses = [position for position in closed_positions if (position.pnl_pct or 0.0) <= 0]
+        avg_realized = (
+            round(sum((position.pnl_pct or 0.0) for position in closed_positions) / len(closed_positions), 2)
+            if closed_positions
+            else None
+        )
+
+        if not latest_positions:
+            return (
+                "Todavía no hay operaciones registradas. En cuanto el bot abra o cierre posiciones, aquí podré resumirte entradas, salidas y PnL.",
+                {
+                    "latest_positions": [],
+                    "closed_positions": 0,
+                    "open_positions": 0,
+                    "avg_realized_pnl_pct": None,
+                },
+            )
+
+        summaries = []
+        for position in latest_positions[:4]:
+            status = "abierta" if position.status == "open" else f"cerrada {position.pnl_pct or 0:.2f}%"
+            reason = position.exit_reason or position.thesis or "sin detalle"
+            summaries.append(f"{position.ticker}: {status} ({reason})")
+
+        reply = (
+            f"Resumen rápido de las últimas operaciones: {'; '.join(summaries)}. "
+            f"Acumulado cerrado: {len(closed_positions)} trades, {len(wins)} ganadoras, {len(losses)} perdedoras"
+            + (f", PnL medio {avg_realized:.2f}%." if avg_realized is not None else ".")
+        )
+        return reply, {
+            "latest_positions": [
+                {
+                    "ticker": position.ticker,
+                    "status": position.status,
+                    "pnl_pct": position.pnl_pct,
+                    "exit_reason": position.exit_reason,
+                }
+                for position in latest_positions
+            ],
+            "closed_positions": len(closed_positions),
+            "open_positions": len(open_positions),
+            "wins": len(wins),
+            "losses": len(losses),
+            "avg_realized_pnl_pct": avg_realized,
+        }
+
+    def _build_macro_reply(self, session: Session) -> tuple[str, dict]:
+        context = self.macro_context_service.get_context(session, limit=6).model_dump(mode="json")
+        latest_market_state = self._get_latest_market_state_context(session)
+        dominant_regimes = context["active_regimes"][:3] or (latest_market_state or {}).get("active_regimes", [])[:3]
+        lines = [context["summary"]]
+        if latest_market_state is not None:
+            confidence_suffix = (
+                f" con confianza {latest_market_state['regime_confidence']:.2f}"
+                if latest_market_state.get("regime_confidence") is not None
+                else ""
+            )
+            lines.append(
+                "Último Market State Snapshot: "
+                f"régimen {latest_market_state['regime_label']} en fase {latest_market_state['pdca_phase'] or 'general'}{confidence_suffix}."
+            )
+        if dominant_regimes:
+            lines.append(f"Regimenes dominantes: {', '.join(dominant_regimes)}.")
+        if context["signals"]:
+            top_lines = [
+                f"{signal['key']}: {signal['content']}"
+                for signal in context["signals"][:3]
+            ]
+            lines.append(f"Señales más relevantes: {'; '.join(top_lines)}.")
+        return " ".join(lines), {
+            **context,
+            "market_state": latest_market_state,
+        }
+
+    def _build_calendar_reply(self, session: Session, message: str) -> tuple[str, dict]:
+        del session
+        ticker = self._extract_ticker_candidate(message)
+        try:
+            events = (
+                self.calendar_service.list_ticker_events(ticker, days_ahead=30)
+                if ticker
+                else self.calendar_service.list_macro_events(days_ahead=14)
+            )
+        except CalendarProviderError as exc:
+            return (
+                f"No puedo traer calendario ahora mismo: {exc}.",
+                {"ticker": ticker, "events": [], "error": str(exc)},
+            )
+
+        if ticker:
+            if not events:
+                return (
+                    f"No veo eventos corporativos próximos para {ticker} o el calendario externo no está configurado.",
+                    {"ticker": ticker, "events": []},
+                )
+            reply = (
+                f"Próximos eventos corporativos para {ticker}: "
+                + "; ".join(f"{event.title} ({event.event_date})" for event in events[:3])
+                + "."
+            )
+            return reply, {
+                "ticker": ticker,
+                "events": [event.__dict__ for event in events],
+            }
+
+        if not events:
+            return (
+                "No veo eventos macro próximos o el calendario externo no está configurado.",
+                {"events": []},
+            )
+        reply = (
+            "Próximos eventos macro relevantes: "
+            + "; ".join(f"{event.title} ({event.event_date})" for event in events[:4])
+            + "."
+        )
+        return reply, {"events": [event.__dict__ for event in events]}
+
+    def _build_overview_reply(self, session: Session) -> tuple[str, dict]:
+        status_reply, status_context = self._build_status_reply(session)
+        discoveries_reply, discoveries_context = self._build_discoveries_reply(session)
+        operations_reply, operations_context = self._build_operations_reply(session)
+        macro_reply, macro_context = self._build_macro_reply(session)
+        reply = f"{status_reply} {discoveries_reply} {operations_reply} {macro_reply}"
+        return reply, {
+            "status": status_context,
+            "discoveries": discoveries_context,
+            "operations": operations_context,
+            "macro": macro_context,
+        }
+
+    @staticmethod
+    def _normalize_message(message: str) -> str:
+        normalized = unicodedata.normalize("NFKD", message.lower())
+        return "".join(char for char in normalized if not unicodedata.combining(char))
+
+    def _classify_topic(self, message: str) -> str:
+        text = self._normalize_message(message)
+
+        if any(token in text for token in ["noticia", "noticias", "news", "catalyst", "catalysts", "titulares"]):
+            return "news"
+        if any(
+            token in text
+            for token in ["earnings", "calendario", "evento", "eventos", "ipc", "cpi", "fomc", "dividendo", "split"]
+        ):
+            return "calendar"
+        if any(
+            token in text
+            for token in [
+                "macro",
+                "geopolit",
+                "fed",
+                "tipos",
+                "inflacion",
+                "petroleo",
+                "guerra",
+                "eleccion",
+                "regimen",
+                "rates",
+            ]
+        ):
+            return "macro"
+        if any(token in text for token in ["operacion", "trade", "trades", "pnl", "ultimo", "ultimas"]):
+            return "operations"
+        if any(token in text for token in ["descubr", "detect", "hall", "research", "oportun"]):
+            return "discoveries"
+        if any(token in text for token in ["herramient", "falta", "faltan", "mejorar", "improve", "tool"]):
+            return "tools"
+        if any(token in text for token in ["haciendo", "doing", "estado", "status", "ahora", "runtime"]):
+            return "status"
+        return "overview"
+
+    @staticmethod
+    def _suggested_prompts(topic: str) -> list[str]:
+        suggestions = {
+            "news": [
+                "Noticias de NVDA",
+                "Catalysts recientes de AAPL",
+                "Ultimas noticias del mercado",
+            ],
+            "calendar": [
+                "Proximos earnings de NVDA",
+                "Que eventos macro hay esta semana",
+                "Calendario corporativo de AAPL",
+            ],
+            "discoveries": [
+                "Que has descubierto hoy",
+                "Que candidatos merecen promocion",
+                "Que research sigue abierto",
+            ],
+            "macro": [
+                "Cual es el contexto macro actual",
+                "Que regimen de mercado estas viendo",
+                "Que riesgos geopoliticos importan ahora",
+            ],
+            "status": [
+                "Que estas haciendo ahora",
+                "Cual es tu siguiente foco",
+                "Por que estas en pausa",
+            ],
+            "tools": [
+                "Que herramientas te faltan",
+                "Como mejorarias el stack actual",
+                "Que integracion aporta mas valor",
+            ],
+            "operations": [
+                "Resumen de las ultimas operaciones",
+                "Cuantas posiciones abiertas hay",
+                "Cuales fueron las ultimas perdidas",
+            ],
+            "overview": [
+                "Dame un resumen general",
+                "Que has descubierto",
+                "Que estas haciendo ahora",
+            ],
+        }
+        return suggestions[topic]
+
+    @staticmethod
+    def _extract_ticker_candidate(message: str) -> str | None:
+        matches = re.findall(r"\b[A-Z]{2,6}\b", message)
+        return matches[0] if matches else None
 
 
 class FailureAnalysisService:
@@ -267,6 +976,16 @@ class OrchestratorService:
         work_queue_service: object | None = None,
         strategy_evolution_service: object | None = None,
         opportunity_discovery_service: object | None = None,
+        trading_agent_service: AutonomousTradingAgentService | None = None,
+        agent_tool_gateway_service: AgentToolGatewayService | None = None,
+        market_state_service: MarketStateService | None = None,
+        decision_context_service: DecisionContextService | None = None,
+        feature_relevance_service: FeatureRelevanceService | None = None,
+        strategy_context_adaptation_service: StrategyContextAdaptationService | None = None,
+        decision_context_assembler_service: DecisionContextAssemblerService | None = None,
+        entry_scoring_service: EntryScoringService | None = None,
+        position_sizing_service: PositionSizingService | None = None,
+        halt_on_market_data_failure: bool = False,
     ) -> None:
         self.pdca_service = pdca_service or PDCACycleService()
         self.journal_service = journal_service or JournalService()
@@ -278,11 +997,14 @@ class OrchestratorService:
         if market_data_service is None:
             from app.domains.market.services import MarketDataService
 
-            market_data_service = MarketDataService()
+            market_data_service = MarketDataService(raise_on_provider_error=halt_on_market_data_failure)
         if signal_service is None:
+            from app.domains.market.analysis import FusedAnalysisService
             from app.domains.market.services import SignalService
 
-            signal_service = SignalService()
+            signal_service = SignalService(
+                fused_analysis_service=FusedAnalysisService(market_data_service=market_data_service)
+            )
         if position_service is None:
             from app.domains.execution.services import PositionService
 
@@ -331,6 +1053,20 @@ class OrchestratorService:
 
             work_queue_service = WorkQueueService(failure_analysis_service=self.failure_analysis_service)
         self.work_queue_service = work_queue_service
+        self.trading_agent_service = trading_agent_service or AutonomousTradingAgentService()
+        self.agent_tool_gateway_service = agent_tool_gateway_service or AgentToolGatewayService()
+        self.market_state_service = market_state_service or MarketStateService(
+            settings=self.trading_agent_service.settings,
+            market_data_service=self.market_data_service,
+        )
+        self.decision_context_service = decision_context_service or DecisionContextService()
+        self.feature_relevance_service = feature_relevance_service or FeatureRelevanceService()
+        self.strategy_context_adaptation_service = strategy_context_adaptation_service or StrategyContextAdaptationService()
+        self.decision_context_assembler_service = decision_context_assembler_service or DecisionContextAssemblerService(
+            strategy_context_adaptation_service=self.strategy_context_adaptation_service
+        )
+        self.entry_scoring_service = entry_scoring_service or EntryScoringService()
+        self.position_sizing_service = position_sizing_service or PositionSizingService()
 
     @staticmethod
     def _get_execution_version(strategy: Strategy | None) -> tuple[int | None, bool]:
@@ -345,7 +1081,39 @@ class OrchestratorService:
 
         return strategy.current_version_id, False
 
+    @staticmethod
+    def _classify_guard_results(guard_results: dict | None) -> tuple[str | None, str]:
+        if not isinstance(guard_results, dict) or not guard_results.get("blocked"):
+            return None, "keep_on_watchlist"
+
+        guard_types = {
+            str(item).strip()
+            for item in guard_results.get("types", [])
+            if isinstance(item, str) and str(item).strip()
+        }
+        if "regime_policy" in guard_types:
+            return "regime_policy", "skip_regime_policy"
+        if "learned_rule" in guard_types:
+            return "learned_rule", "skip_strategy_context_rule"
+        if "portfolio_limit" in guard_types:
+            return "portfolio_limit", "skip_portfolio_limit"
+        if "risk_budget" in guard_types:
+            return "risk_budget", "skip_risk_budget_limit"
+        return "decision_layer", "keep_on_watchlist"
+
+    @staticmethod
+    def _to_market_state_read(record) -> MarketStateSnapshotRead | None:
+        if record is None:
+            return None
+        return MarketStateSnapshotRead.model_validate(record)
+
     def plan_daily_cycle(self, session: Session, payload: DailyPlanRequest) -> OrchestratorPlanResponse:
+        market_state_snapshot = self.market_state_service.capture_snapshot(
+            session,
+            trigger="orchestrator_plan",
+            pdca_phase="plan",
+            source_context=payload.market_context,
+        )
         cycle = self.pdca_service.create_daily_plan(session, payload.cycle_date)
         review_backlog = session.query(Position).filter(Position.status == "closed", Position.review_status == "pending").count()
         open_research_tasks = len([task for task in self.research_service.list_tasks(session) if task.status in ["open", "in_progress"]])
@@ -354,6 +1122,8 @@ class OrchestratorService:
         cycle.context = {
             **cycle.context,
             **payload.market_context,
+            "market_state_snapshot_id": market_state_snapshot.id,
+            "market_state_regime": market_state_snapshot.regime_label,
             "review_backlog": review_backlog,
             "open_research_tasks": open_research_tasks,
             "degraded_candidate_backlog": degraded_candidate_backlog,
@@ -366,10 +1136,17 @@ class OrchestratorService:
             status=cycle.status,
             summary=cycle.summary or "",
             market_context=cycle.context,
+            market_state_snapshot=self._to_market_state_read(market_state_snapshot),
             work_queue=work_queue,
         )
 
     def run_do_phase(self, session: Session) -> OrchestratorDoResponse:
+        market_state_snapshot = self.market_state_service.capture_snapshot(
+            session,
+            trigger="orchestrator_do",
+            pdca_phase="do",
+            source_context={"execution_mode": "global"},
+        )
         exit_result: AutoExitBatchResult = self.exit_management_service.evaluate_open_positions(session)
         discovery_result = self.opportunity_discovery_service.refresh_active_watchlists(session)
         active_watchlists = session.query(Watchlist).filter(Watchlist.status == "active").count()
@@ -399,6 +1176,15 @@ class OrchestratorService:
         generated_signals = 0
         opened_positions = 0
         prioritized_candidate_items = 0
+        ai_decisions = 0
+        ai_unavailable_entries = 0
+        calendar_blocked_entries = 0
+        learned_rule_blocked_entries = 0
+        regime_policy_blocked_entries = 0
+        decision_layer_blocked_entries = 0
+        portfolio_blocked_entries = 0
+        risk_budget_blocked_entries = 0
+        decision_context_snapshots = 0
 
         for item in items:
             watchlist = session.get(Watchlist, item.watchlist_id)
@@ -407,6 +1193,166 @@ class OrchestratorService:
             if using_candidate_version:
                 prioritized_candidate_items += 1
             signal = self.signal_service.analyze_ticker(item.ticker)
+            signal["base_combined_score"] = signal.get("combined_score")
+            signal["base_decision"] = signal.get("decision")
+            market_context = {
+                "watchlist_id": watchlist.id if watchlist is not None else None,
+                "execution_mode": "candidate_validation" if using_candidate_version else "default",
+                "market_state_snapshot_id": market_state_snapshot.id,
+                "market_state_regime": market_state_snapshot.regime_label,
+                "opened_positions_so_far": opened_positions,
+            }
+            decision_context = self.decision_context_assembler_service.build_trade_candidate_context(
+                session,
+                ticker=item.ticker,
+                strategy_id=strategy.id if strategy is not None else None,
+                strategy_version_id=strategy_version_id,
+                signal_payload=signal,
+                market_context=market_context,
+            )
+            entry_score = self.entry_scoring_service.evaluate(
+                signal_payload=signal,
+                decision_context=decision_context,
+            )
+            signal["decision_context"] = decision_context
+            signal["risk_budget"] = decision_context.get("risk_budget")
+            signal["regime_policy"] = decision_context.get("regime_policy")
+            signal["score_breakdown"] = entry_score["score_breakdown"]
+            signal["guard_results"] = entry_score["guard_results"]
+            signal["combined_score"] = entry_score["final_score"]
+            signal["decision_confidence"] = entry_score["final_score"]
+            signal["decision"] = entry_score["recommended_action"]
+            signal["rationale"] = f"{signal['rationale']} {entry_score['summary']}"
+            research_package = self.trading_agent_service.build_trade_candidate_research_package(
+                ticker=item.ticker,
+                strategy_version_id=strategy_version_id,
+                signal_payload=signal,
+                entry_context=market_context,
+            )
+            signal["research_plan"] = research_package.get("research_plan")
+            signal["decision_trace"] = research_package.get("decision_trace")
+            initial_decision_source = "deterministic_scoring"
+            pre_entry_guard_category = None
+            if entry_score["guard_results"]["blocked"]:
+                pre_entry_guard_category, _ = self._classify_guard_results(entry_score["guard_results"])
+                if pre_entry_guard_category == "learned_rule":
+                    learned_rule_blocked_entries += 1
+                elif pre_entry_guard_category == "regime_policy":
+                    regime_policy_blocked_entries += 1
+                elif pre_entry_guard_category == "portfolio_limit":
+                    portfolio_blocked_entries += 1
+                elif pre_entry_guard_category == "risk_budget":
+                    risk_budget_blocked_entries += 1
+                else:
+                    decision_layer_blocked_entries += 1
+                initial_decision_source = f"deterministic_{pre_entry_guard_category or 'guard'}"
+
+            ai_decision = None
+            ai_decision_error: str | None = None
+            if not entry_score["guard_results"]["blocked"]:
+                try:
+                    ai_decision = self.trading_agent_service.advise_trade_candidate(
+                        session,
+                        ticker=item.ticker,
+                        strategy_id=strategy.id if strategy is not None else None,
+                        strategy_version_id=strategy_version_id,
+                        watchlist_code=watchlist.code if watchlist is not None else None,
+                        signal_payload=signal,
+                        market_context=market_context,
+                    )
+                except AIDecisionError as exc:
+                    ai_decision_error = str(exc)
+                    ai_unavailable_entries += 1
+                    signal["rationale"] = f"{signal['rationale']} AI unavailable; kept deterministic decision."
+                    signal["ai_overlay"] = {
+                        "provider": self.trading_agent_service.runtime.provider,
+                        "model": self.trading_agent_service.runtime.model,
+                        "status": "unavailable",
+                        "error": ai_decision_error,
+                        "fallback_to": signal["decision"],
+                    }
+            if ai_decision is not None:
+                ai_decisions += 1
+                signal["decision"] = ai_decision.action
+                signal["decision_confidence"] = round(
+                    min(
+                        max(
+                            (
+                                float(signal.get("decision_confidence", signal["combined_score"]))
+                                + ai_decision.confidence
+                            )
+                            / 2,
+                            0.0,
+                        ),
+                        1.0,
+                    ),
+                    2,
+                )
+                signal["rationale"] = f"{signal['rationale']} AI thesis: {ai_decision.thesis}"
+                signal["ai_overlay"] = {
+                    "provider": self.trading_agent_service.runtime.provider,
+                    "model": self.trading_agent_service.runtime.model,
+                    "action": ai_decision.action,
+                    "confidence": ai_decision.confidence,
+                    "thesis": ai_decision.thesis,
+                    "risks": ai_decision.risks,
+                    "lessons_applied": ai_decision.lessons_applied,
+                }
+            sizing_decision_source: str | None = None
+            if signal["decision"] == "paper_enter":
+                sizing_result = self.position_sizing_service.size_trade_candidate(
+                    signal_payload=signal,
+                    decision_context=decision_context,
+                )
+                signal["risk_budget"] = sizing_result.get("risk_budget")
+                signal["position_sizing"] = sizing_result.get("position_sizing")
+                signal["rationale"] = f"{signal['rationale']} {sizing_result['summary']}"
+                if sizing_result.get("blocked"):
+                    signal["decision"] = "watch"
+                    guard_results = signal.get("guard_results") if isinstance(signal.get("guard_results"), dict) else {}
+                    existing_reasons = [
+                        str(item)
+                        for item in guard_results.get("reasons", [])
+                        if isinstance(item, str) and item.strip()
+                    ]
+                    existing_types = [
+                        str(item)
+                        for item in guard_results.get("types", [])
+                        if isinstance(item, str) and item.strip()
+                    ]
+                    existing_advisories = [
+                        str(item)
+                        for item in guard_results.get("advisories", [])
+                        if isinstance(item, str) and item.strip()
+                    ]
+                    signal["guard_results"] = {
+                        "blocked": True,
+                        "reasons": existing_reasons + [str(sizing_result["summary"])],
+                        "types": existing_types + ["risk_budget"],
+                        "advisories": existing_advisories,
+                    }
+                    risk_budget_blocked_entries += 1
+                    sizing_decision_source = "risk_budget"
+                else:
+                    signal["size"] = signal["position_sizing"]["size"]
+                    effective_stop_price = signal["position_sizing"].get("effective_stop_price")
+                    if isinstance(effective_stop_price, (int, float)):
+                        signal["stop_price"] = float(effective_stop_price)
+            signal["decision_trace"] = self.trading_agent_service.finalize_trade_candidate_trace(
+                decision_trace=signal.get("decision_trace"),
+                final_action=signal["decision"],
+                final_reason=signal["rationale"],
+                decision_source=(
+                    sizing_decision_source
+                    or (
+                        "ai_overlay"
+                        if ai_decision is not None
+                        else ("deterministic_ai_unavailable" if ai_decision_error is not None else initial_decision_source)
+                    )
+                ),
+                confidence=signal.get("decision_confidence"),
+                ai_thesis=ai_decision.thesis if ai_decision is not None else None,
+            )
             analysis = self.analysis_service.create_run(
                 session,
                 AnalysisRunCreate(
@@ -426,11 +1372,27 @@ class OrchestratorService:
                 ),
             )
             generated_analyses += 1
-            signal_record = self.signal_service.create_signal(
+            primary_setup_id = item.setup_id or (watchlist.setup_id if watchlist is not None else None)
+            primary_hypothesis_id = (
+                watchlist.hypothesis_id
+                if watchlist is not None and watchlist.hypothesis_id is not None
+                else (strategy.hypothesis_id if strategy is not None else None)
+            )
+            primary_signal_definition_id = self._resolve_primary_signal_definition_id(
+                session,
+                setup_type=str(signal["visual_summary"].get("setup_type") or signal["quant_summary"].get("setup") or ""),
+            )
+            signal["hypothesis_id"] = primary_hypothesis_id
+            signal["setup_id"] = primary_setup_id
+            signal["signal_definition_id"] = primary_signal_definition_id
+            signal_record = self.signal_service.create_trade_signal_with_source(
                 session,
                 SignalCreate(
+                    hypothesis_id=primary_hypothesis_id,
                     strategy_id=strategy.id if strategy is not None else None,
                     strategy_version_id=strategy_version_id,
+                    setup_id=primary_setup_id,
+                    signal_definition_id=primary_signal_definition_id,
                     watchlist_item_id=item.id,
                     ticker=item.ticker,
                     timeframe="1D",
@@ -445,64 +1407,218 @@ class OrchestratorService:
                         "quant_summary": signal["quant_summary"],
                         "visual_summary": signal["visual_summary"],
                         "risk_reward": signal["risk_reward"],
+                        "base_combined_score": signal.get("base_combined_score"),
+                        "base_decision": signal.get("base_decision"),
+                        "decision_context": signal.get("decision_context"),
+                        "risk_budget": signal.get("risk_budget"),
+                        "position_sizing": signal.get("position_sizing"),
+                        "research_plan": signal.get("research_plan"),
+                        "decision_trace": signal.get("decision_trace"),
+                        "score_breakdown": signal.get("score_breakdown"),
+                        "guard_results": signal.get("guard_results"),
+                        "ai_overlay": signal.get("ai_overlay"),
+                        "regime_policy": signal.get("regime_policy"),
+                        "policy_version": (signal.get("regime_policy") or {}).get("policy_version"),
+                        "allowed_playbooks": (signal.get("regime_policy") or {}).get("allowed_playbooks"),
+                        "blocked_reason": (signal.get("regime_policy") or {}).get("blocked_reason"),
+                        "risk_multiplier": (signal.get("regime_policy") or {}).get("risk_multiplier"),
+                        "market_state_snapshot_id": market_state_snapshot.id,
+                        "market_state_regime": market_state_snapshot.regime_label,
                         "execution_mode": "candidate_validation" if using_candidate_version else "default",
                     },
                     quality_score=signal["combined_score"],
                     status="new",
                 ),
+                event_source="orchestrator_do",
             )
             generated_signals += 1
 
-            existing_open = session.scalar(select(Position).where(Position.ticker == item.ticker, Position.status == "open"))
-            position_id: int | None = None
-
-            if signal["decision"] == "paper_enter" and existing_open is None:
-                position = self.position_service.create_position(
-                    session,
-                    PositionCreate(
-                        ticker=item.ticker,
-                        signal_id=signal_record.id,
-                        strategy_version_id=strategy_version_id,
-                        analysis_run_id=analysis.id,
-                        account_mode="paper",
-                        side="long",
-                        entry_price=signal["entry_price"],
-                        stop_price=signal["stop_price"],
-                        target_price=signal["target_price"],
-                        size=1,
-                        thesis=signal["rationale"],
-                        entry_context={
-                            "source": "orchestrator_do",
-                            "watchlist_item_id": item.id,
-                            "quant_summary": signal["quant_summary"],
-                            "visual_summary": signal["visual_summary"],
-                            "risk_reward": signal["risk_reward"],
-                            "execution_mode": "candidate_validation" if using_candidate_version else "default",
-                        },
-                    ),
+            existing_open = session.scalar(
+                select(Position).where(
+                    Position.ticker == item.ticker,
+                    Position.status == "open",
+                    Position.strategy_version_id == strategy_version_id,
                 )
-                self.signal_service.update_status(session, signal_record.id, "executed")
-                position_id = position.id
-                opened_positions += 1
-                item.state = "entered"
-                journal_decision = "open_paper_position"
-                journal_outcome = "executed"
-            elif signal["decision"] == "discard":
-                self.signal_service.update_status(session, signal_record.id, "rejected", "signal_below_threshold")
+            )
+            position_id: int | None = None
+            execution_guard: dict | None = None
+            step_results: list[dict] = []
+            opening_reason = (
+                "Autonomous entry from candidate validation."
+                if using_candidate_version
+                else "Autonomous entry from orchestrator DO phase."
+            )
+            planned_entry = self.trading_agent_service.plan_trade_candidate_execution(
+                ticker=item.ticker,
+                strategy_version_id=strategy_version_id,
+                signal_id=signal_record.id,
+                analysis_run_id=analysis.id,
+                signal_payload=signal,
+                entry_context={
+                    "source": "orchestrator_do",
+                    "watchlist_item_id": item.id,
+                    "quant_summary": signal["quant_summary"],
+                    "visual_summary": signal["visual_summary"],
+                    "risk_reward": signal["risk_reward"],
+                    "decision_context": signal.get("decision_context"),
+                    "risk_budget": signal.get("risk_budget"),
+                    "position_sizing": signal.get("position_sizing"),
+                    "research_plan": signal.get("research_plan"),
+                    "decision_trace": signal.get("decision_trace"),
+                    "score_breakdown": signal.get("score_breakdown"),
+                    "guard_results": signal.get("guard_results"),
+                    "ai_overlay": signal.get("ai_overlay"),
+                    "regime_policy": signal.get("regime_policy"),
+                    "policy_version": (signal.get("regime_policy") or {}).get("policy_version"),
+                    "allowed_playbooks": (signal.get("regime_policy") or {}).get("allowed_playbooks"),
+                    "blocked_reason": (signal.get("regime_policy") or {}).get("blocked_reason"),
+                    "risk_multiplier": (signal.get("regime_policy") or {}).get("risk_multiplier"),
+                    "market_state_snapshot_id": market_state_snapshot.id,
+                    "market_state_regime": market_state_snapshot.regime_label,
+                    "execution_mode": "candidate_validation" if using_candidate_version else "default",
+                },
+                opening_reason=opening_reason,
+            )
+            final_decision = signal["decision"]
+            if planned_entry.should_execute and any(step.tool_name == "positions.open" for step in planned_entry.steps) and existing_open is None:
+                step_results = self.agent_tool_gateway_service.execute_plan(session, planned_entry)
+                open_step = next((step for step in step_results if step["tool_name"] == "positions.open"), None)
+                position_result = open_step["result"] if open_step is not None else None
+                if position_result is not None and not position_result.get("skipped"):
+                    self.signal_service.update_trade_signal_status_with_source(
+                        session,
+                        signal_record.id,
+                        status="executed",
+                        event_source="orchestrator_do",
+                    )
+                    position_id = position_result["id"]
+                    opened_positions += 1
+                    item.state = "entered"
+                    journal_decision = "open_paper_position"
+                    journal_outcome = "executed"
+                else:
+                    execution_guard = position_result
+                    guard_summary = (
+                        execution_guard.get("summary")
+                        if isinstance(execution_guard, dict)
+                        else "Entry plan did not open a position."
+                    )
+                    if isinstance(execution_guard, dict):
+                        signal["rationale"] = f"{signal['rationale']} {guard_summary}"
+                    self.signal_service.update_trade_signal_status_with_source(
+                        session,
+                        signal_record.id,
+                        status="new",
+                        event_source="orchestrator_do",
+                    )
+                    item.state = "watching"
+                    final_decision = "watch"
+                    guard_reason = execution_guard.get("reason") if isinstance(execution_guard, dict) else None
+                    if guard_reason == "strategy_context_rule":
+                        learned_rule_blocked_entries += 1
+                        journal_decision = "skip_strategy_context_rule"
+                    elif guard_reason == "regime_policy":
+                        regime_policy_blocked_entries += 1
+                        journal_decision = "skip_regime_policy"
+                    elif guard_reason == "portfolio_limit":
+                        portfolio_blocked_entries += 1
+                        journal_decision = "skip_portfolio_limit"
+                    elif guard_reason == "risk_budget_limit":
+                        risk_budget_blocked_entries += 1
+                        journal_decision = "skip_risk_budget_limit"
+                    else:
+                        calendar_blocked_entries += 1
+                        journal_decision = (
+                            "skip_calendar_check_failed"
+                            if guard_reason == "calendar_check_failed"
+                            else "skip_calendar_risk"
+                        )
+                    journal_outcome = "watching"
+            elif planned_entry.action == "discard":
+                self.signal_service.update_trade_signal_status_with_source(
+                    session,
+                    signal_record.id,
+                    status="rejected",
+                    rejection_reason="signal_below_threshold",
+                    event_source="orchestrator_do",
+                )
                 item.state = "discarded"
+                final_decision = "discard"
                 journal_decision = "discard_signal"
                 journal_outcome = "rejected"
             else:
-                if existing_open is not None and signal["decision"] == "paper_enter":
-                    self.signal_service.update_status(session, signal_record.id, "rejected", "existing_open_position")
+                if existing_open is not None and planned_entry.action == "paper_enter":
+                    self.signal_service.update_trade_signal_status_with_source(
+                        session,
+                        signal_record.id,
+                        status="rejected",
+                        rejection_reason="existing_open_position",
+                        event_source="orchestrator_do",
+                    )
                     item.state = "entered"
+                    final_decision = "watch"
                     journal_decision = "skip_existing_open_position"
                     journal_outcome = "rejected"
                 else:
-                    self.signal_service.update_status(session, signal_record.id, "new")
+                    pre_entry_guard_category, pre_entry_guard_journal_decision = self._classify_guard_results(
+                        signal.get("guard_results")
+                    )
+                    self.signal_service.update_trade_signal_status_with_source(
+                        session,
+                        signal_record.id,
+                        status="new",
+                        event_source="orchestrator_do",
+                    )
                     item.state = "watching"
-                    journal_decision = "keep_on_watchlist"
+                    final_decision = "watch"
+                    journal_decision = pre_entry_guard_journal_decision
                     journal_outcome = "watching"
+
+            signal["decision_trace"] = self.trading_agent_service.finalize_trade_candidate_trace(
+                decision_trace=signal.get("decision_trace"),
+                final_action=final_decision,
+                final_reason=signal["rationale"],
+                decision_source=(
+                    "execution_guard"
+                    if execution_guard is not None
+                    else "ai_overlay"
+                    if ai_decision is not None
+                    else initial_decision_source
+                ),
+                confidence=signal.get("decision_confidence"),
+                ai_thesis=(signal.get("ai_overlay") or {}).get("thesis") if isinstance(signal.get("ai_overlay"), dict) else None,
+                execution_outcome=final_decision,
+            )
+            signal_record.signal_context = {
+                **dict(signal_record.signal_context or {}),
+                "decision": signal.get("decision"),
+                "decision_confidence": signal.get("decision_confidence"),
+                "risk_budget": signal.get("risk_budget"),
+                "position_sizing": signal.get("position_sizing"),
+                "research_plan": signal.get("research_plan"),
+                "decision_trace": signal.get("decision_trace"),
+                "regime_policy": signal.get("regime_policy"),
+                "policy_version": (signal.get("regime_policy") or {}).get("policy_version"),
+                "allowed_playbooks": (signal.get("regime_policy") or {}).get("allowed_playbooks"),
+                "blocked_reason": (signal.get("regime_policy") or {}).get("blocked_reason"),
+                "risk_multiplier": (signal.get("regime_policy") or {}).get("risk_multiplier"),
+                "market_state_snapshot_id": market_state_snapshot.id,
+                "market_state_regime": market_state_snapshot.regime_label,
+                "final_decision": final_decision,
+            }
+            session.add(signal_record)
+            self.decision_context_service.record_trade_candidate_context(
+                session,
+                signal=signal_record,
+                analysis_run=analysis,
+                ticker=item.ticker,
+                planned_entry_action=planned_entry.action,
+                final_decision=final_decision,
+                step_results=step_results,
+                position_id=position_id,
+                execution_guard=execution_guard,
+            )
+            decision_context_snapshots += 1
 
             self.journal_service.create_entry(
                 session,
@@ -515,7 +1631,12 @@ class OrchestratorService:
                     market_context={
                         "watchlist_id": watchlist.id if watchlist is not None else None,
                         "watchlist_code": watchlist.code if watchlist is not None else None,
+                        "market_state_snapshot_id": market_state_snapshot.id,
+                        "market_state_regime": market_state_snapshot.regime_label,
                         "execution_mode": "candidate_validation" if using_candidate_version else "default",
+                        "policy_version": (signal.get("regime_policy") or {}).get("policy_version"),
+                        "risk_multiplier": (signal.get("regime_policy") or {}).get("risk_multiplier"),
+                        "blocked_reason": (signal.get("regime_policy") or {}).get("blocked_reason"),
                     },
                     hypothesis=watchlist.hypothesis if watchlist is not None else None,
                     observations={
@@ -524,6 +1645,20 @@ class OrchestratorService:
                         "score": signal["combined_score"],
                         "risk_reward": signal["risk_reward"],
                         "alpha_gap_pct": signal.get("alpha_gap_pct"),
+                        "risk_budget": signal.get("risk_budget"),
+                        "position_sizing": signal.get("position_sizing"),
+                        "research_plan": signal.get("research_plan"),
+                        "decision_trace": signal.get("decision_trace"),
+                        "score_breakdown": signal.get("score_breakdown"),
+                        "guard_results": signal.get("guard_results"),
+                        "decision_context": signal.get("decision_context"),
+                        "ai_overlay": signal.get("ai_overlay"),
+                        "regime_policy": signal.get("regime_policy"),
+                        "policy_version": (signal.get("regime_policy") or {}).get("policy_version"),
+                        "allowed_playbooks": (signal.get("regime_policy") or {}).get("allowed_playbooks"),
+                        "blocked_reason": (signal.get("regime_policy") or {}).get("blocked_reason"),
+                        "risk_multiplier": (signal.get("regime_policy") or {}).get("risk_multiplier"),
+                        "execution_guard": execution_guard,
                     },
                     reasoning=signal["rationale"],
                     decision=journal_decision,
@@ -545,7 +1680,8 @@ class OrchestratorService:
                     watchlist_item_id=item.id,
                     analysis_run_id=analysis.id,
                     signal_id=signal_record.id,
-                    decision=signal["decision"],
+                    trade_signal_id=signal_record.id,
+                    decision=final_decision,
                     score=signal["combined_score"],
                     position_id=position_id,
                 )
@@ -559,18 +1695,34 @@ class OrchestratorService:
             "watchlists_scanned": discovery_result["watchlists_scanned"],
             "discovery_universe_size": discovery_result["universe_size"],
             "prioritized_candidate_items": prioritized_candidate_items,
+            "ai_decisions": ai_decisions,
+            "ai_unavailable_entries": ai_unavailable_entries,
+            "decision_layer_blocked_entries": decision_layer_blocked_entries,
+            "calendar_blocked_entries": calendar_blocked_entries,
+            "learned_rule_blocked_entries": learned_rule_blocked_entries,
+            "regime_policy_blocked_entries": regime_policy_blocked_entries,
+            "portfolio_blocked_entries": portfolio_blocked_entries,
+            "risk_budget_blocked_entries": risk_budget_blocked_entries,
+            "decision_context_snapshots": decision_context_snapshots,
             "generated_analyses": generated_analyses,
             "generated_signals": generated_signals,
             "opened_positions": opened_positions,
             "open_positions": open_positions,
             "auto_exit_evaluated": exit_result.evaluated_positions,
             "auto_exit_closed": exit_result.closed_positions,
+            "auto_exit_adjusted": exit_result.adjusted_positions,
         }
         summary = (
             f"DO phase processed {len(items)} watchlist items, generated {generated_analyses} analyses "
             f"opened {opened_positions} paper positions, discovered {discovery_result['discovered_items']} new "
             f"opportunities, prioritized {prioritized_candidate_items} candidate-validation items and "
-            f"auto-closed {exit_result.closed_positions} positions."
+            f"applied {ai_decisions} AI overlays, degraded {ai_unavailable_entries} entries due to AI unavailability, "
+            f"blocked {decision_layer_blocked_entries} decision-layer entries, "
+            f"blocked {calendar_blocked_entries} calendar-risk entries, blocked {learned_rule_blocked_entries} "
+            f"learned-rule entries, blocked {portfolio_blocked_entries} portfolio-limit entries, "
+            f"blocked {risk_budget_blocked_entries} risk-budget entries, "
+            f"while auto-closing {exit_result.closed_positions} positions and updating risk on "
+            f"{exit_result.adjusted_positions} open positions."
         )
         self.journal_service.create_entry(
             session,
@@ -583,6 +1735,8 @@ class OrchestratorService:
                 market_context={
                     "benchmark_ticker": discovery_result["benchmark_ticker"],
                     "top_discovery_candidates": discovery_result["top_candidates"],
+                    "market_state_snapshot_id": market_state_snapshot.id,
+                    "market_state_regime": market_state_snapshot.regime_label,
                 },
                 observations=metrics,
                 reasoning=summary,
@@ -597,12 +1751,38 @@ class OrchestratorService:
             generated_analyses=generated_analyses,
             opened_positions=opened_positions,
             candidates=candidates,
+            market_state_snapshot=self._to_market_state_read(market_state_snapshot),
+            exits=exit_result,
+            discovery=discovery_result,
         )
 
+    @staticmethod
+    def _resolve_primary_signal_definition_id(session: Session, *, setup_type: str) -> int | None:
+        normalized = setup_type.strip().lower()
+        code_map = {
+            "breakout": "breakout_trigger",
+            "pullback": "pullback_resume_confirmation",
+            "consolidation": "trend_context_filter",
+            "range": "trend_context_filter",
+        }
+        code = code_map.get(normalized)
+        if code is None:
+            return None
+        signal_definition = session.scalars(select(SignalDefinition).where(SignalDefinition.code == code)).first()
+        return signal_definition.id if signal_definition is not None else None
+
     def run_check_phase(self, session: Session) -> OrchestratorPhaseResponse:
+        market_state_snapshot = self.market_state_service.capture_snapshot(
+            session,
+            trigger="orchestrator_check",
+            pdca_phase="check",
+            source_context={"execution_mode": "global"},
+        )
         auto_review_result = self.auto_review_service.generate_pending_loss_reviews(session)
         failure_patterns = self.failure_analysis_service.refresh_patterns(session)
         scorecards = self.strategy_scoring_service.recalculate_all(session)
+        feature_stats_generated = self.feature_relevance_service.recompute_all(session)
+        strategy_context_rules_generated = self.strategy_context_adaptation_service.refresh_rules(session)
         benchmark_snapshot = self.market_data_service.get_snapshot("SPY")
         benchmark_return_pct = round(benchmark_snapshot.month_performance * 100, 2)
         research_tasks_opened = 0
@@ -644,6 +1824,7 @@ class OrchestratorService:
         winning_positions = session.query(Position).filter(Position.status == "closed", Position.pnl_pct > 0).count()
         losing_positions = session.query(Position).filter(Position.status == "closed", Position.pnl_pct <= 0).count()
         pending_reviews = session.query(Position).filter(Position.status == "closed", Position.review_status == "pending").count()
+        decision_context_snapshots = session.query(DecisionContextSnapshot).count()
 
         closed_rows = session.query(Position.pnl_pct, Position.max_drawdown_pct).filter(Position.status == "closed").all()
         avg_pnl_pct = round(sum((row[0] or 0.0) for row in closed_rows) / len(closed_rows), 2) if closed_rows else 0.0
@@ -664,6 +1845,9 @@ class OrchestratorService:
             "auto_generated_reviews": auto_review_result.generated_reviews,
             "failure_patterns_tracked": len(failure_patterns),
             "scorecards_generated": len(scorecards),
+            "decision_context_snapshots": decision_context_snapshots,
+            "feature_stats_generated": feature_stats_generated,
+            "strategy_context_rules_generated": strategy_context_rules_generated,
             "research_tasks_opened": research_tasks_opened,
         }
         summary = (
@@ -690,7 +1874,11 @@ class OrchestratorService:
                     "The system should outperform the benchmark while containing drawdown and convert repeated "
                     "outcomes into reusable lessons."
                 ),
-                market_context={"benchmark_ticker": "SPY"},
+                market_context={
+                    "benchmark_ticker": "SPY",
+                    "market_state_snapshot_id": market_state_snapshot.id,
+                    "market_state_regime": market_state_snapshot.regime_label,
+                },
                 observations=metrics,
                 reasoning=summary,
                 decision="review_outcomes",
@@ -700,9 +1888,21 @@ class OrchestratorService:
                 ),
             ),
         )
-        return OrchestratorPhaseResponse(phase="check", status="completed", summary=summary, metrics=metrics)
+        return OrchestratorPhaseResponse(
+            phase="check",
+            status="completed",
+            summary=summary,
+            metrics=metrics,
+            market_state_snapshot=self._to_market_state_read(market_state_snapshot),
+        )
 
     def run_act_phase(self, session: Session) -> OrchestratorActResponse:
+        market_state_snapshot = self.market_state_service.capture_snapshot(
+            session,
+            trigger="orchestrator_act",
+            pdca_phase="act",
+            source_context={"execution_mode": "global"},
+        )
         health_result = self.strategy_evolution_service.evaluate_failure_patterns(session)
         candidate_result = self.strategy_evolution_service.evaluate_candidate_versions(session)
         candidate_research_tasks_opened = 0
@@ -749,6 +1949,10 @@ class OrchestratorService:
             session,
             JournalEntryCreate(
                 entry_type="pdca_act",
+                market_context={
+                    "market_state_snapshot_id": market_state_snapshot.id,
+                    "market_state_regime": market_state_snapshot.regime_label,
+                },
                 observations=metrics,
                 reasoning=summary,
                 decision="promote_success_patterns",
@@ -761,4 +1965,5 @@ class OrchestratorService:
             summary=summary,
             metrics=metrics,
             generated_variants=lab_result["generated_variants"],
+            market_state_snapshot=self._to_market_state_read(market_state_snapshot),
         )

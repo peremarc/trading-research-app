@@ -5,9 +5,9 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+import app.db.models  # noqa: F401
 from app.core.config import get_settings
 from app.db.base import Base
-from app.db.models import analysis, journal, memory, pdca, position, screener, strategy, watchlist  # noqa: F401
 
 config = context.config
 settings = get_settings()

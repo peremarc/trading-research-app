@@ -4,8 +4,63 @@ from app.domains.market.services import MarketDataService
 from app.providers.market_data.base import OHLCVCandle
 
 
+CHART_TIMEFRAME_WINDOWS = {
+    "1M": 22,
+    "3M": 66,
+    "6M": 132,
+    "1Y": 252,
+    "5Y": 1260,
+}
+
+CHART_TIMEFRAME_ALIASES = {
+    "1m": "1M",
+    "1mo": "1M",
+    "1month": "1M",
+    "1 month": "1M",
+    "3m": "3M",
+    "3mo": "3M",
+    "3month": "3M",
+    "3 months": "3M",
+    "6m": "6M",
+    "6mo": "6M",
+    "6month": "6M",
+    "6 months": "6M",
+    "1y": "1Y",
+    "1yr": "1Y",
+    "1year": "1Y",
+    "1 year": "1Y",
+    "5y": "5Y",
+    "5yr": "5Y",
+    "5year": "5Y",
+    "5 years": "5Y",
+}
+
+
+def normalize_chart_timeframe(timeframe: str | None) -> tuple[str, int]:
+    if timeframe is None:
+        canonical = "6M"
+    else:
+        normalized = str(timeframe).strip()
+        if not normalized:
+            canonical = "6M"
+        else:
+            canonical = CHART_TIMEFRAME_ALIASES.get(normalized.lower(), normalized.upper())
+    if canonical not in CHART_TIMEFRAME_WINDOWS:
+        raise ValueError(
+            f"Unsupported timeframe '{timeframe}'. Supported values: {', '.join(CHART_TIMEFRAME_WINDOWS.keys())}"
+        )
+    return canonical, CHART_TIMEFRAME_WINDOWS[canonical]
+
+
 class ChartRenderService:
-    def render_standard_chart(self, *, ticker: str, candles: list[OHLCVCandle], quant_summary: dict) -> str:
+    def render_standard_chart(
+        self,
+        *,
+        ticker: str,
+        candles: list[OHLCVCandle],
+        quant_summary: dict,
+        timeframe_label: str,
+    ) -> str:
         width = 960
         height = 540
         pad_left = 56
@@ -61,7 +116,7 @@ class ChartRenderService:
   <line x1="{pad_left}" y1="{entry_y:.2f}" x2="{width - pad_right}" y2="{entry_y:.2f}" stroke="#244a7c" />
   <line x1="{pad_left}" y1="{stop_y:.2f}" x2="{width - pad_right}" y2="{stop_y:.2f}" stroke="#8d2242" stroke-dasharray="3 3" />
   <line x1="{pad_left}" y1="{take_profit_y:.2f}" x2="{width - pad_right}" y2="{take_profit_y:.2f}" stroke="#135b3b" stroke-dasharray="3 3" />
-  <text x="{pad_left}" y="24" fill="#132231" font-size="20" font-family="Bahnschrift, Trebuchet MS, sans-serif">{ticker.upper()} Standardized Daily Chart</text>
+  <text x="{pad_left}" y="24" fill="#132231" font-size="20" font-family="Bahnschrift, Trebuchet MS, sans-serif">{ticker.upper()} Standardized {timeframe_label} Chart</text>
   <text x="{pad_left}" y="{height - 16}" fill="#53606c" font-size="13" font-family="Bahnschrift, Trebuchet MS, sans-serif">Setup={quant_summary['setup']} · Trend={quant_summary['trend']} · ADX={quant_summary['adx_14']} · R/R={quant_summary['risk_reward']}</text>
 </svg>"""
 
@@ -308,19 +363,44 @@ class FusedAnalysisService:
         self.visual_service = visual_service or VisualAnalysisService()
         self.chart_service = chart_service or ChartRenderService()
 
-    def analyze_ticker(self, ticker: str, benchmark_ticker: str = "SPY") -> dict:
-        candles = self.market_data_service.get_history(ticker, limit=120)
-        benchmark_candles = self.market_data_service.get_history(benchmark_ticker, limit=120)
+    def analyze_ticker(self, ticker: str, benchmark_ticker: str = "SPY", timeframe: str | None = None) -> dict:
+        chart_payload = self.build_chart_payload(ticker=ticker, benchmark_ticker=benchmark_ticker, timeframe=timeframe)
+        return {
+            "ticker": chart_payload["ticker"],
+            "quant_summary": chart_payload["quant_summary"],
+            "visual_summary": chart_payload["visual_summary"],
+            "chart_svg": chart_payload["chart_svg"],
+            "combined_score": chart_payload["combined_score"],
+            "decision": chart_payload["decision"],
+            "decision_confidence": chart_payload["decision_confidence"],
+            "entry_price": chart_payload["entry_price"],
+            "stop_price": chart_payload["stop_price"],
+            "target_price": chart_payload["target_price"],
+            "risk_reward": chart_payload["risk_reward"],
+            "rationale": chart_payload["rationale"],
+            "timeframe": chart_payload["timeframe"],
+        }
+
+    def build_chart_payload(self, *, ticker: str, benchmark_ticker: str = "SPY", timeframe: str | None = None) -> dict:
+        timeframe_label, visible_window = normalize_chart_timeframe(timeframe)
+        history_limit = max(220, visible_window)
+        candles = self.market_data_service.get_history(ticker, limit=history_limit)
+        benchmark_candles = self.market_data_service.get_history(benchmark_ticker, limit=history_limit)
+        visible_candles = candles[-visible_window:]
+        visible_benchmark_candles = benchmark_candles[-visible_window:] if len(benchmark_candles) >= visible_window else benchmark_candles
+        analysis_candles = visible_candles if len(visible_candles) >= 60 else candles
+        analysis_benchmark_candles = visible_benchmark_candles if len(visible_benchmark_candles) >= 60 else benchmark_candles
         quant_summary = self.quant_service.analyze(
             ticker=ticker,
-            candles=candles,
-            benchmark_candles=benchmark_candles,
+            candles=analysis_candles,
+            benchmark_candles=analysis_benchmark_candles,
         )
-        visual_summary = self.visual_service.analyze(candles=candles, quant_summary=quant_summary)
+        visual_summary = self.visual_service.analyze(candles=visible_candles, quant_summary=quant_summary)
         chart_svg = self.chart_service.render_standard_chart(
             ticker=ticker,
-            candles=candles[-90:],
+            candles=visible_candles,
             quant_summary=quant_summary,
+            timeframe_label=timeframe_label,
         )
         combined_score = round((quant_summary["quant_score"] * 0.6) + (visual_summary["visual_score"] * 0.4), 2)
         decision = "discard"
@@ -337,10 +417,13 @@ class FusedAnalysisService:
 
         return {
             "ticker": ticker.upper(),
+            "timeframe": timeframe_label,
+            "visible_candles": len(visible_candles),
             "quant_summary": quant_summary,
             "visual_summary": {
                 **visual_summary,
                 "chart_render_mode": "standardized_svg",
+                "timeframe": timeframe_label,
             },
             "chart_svg": chart_svg,
             "combined_score": combined_score,
@@ -351,4 +434,21 @@ class FusedAnalysisService:
             "target_price": quant_summary["take_profit_price"],
             "risk_reward": quant_summary["risk_reward"],
             "rationale": rationale,
+        }
+
+    def get_multitimeframe_context(
+        self,
+        *,
+        ticker: str,
+        benchmark_ticker: str = "SPY",
+        timeframes: list[str] | None = None,
+    ) -> dict:
+        selected = timeframes or ["1M", "3M", "6M", "1Y", "5Y"]
+        charts = [
+            self.build_chart_payload(ticker=ticker, benchmark_ticker=benchmark_ticker, timeframe=timeframe)
+            for timeframe in selected
+        ]
+        return {
+            "ticker": ticker.upper(),
+            "charts": charts,
         }

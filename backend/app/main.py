@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
+from app.db.migrations import upgrade_database_to_head
 from app.db.session import SessionLocal
 from app.domains.system.runtime import scheduler_service
 from app.domains.system.services import SeedService
@@ -18,13 +19,23 @@ from app.domains.system.services import SeedService
 mimetypes.add_type("application/javascript", ".js")
 
 
+def maybe_seed_on_startup(settings, *, session_factory=SessionLocal, seed_service: SeedService | None = None) -> dict | None:
+    if not settings.bootstrap_seed_on_startup:
+        return None
+    service = seed_service or SeedService()
+    with session_factory() as session:
+        if not service.should_seed_on_startup(session):
+            return None
+        return service.seed_initial_data(session)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
-    if settings.bootstrap_seed_on_startup:
-        with SessionLocal() as session:
-            SeedService().seed_initial_data(session)
-    scheduler_service.start()
+    if settings.database_auto_upgrade_on_startup:
+        upgrade_database_to_head(settings)
+    maybe_seed_on_startup(settings)
+    scheduler_service.boot()
     try:
         yield
     finally:
