@@ -220,6 +220,8 @@ La IA central debe apoyarse en herramientas o módulos con responsabilidades cla
 * strategy registry
 * setup registry
 * signal registry
+* skill registry
+* skill router
 * screener builder
 * screener runner
 * market data / OHLCV analyzer
@@ -230,6 +232,52 @@ La IA central debe apoyarse en herramientas o módulos con responsabilidades cla
 * journal writer
 * memory manager
 * review / improvement manager
+
+### 2.b Skills procedurales separadas de las herramientas
+
+Quiero que el sistema distinga explícitamente entre:
+
+* **tool**: función o integración ejecutable
+* **skill**: procedimiento reutilizable que enseña **cuándo** y **cómo**
+  usar tools o criterios del sistema
+* **playbook / estrategia**: marco operativo amplio
+* **regla aprendida**: ajuste validado que modifica el comportamiento futuro
+
+Una skill no es una integración técnica ni una estrategia completa.
+Es una pieza operativa intermedia, por ejemplo:
+
+* `analizar_ticker_post_noticia`
+* `evaluar_breakout_diario`
+* `detectar_condiciones_risk_off`
+* `hacer_post_mortem_de_trade`
+* `clasificar_error_operativo`
+* `proponer_mejora_pdca`
+
+Cada skill debe declarar al menos:
+
+* nombre / código
+* objetivo
+* descripción corta
+* cuándo usarla
+* cuándo no usarla
+* inputs requeridos
+* salida esperada
+* herramientas o contextos que puede necesitar
+* incompatibilidades o dependencias, si aplica
+
+No quiero meter siempre todas las skills completas en el contexto del modelo.
+Prefiero:
+
+* un **catálogo compacto** de skills
+* selección contextual de candidatas
+* carga **on-demand** de la skill elegida
+
+La activación de skills debe combinar:
+
+* router determinista por estado/contexto
+* selección o priorización del LLM sobre un conjunto pequeño de candidatas
+
+No quiero que el LLM elija entre todo el universo de skills sin filtro previo.
 
 ### 3. Trazabilidad total
 
@@ -281,6 +329,7 @@ La IA debe recordar:
 * observaciones relevantes de revisiones previas
 * lecciones aprendidas
 * mejoras propuestas y su estado
+* skills activas, skills en borrador y skills retiradas
 
 ### 6. Enfoque realista
 
@@ -301,6 +350,348 @@ sobre sofisticación innecesaria.
 ## Qué quiero que construyas conmigo
 
 Quiero que me ayudes a diseñar y después implementar una app con estos componentes.
+
+---
+
+## Arquitectura de aprendizaje procedimental
+
+Quiero que el diseño refleje explícitamente estas cuatro capas:
+
+### 1. Herramientas
+
+Capacidades ejecutables del sistema:
+
+* market data
+* news
+* calendar
+* charts
+* execution
+* broker / paper trading
+* reportes
+
+### 2. Memoria
+
+Persistencia de experiencia y contexto:
+
+* trades
+* journal
+* revisiones
+* errores repetidos
+* contexto de mercado
+* reglas propuestas
+* lecciones validadas o descartadas
+
+### 3. Skills
+
+Procedimientos reutilizables que ayudan al agente a operar con consistencia.
+
+Las skills deben servir para:
+
+* análisis
+* diagnóstico
+* revisión
+* mejora
+
+No quiero que la app “aprenda” solo por acumular texto en memoria.
+Quiero que aprenda cuando convierte experiencia pasada en **cambios
+reutilizables de comportamiento**.
+
+### 4. Política de mejora
+
+Debe existir un flujo explícito para decidir cuándo una observación pasa a ser:
+
+* nota
+* lección
+* hipótesis
+* regla temporal
+* skill consolidada
+
+Ese flujo debe exigir:
+
+* muestra mínima
+* evidencia trazable
+* validación suficiente
+* promoción controlada
+
+No quiero que una observación aislada se convierta automáticamente en una skill
+activa ni en una regla de ejecución live.
+
+### Regla fundamental de aprendizaje
+
+El bot no debe considerarse “más listo” por tener más tools.
+
+Debe considerarse que aprende cuando:
+
+* detecta un patrón repetido
+* formula una hipótesis
+* la valida con datos o revisión suficiente
+* y modifica el procedimiento futuro de forma controlada
+
+Por tanto, el sistema debe registrar no solo:
+
+* qué tool usó
+* qué decisión tomó
+
+sino también:
+
+* qué skill aplicó
+* por qué se activó
+* si fue útil
+* si faltó otra skill complementaria
+* si la experiencia justifica promover una mejora reutilizable
+
+---
+
+## Arquitectura de research y backtesting
+
+Quiero que el bot disponga de una capacidad explícita de `research/backtesting`,
+pero no como un añadido aislado ni como una excusa para sobreoptimizar.
+
+El objetivo no es que el bot "haga más cosas", sino que pueda recorrer este
+flujo de forma controlada:
+
+* formular una hipótesis
+* traducirla a una especificación de backtest
+* ejecutar validación histórica reproducible
+* separar `in-sample`, `out-of-sample` y, cuando sea razonable, `walk-forward`
+* registrar métricas, decisiones y supuestos
+* decidir si la hipótesis merece:
+
+  * descarte
+  * research adicional
+  * paper trading
+  * promoción a regla o skill candidata
+
+### Principio clave
+
+No quiero atar el bot al backtester propietario de un broker ni a una librería
+externa concreta como dependencia estructural del core.
+
+Prefiero:
+
+* una interfaz propia y pequeña de `backtest engine`
+* desplegar el motor de backtesting en un **servicio externo**
+* mantener este repo como cliente/orquestador
+* posibilidad de añadir adaptadores externos más adelante
+
+### Herramientas externas evaluadas
+
+Herramientas gratuitas o abiertas que sí merece la pena considerar como
+referencia o posible integración futura:
+
+* `Backtesting.py`
+* `Backtrader`
+* `LEAN`
+* `vectorbt`
+
+Pero para el core de esta app, la decisión inicial es:
+
+* **no acoplar la v1 a una de esas librerías dentro del runtime principal**
+* construir un motor nativo y acotado para validación diaria reproducible
+* alojarlo preferiblemente en un **repositorio/servicio separado**
+* dejar una interfaz para conectar motores externos después
+
+Razones:
+
+* el stack actual del bot es principalmente `1D + OHLCV + contexto`
+* ya existe una base de `trade replay` y validación de candidatos
+* varias librerías externas añaden peso, complejidad o restricciones de
+  licencia que no quiero meter prematuramente en el core
+* separar el servicio reduce el crecimiento del monolito principal
+* una API dedicada permite reutilizar el backtesting desde otras apps
+* quiero que el comportamiento del bot siga siendo trazable y consistente con
+  sus propias reglas, no con una caja negra externa
+
+### Motor elegido para la v1
+
+La v1 debe introducir un motor propio, por ejemplo:
+
+* `native_daily_ohlcv_replay`
+
+Este motor debe:
+
+* operar sobre `OHLCV` diario
+* reutilizar, en lo posible, las mismas reglas y contextos que ya usa el bot
+  para decidir en runtime
+* soportar costes y fricción básicos:
+
+  * comisión
+  * slippage
+  * tamaño de posición
+  * invalidación por stop
+  * take profit / trailing si aplica
+
+No quiero que la v1 intente resolver todavía:
+
+* order book
+* microestructura
+* intradía fino
+* simulación exacta de ejecución real
+* optimización masiva de parámetros
+* portfolio construction compleja
+
+### Frontera de despliegue preferida
+
+El motor propio v1 no tiene por qué vivir dentro de este repositorio.
+
+La frontera preferida es:
+
+* este repo = `trading brain / orchestrator / journal / memory / policy`
+* servicio externo = `historical research / backtests / experiment runs`
+
+Eso implica:
+
+* otro repositorio dedicado
+* despliegue separado, por ejemplo en un VPS
+* consumo vía API versionada
+* persistencia local mínima en este bot:
+
+  * `backtest_spec_ref`
+  * `backtest_run_id`
+  * `status`
+  * métricas resumidas
+  * enlaces a artefactos
+
+Quiero que el bot siga pudiendo trabajar aunque el servicio de backtesting no
+esté disponible. Debe tratarse como una capacidad opcional y desacoplada,
+similar a otros providers externos.
+
+### Candidato externo prioritario
+
+Si en una fase posterior se decide integrar un motor externo más serio, el
+primer candidato a evaluar como sidecar o adaptador debería ser `LEAN`, no por
+ser el más simple sino por ser el más limpio para una integración seria y
+broker-independiente.
+
+No obstante, eso debe llegar después del motor nativo v1.
+
+### Contrato mínimo de backtesting
+
+Quiero una abstracción pequeña y pragmática, algo del estilo:
+
+* `BacktestSpec`
+* `BacktestRun`
+* `BacktestTrade`
+* `BacktestMetricSnapshot`
+* `BacktestEngine`
+
+Donde:
+
+* `BacktestSpec` describe la hipótesis, setup o skill que se quiere validar
+* `BacktestEngine` ejecuta la simulación sobre datos históricos
+* `BacktestRun` guarda configuración, particiones temporales, supuestos y
+  resultados
+* `BacktestTrade` guarda la secuencia simulada de entradas y salidas
+* `BacktestMetricSnapshot` resume métricas comparables y trazables
+
+Además, el servicio externo debe exponer como mínimo:
+
+* `GET /health`
+* `GET /capabilities`
+* `POST /api/v1/backtests`
+* `GET /api/v1/backtests/{run_id}`
+* `GET /api/v1/backtests/{run_id}/trades`
+* `GET /api/v1/backtests/{run_id}/equity`
+* `GET /api/v1/backtests/{run_id}/metrics`
+* `POST /api/v1/backtests/{run_id}/cancel`
+
+Y la especificación debe ser declarativa, no código arbitrario ejecutado
+remotamente.
+
+### Integración con el flujo actual
+
+El módulo de backtesting debe encajar con piezas ya existentes:
+
+* `hypotheses`
+* `strategies`
+* `setups`
+* `signal_definitions`
+* `skill_candidates`
+* `candidate_validation_snapshots`
+* `research_tasks`
+* `journal`
+* `memory`
+
+El flujo deseado es:
+
+1. una hipótesis, lesson o skill candidata solicita validación
+2. se genera un `BacktestSpec`
+3. el motor ejecuta un `BacktestRun`
+4. el resultado queda persistido y enlazado a la entidad origen
+5. el sistema decide si:
+
+   * rechaza
+   * pide más research
+   * abre paper validation
+   * promueve a revisión candidata
+
+### MVP concreto que quiero primero
+
+La primera versión debe ser estrecha y útil:
+
+* universo: acciones USA ya soportadas por el bot
+* timeframe: `1D`
+* datos: `OHLCV` e indicadores/contextos ya presentes en el sistema
+* sesgo inicial: sobre todo `long`
+* foco: validar setups y skills ya existentes antes de abrir la puerta a ideas
+  más complejas
+
+Capacidades mínimas del MVP:
+
+* ejecutar backtests reproducibles desde una especificación persistente
+* soportar `in-sample` y `out-of-sample`
+* calcular métricas básicas:
+
+  * trade count
+  * win rate
+  * expectancy
+  * profit factor
+  * max drawdown
+  * return
+  * exposure
+
+* guardar trades simulados y equity curve
+* enlazar resultados con `research_task`, `hypothesis`, `strategy_version` o
+  `skill_candidate`
+* reutilizar estos resultados dentro de `CHECK` y `ACT`
+
+La preferencia de implementación para este MVP es:
+
+* motor nativo en servicio externo
+* este bot como cliente
+* sin UI compleja al principio
+* sin optimizador masivo ni notebooks embebidos en este repo
+
+### Reglas de seguridad metodológica
+
+No quiero que un backtest aislado cambie el comportamiento live del bot.
+
+Por tanto:
+
+* una sola corrida no basta para promover cambios
+* debe existir separación entre muestra de diseño y muestra de validación
+* cuando sea posible, prefiero `walk-forward` a una única ventana estática
+* toda promoción debe pasar además por `paper` o por otra forma de validación
+  complementaria
+
+### Cómo debe aprender el bot usando backtesting
+
+La secuencia correcta debe ser:
+
+* observación
+* hipótesis
+* backtest
+* validación fuera de muestra
+* paper/replay
+* promoción controlada
+
+No quiero un sistema que:
+
+* busque parámetros hasta encontrar uno que "funciona"
+* active cambios automáticamente por una mejora aparente
+* confunda ajuste histórico con edge real
+
+El backtesting debe servir para aprender mejor, no para generar overfitting.
 
 ---
 
@@ -527,6 +918,8 @@ Debe registrar:
 * resultado posterior
 * reflexión posterior
 * lecciones aprendidas
+* skill usada o skills activadas
+* si la skill fue suficiente, inadecuada o incompleta
 
 Quiero que el journal sirva para:
 
@@ -544,6 +937,8 @@ La memoria del agente debe poder recuperar:
 * setups frecuentes
 * conclusiones previas
 * mejoras propuestas y aprobadas
+* skills validadas
+* skills candidatas o retiradas
 
 ---
 
@@ -608,6 +1003,7 @@ En esta fase la IA debe poder:
 * comparar con expectativas
 * revisar el comportamiento observado
 * evaluar si la hipótesis conserva validez
+* evaluar si la skill o procedimiento usado fue adecuado
 * registrar conclusiones en journal y memoria
 
 ### ACT
@@ -620,6 +1016,8 @@ En esta fase la IA debe poder:
 * proponer mejoras en filtros, señales, pesos y criterios
 * ajustar reglas de entrada/salida o seguimiento
 * crear nuevas versiones
+* promover una observación a hipótesis o regla temporal
+* proponer creación o actualización de una skill
 * registrar mejoras en memoria y journal
 * dejar la mejora pendiente de validación o paper testing antes de pasar a live
 
@@ -678,6 +1076,9 @@ Propón una base de datos y esquema inicial para persistir:
 * journal
 * revisiones PDCA
 * propuestas de mejora
+* skills
+* versiones de skills
+* evaluaciones de uso de skills
 * configuraciones
 * memoria persistente del agente
 
@@ -715,6 +1116,7 @@ Quiero que me entregues, en este orden:
 * flujo de datos entre módulos
 * catálogo de eventos del sistema
 * cómo se implementa el PDCA orientado a eventos
+* cómo funciona el router de skills
 * cómo funciona la memoria del agente
 * cómo funciona el journal
 
@@ -724,7 +1126,7 @@ Quiero que me entregues, en este orden:
 * relaciones
 * campos importantes
 * propuesta de tablas o colecciones
-* versionado de hipótesis, estrategias, setups, señales y screeners
+* versionado de hipótesis, estrategias, setups, señales, screeners y skills
 
 ### Fase 4: arquitectura técnica
 
@@ -745,6 +1147,7 @@ Quiero un MVP reducido pero útil, por ejemplo:
 * 1 flujo PDCA orientado a eventos
 * 1 journal funcional
 * 1 memoria útil
+* 3 o 4 skills iniciales útiles
 * 1 integración inicial de market data
 * 1 sistema de paper trading antes de live trading
 
@@ -754,6 +1157,136 @@ Quiero un MVP reducido pero útil, por ejemplo:
 * versión 2
 * versión 3
 * mejoras futuras
+
+#### Roadmap específico del loop de aprendizaje
+
+Además del roadmap general del producto, quiero un roadmap explícito para la
+evolución del loop de aprendizaje inspirado en OpenClaw/Hermes pero adaptado a
+trading con control de riesgo fuerte.
+
+El principio rector es este:
+
+* no copiar frameworks enteros
+* sí copiar lo que mejora memoria procedimental, disciplina operativa y
+  aprendizaje reutilizable
+* nunca permitir auto-modificación rápida de reglas live sin validación
+
+Estado actual esperado del proyecto:
+
+* `tools` separadas de `skills`
+* memoria persistente
+* journal y reviews
+* skills catalogadas y validadas
+* claims/evidence persistidos
+* skills y claims cargados on-demand en runtime
+
+Lo que debe venir después, en este orden:
+
+##### Prioridad 1: workflows explícitos de aprendizaje
+
+Convertir revisiones y mantenimiento del conocimiento en workflows de primer
+nivel, no solo en efectos secundarios del loop principal.
+
+Workflows iniciales deseados:
+
+* `premarket_review`
+* `postmarket_review`
+* `weekly_skill_audit`
+* `stale_claim_review`
+* `regime_shift_review`
+
+Cada workflow debe tener:
+
+* trigger claro
+* inputs requeridos
+* skills aplicables
+* outputs persistidos
+* criterios de cierre
+
+##### Prioridad 2: detección de skill gaps
+
+El sistema debe registrar no solo qué skill se usó, sino también cuándo:
+
+* faltó una skill
+* una skill fue insuficiente
+* faltó una skill complementaria
+* el operador corrigió una decisión del bot
+
+Eso debe poder generar:
+
+* `gap_note`
+* `research_task`
+* `claim`
+* `skill_candidate`
+
+##### Prioridad 3: puente explícito `claim -> skill_candidate`
+
+No quiero que claims y skills vivan como capas paralelas sin conexión fuerte.
+
+Debe existir un camino formal:
+
+* claim repetido o validado
+* evidencia suficiente
+* propuesta procedimental concreta
+* `skill_candidate`
+* validación replay/paper
+* `validated_skill_revision`
+
+##### Prioridad 4: observabilidad del presupuesto cognitivo
+
+El runtime debe dejar claro cuánto contexto consume cada capa:
+
+* doctrine fija
+* market state
+* runtime skills
+* durable claims
+* journal reciente
+* failure patterns
+
+Esto debe servir para:
+
+* no saturar el prompt
+* entender qué contexto cambió la decisión
+* reducir coste cognitivo sin perder edge
+
+##### Prioridad 5: skills más portables y versionables
+
+Más adelante, las skills deben poder vivir también como artefactos más
+portables y revisables, por ejemplo:
+
+* `SKILL.md`
+* YAML estructurado
+* export/import desde la base de datos
+
+No es prioritario para la primera fase, pero sí importante para:
+
+* diff
+* review
+* test
+* portabilidad
+
+##### Prioridad 6: destilación y compacción de memoria
+
+La memoria no debe crecer solo acumulando objetos.
+
+El sistema debe poder:
+
+* fusionar claims duplicados
+* degradar claims viejos
+* retirar conocimiento superado
+* resumir periodos largos
+* distinguir entre conocimiento actual y conocimiento histórico
+
+#### Entregables esperados por slice
+
+Cada nueva slice del loop de aprendizaje debe dejar:
+
+* modelo o contrato claro
+* persistencia
+* trazabilidad en journal/memory/context
+* API o surface operativa
+* tests dirigidos
+* actualización de `IMPLEMENTATION_JOURNAL.md`
 
 ### Fase 7: implementación
 

@@ -6,6 +6,7 @@ from app.db.session import get_db_session
 from app.domains.market.schemas import (
     AnalysisRunCreate,
     AnalysisRunRead,
+    CorporateCalendarContextRead,
     CalendarEventRead,
     MarketSnapshotRead,
     NewsArticleRead,
@@ -170,6 +171,23 @@ async def get_ticker_calendar(ticker: str, days_ahead: int = 21) -> list[Calenda
         ]
     except CalendarProviderError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+
+@calendar_router.get("/corporate-context/{ticker}", response_model=CorporateCalendarContextRead)
+async def get_ticker_calendar_context(ticker: str, days_ahead: int = 21) -> CorporateCalendarContextRead:
+    try:
+        context = calendar_service.get_ticker_event_context(ticker, days_ahead=days_ahead)
+    except CalendarProviderError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    return CorporateCalendarContextRead.model_validate(
+        {
+            **context,
+            "events": [
+                CalendarEventRead.model_validate(event.__dict__ if hasattr(event, "__dict__") else event)
+                for event in context.get("events", [])
+            ],
+        }
+    )
 
 
 @calendar_router.get("/macro", response_model=list[CalendarEventRead])

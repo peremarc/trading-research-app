@@ -129,31 +129,47 @@ class QuantAnalysisService:
         candles: list[OHLCVCandle],
         benchmark_candles: list[OHLCVCandle] | None = None,
     ) -> dict:
+        if not candles:
+            raise ValueError(f"No candles available to analyze {ticker.upper()}")
+
         closes = [c.close for c in candles]
         highs = [c.high for c in candles]
         lows = [c.low for c in candles]
         volumes = [c.volume for c in candles]
+        candle_count = len(candles)
         latest_close = closes[-1]
 
-        sma_20 = self._sma(closes[-20:])
-        sma_50 = self._sma(closes[-50:])
-        momentum_20 = self._pct_change(closes[-21], latest_close)
-        relative_volume = volumes[-1] / max(self._sma(volumes[-21:-1]), 1.0)
-        atr_14 = self._atr(highs[-15:], lows[-15:], closes[-15:])
-        adx_14 = self._adx(highs[-15:], lows[-15:], closes[-15:])
+        sma_20 = self._sma(closes[-min(candle_count, 20):])
+        sma_50 = self._sma(closes[-min(candle_count, 50):])
+        momentum_window = min(max(candle_count - 1, 0), 20)
+        momentum_20 = self._pct_change(closes[-(momentum_window + 1)], latest_close) if momentum_window >= 1 else 0.0
+        volume_baseline = (
+            self._sma(volumes[-(min(candle_count - 1, 20) + 1):-1])
+            if candle_count >= 2
+            else volumes[-1]
+        )
+        relative_volume = volumes[-1] / max(volume_baseline, 1.0) if candle_count >= 2 else 1.0
+        atr_window = min(candle_count, 15)
+        atr_14 = (
+            self._atr(highs[-atr_window:], lows[-atr_window:], closes[-atr_window:])
+            if candle_count >= 2
+            else max(highs[-1] - lows[-1], latest_close * 0.02)
+        )
+        adx_14 = self._adx(highs[-atr_window:], lows[-atr_window:], closes[-atr_window:]) if candle_count >= 2 else 0.0
         bb_mid = sma_20
-        bb_std = self._std(closes[-20:])
+        bb_std = self._std(closes[-min(candle_count, 20):])
         bb_upper = bb_mid + (2 * bb_std)
         bb_lower = bb_mid - (2 * bb_std)
-        donchian_high = max(highs[-20:])
-        donchian_low = min(lows[-20:])
-        proximity_to_high = round(((latest_close / max(max(highs[-55:]), 0.01)) - 1) * 100, 2)
-        proximity_to_low = round(((latest_close / max(min(lows[-55:]), 0.01)) - 1) * 100, 2)
+        donchian_high = max(highs[-min(candle_count, 20):])
+        donchian_low = min(lows[-min(candle_count, 20):])
+        proximity_window = min(candle_count, 55)
+        proximity_to_high = round(((latest_close / max(max(highs[-proximity_window:]), 0.01)) - 1) * 100, 2)
+        proximity_to_low = round(((latest_close / max(min(lows[-proximity_window:]), 0.01)) - 1) * 100, 2)
 
         benchmark_momentum = 0.0
-        if benchmark_candles and len(benchmark_candles) >= 21:
+        if benchmark_candles and len(benchmark_candles) >= momentum_window + 1 and momentum_window >= 1:
             benchmark_closes = [c.close for c in benchmark_candles]
-            benchmark_momentum = self._pct_change(benchmark_closes[-21], benchmark_closes[-1])
+            benchmark_momentum = self._pct_change(benchmark_closes[-(momentum_window + 1)], benchmark_closes[-1])
         alpha_gap = momentum_20 - benchmark_momentum
 
         trend = "sideways"
@@ -170,8 +186,8 @@ class QuantAnalysisService:
         elif adx_14 < 18:
             setup = "range"
 
-        support_level = round(min(lows[-10:]), 2)
-        resistance_level = round(max(highs[-10:]), 2)
+        support_level = round(min(lows[-min(candle_count, 10):]), 2)
+        resistance_level = round(max(highs[-min(candle_count, 10):]), 2)
         entry_price = round(latest_close, 2)
         stop_price = round(max(min(support_level, latest_close - (1.5 * atr_14)), 0.01), 2)
         if setup == "breakout":
@@ -200,9 +216,16 @@ class QuantAnalysisService:
             + rr_score * 0.18,
             2,
         )
+        history_quality = "complete" if candle_count >= 60 else ("limited" if candle_count >= 20 else "sparse")
+        if candle_count < 20:
+            quant_score = round(min(quant_score, 0.38), 2)
+        elif candle_count < 60:
+            quant_score = round(min(quant_score, 0.62), 2)
 
         return {
             "ticker": ticker.upper(),
+            "history_bars": candle_count,
+            "history_quality": history_quality,
             "trend": trend,
             "setup": setup,
             "momentum_pct_20": round(momentum_20, 2),
@@ -228,6 +251,7 @@ class QuantAnalysisService:
             "narrative": (
                 f"{ticker.upper()} shows {trend} with {setup} context, momentum {round(momentum_20, 2)}%, "
                 f"relative volume {round(relative_volume, 2)}x, ADX {round(adx_14, 1)} and R/R {risk_reward}."
+                f" History quality={history_quality} ({candle_count} bars)."
             ),
         }
 
@@ -284,6 +308,334 @@ class QuantAnalysisService:
         if di_sum == 0:
             return 0.0
         return abs(plus_di - minus_di) / di_sum * 100
+
+
+class PriceActionProxyService:
+    SIGNAL_KIND_BY_CODE = {
+        "failed_breakdown_reversal": "trigger",
+        "support_reclaim_confirmation": "confirmation",
+        "rejection_wick_at_support": "confirmation",
+        "high_relative_volume_reversal": "confirmation",
+        "breakout_failure_reclaim": "trigger",
+    }
+    REVERSAL_SIGNAL_CODES = {
+        "failed_breakdown_reversal",
+        "support_reclaim_confirmation",
+        "rejection_wick_at_support",
+        "high_relative_volume_reversal",
+    }
+
+    def analyze(
+        self,
+        *,
+        candles: list[OHLCVCandle],
+        relative_volume: float | None = None,
+        atr_14: float | None = None,
+    ) -> dict:
+        if len(candles) < 12:
+            return self._unavailable_context("Not enough daily candles to build price action proxies.")
+
+        highs = [float(candle.high) for candle in candles]
+        lows = [float(candle.low) for candle in candles]
+        last_candle = candles[-1]
+        prev_candle = candles[-2]
+        previous_lows = lows[:-1] or lows
+        previous_highs = highs[:-1] or highs
+        support_reference = min(previous_lows[-10:] or previous_lows)
+        prior_support_reference = min((lows[:-2] or previous_lows)[-10:] or (lows[:-2] or previous_lows))
+        resistance_reference = max(previous_highs[-10:] or previous_highs)
+        breakout_reference = max(previous_highs[-20:] or previous_highs)
+
+        candle_range = max(float(last_candle.high) - float(last_candle.low), 0.01)
+        close_location = max(min((float(last_candle.close) - float(last_candle.low)) / candle_range, 1.0), 0.0)
+        body_size = abs(float(last_candle.close) - float(last_candle.open))
+        lower_wick = max(min(float(last_candle.open), float(last_candle.close)) - float(last_candle.low), 0.0)
+        upper_wick = max(float(last_candle.high) - max(float(last_candle.open), float(last_candle.close)), 0.0)
+        rejection_wick_ratio = lower_wick / candle_range
+        relative_volume_value = float(relative_volume or 0.0)
+        atr_value = max(float(atr_14 or 0.0), 0.01)
+        day_change_pct = round(((float(last_candle.close) / max(float(prev_candle.close), 0.01)) - 1) * 100, 2)
+        volume_state = self._volume_state(relative_volume_value)
+        close_location_state = self._close_location_state(close_location)
+        higher_timeframe_bias = self._higher_timeframe_bias(candles)
+        close_vs_support_pct = round(((float(last_candle.close) / max(support_reference, 0.01)) - 1) * 100, 2)
+        close_vs_reclaim_pct = round(((float(last_candle.close) / max(prior_support_reference, 0.01)) - 1) * 100, 2)
+
+        triggered_signals: list[dict] = []
+        evidence_points: list[str] = [
+            f"support_reference={round(support_reference, 2)}",
+            f"prior_support_reference={round(prior_support_reference, 2)}",
+            f"resistance_reference={round(resistance_reference, 2)}",
+            f"breakout_reference={round(breakout_reference, 2)}",
+            f"close_location={round(close_location, 2)}",
+            f"relative_volume={round(relative_volume_value, 2)}",
+            f"day_change_pct={day_change_pct}",
+            f"higher_timeframe_bias={higher_timeframe_bias}",
+        ]
+
+        failed_breakdown = (
+            float(last_candle.low) < support_reference * 0.995
+            and float(last_candle.close) >= support_reference * 1.001
+            and close_location >= 0.6
+            and float(last_candle.close) >= float(last_candle.open)
+        )
+        if failed_breakdown:
+            triggered_signals.append(
+                self._signal_payload(
+                    code="failed_breakdown_reversal",
+                    score=min(0.62 + max(close_location - 0.6, 0.0) * 0.5 + max(relative_volume_value - 1.0, 0.0) * 0.08, 0.92),
+                    details="Daily low pushed below recent support and the close reclaimed that level with a constructive finish.",
+                )
+            )
+
+        support_reclaim = (
+            (float(prev_candle.close) < prior_support_reference * 0.998 or float(prev_candle.low) < prior_support_reference * 0.995)
+            and float(last_candle.close) >= prior_support_reference * 1.002
+            and float(last_candle.close) >= max(float(last_candle.open), float(prev_candle.close))
+            and close_location >= 0.6
+            and relative_volume_value >= 1.05
+        )
+        if support_reclaim:
+            triggered_signals.append(
+                self._signal_payload(
+                    code="support_reclaim_confirmation",
+                    score=min(
+                        0.55
+                        + max(close_location - 0.6, 0.0) * 0.3
+                        + max(relative_volume_value - 1.05, 0.0) * 0.08,
+                        0.87,
+                    ),
+                    details="After losing support on the prior session, price reclaimed that level with a constructive close and non-weak participation.",
+                )
+            )
+
+        support_rejection = (
+            float(last_candle.low) <= support_reference * 1.01
+            and rejection_wick_ratio >= 0.35
+            and close_location >= 0.58
+        )
+        if support_rejection:
+            triggered_signals.append(
+                self._signal_payload(
+                    code="rejection_wick_at_support",
+                    score=min(0.56 + rejection_wick_ratio * 0.25 + max(close_location - 0.58, 0.0) * 0.2, 0.88),
+                    details="The candle rejected a nearby support zone with a long lower wick and a close back in the upper part of the range.",
+                )
+            )
+
+        high_volume_reversal = (
+            relative_volume_value >= 1.75
+            and float(last_candle.close) >= max(float(last_candle.open), float(prev_candle.close))
+            and close_location >= 0.65
+        )
+        if high_volume_reversal:
+            triggered_signals.append(
+                self._signal_payload(
+                    code="high_relative_volume_reversal",
+                    score=min(0.58 + max(relative_volume_value - 1.75, 0.0) * 0.1 + max(close_location - 0.65, 0.0) * 0.15, 0.9),
+                    details="The session reversed higher with elevated relative volume and a close near the top of the candle range.",
+                )
+            )
+
+        breakout_reclaim = (
+            float(last_candle.low) < breakout_reference * 0.995
+            and float(last_candle.close) >= breakout_reference * 1.001
+            and close_location >= 0.6
+        )
+        if breakout_reclaim:
+            triggered_signals.append(
+                self._signal_payload(
+                    code="breakout_failure_reclaim",
+                    score=min(0.6 + max(close_location - 0.6, 0.0) * 0.35 + max(relative_volume_value - 1.0, 0.0) * 0.06, 0.9),
+                    details="Price briefly lost the prior breakout area and then reclaimed it by the daily close.",
+                )
+            )
+
+        triggered_signals.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+        primary_signal = triggered_signals[0] if triggered_signals else None
+        reversal_signal_flags = [
+            str(item.get("code"))
+            for item in triggered_signals
+            if str(item.get("code") or "").strip() in self.REVERSAL_SIGNAL_CODES
+        ]
+        follow_through_state = self._follow_through_state(
+            reversal_signal_flags=reversal_signal_flags,
+            higher_timeframe_bias=higher_timeframe_bias,
+            close_location=close_location,
+            relative_volume=relative_volume_value,
+            body_fraction=body_size / candle_range,
+        )
+        follow_through_expected = follow_through_state == "constructive"
+        structural_invalidation_level = round(
+            min(float(last_candle.low), prior_support_reference if reversal_signal_flags else support_reference),
+            2,
+        )
+        confirmation_bonus = self._confirmation_bonus(
+            signal_count=len(triggered_signals),
+            volume_state=volume_state,
+            primary_signal_score=float(primary_signal.get("score") or 0.0) if isinstance(primary_signal, dict) else 0.0,
+        )
+        bias = "supportive" if triggered_signals else "neutral"
+
+        return {
+            "available": True,
+            "timeframe": "1D",
+            "method": "ohlcv_price_action_proxies_v1",
+            "bias": bias,
+            "support_reference": round(support_reference, 2),
+            "support_level": round(support_reference, 2),
+            "reclaim_level": round(prior_support_reference, 2),
+            "resistance_reference": round(resistance_reference, 2),
+            "breakout_reference": round(breakout_reference, 2),
+            "relative_volume": round(relative_volume_value, 2),
+            "volume_state": volume_state,
+            "atr_14": round(atr_value, 2),
+            "candle_range_atr": round(candle_range / atr_value, 2),
+            "day_change_pct": day_change_pct,
+            "close_location": round(close_location, 2),
+            "close_location_state": close_location_state,
+            "close_vs_support_pct": close_vs_support_pct,
+            "close_vs_reclaim_pct": close_vs_reclaim_pct,
+            "body_fraction": round(body_size / candle_range, 2),
+            "lower_wick_fraction": round(lower_wick / candle_range, 2),
+            "upper_wick_fraction": round(upper_wick / candle_range, 2),
+            "rejection_wick_ratio": round(rejection_wick_ratio, 2),
+            "breakdown_failed": failed_breakdown,
+            "support_reclaimed": support_reclaim or failed_breakdown,
+            "higher_timeframe_bias": higher_timeframe_bias,
+            "higher_timeframe_method": "1W_proxy_from_daily_structure_v1",
+            "follow_through_expected": follow_through_expected,
+            "follow_through_state": follow_through_state,
+            "reversal_signal_flags": reversal_signal_flags,
+            "structural_invalidation_level": structural_invalidation_level,
+            "reversal_context": {
+                "support_level": round(support_reference, 2),
+                "reclaim_level": round(prior_support_reference, 2),
+                "close_vs_support_pct": close_vs_support_pct,
+                "close_vs_reclaim_pct": close_vs_reclaim_pct,
+                "rejection_wick_ratio": round(rejection_wick_ratio, 2),
+                "breakdown_failed": failed_breakdown,
+                "support_reclaimed": support_reclaim or failed_breakdown,
+                "higher_timeframe_bias": higher_timeframe_bias,
+                "higher_timeframe_method": "1W_proxy_from_daily_structure_v1",
+                "follow_through_expected": follow_through_expected,
+                "follow_through_state": follow_through_state,
+                "reversal_signal_flags": reversal_signal_flags,
+                "structural_invalidation_level": structural_invalidation_level,
+            },
+            "signal_count": len(triggered_signals),
+            "triggered_signals": triggered_signals,
+            "triggered_signal_codes": [str(item.get("code")) for item in triggered_signals],
+            "signal_definition_codes": [str(item.get("code")) for item in triggered_signals],
+            "primary_signal_code": primary_signal.get("code") if isinstance(primary_signal, dict) else None,
+            "primary_signal_kind": primary_signal.get("signal_kind") if isinstance(primary_signal, dict) else None,
+            "primary_signal_score": round(float(primary_signal.get("score") or 0.0), 2)
+            if isinstance(primary_signal, dict)
+            else 0.0,
+            "confirmation_bonus": confirmation_bonus,
+            "summary": self._build_summary(primary_signal=primary_signal, signal_count=len(triggered_signals)),
+            "evidence_points": evidence_points
+            + [str(item.get("code")) for item in triggered_signals if str(item.get("code") or "").strip()],
+        }
+
+    def _signal_payload(self, *, code: str, score: float, details: str) -> dict:
+        return {
+            "code": code,
+            "signal_kind": self.SIGNAL_KIND_BY_CODE.get(code, "confirmation"),
+            "score": round(min(max(score, 0.0), 1.0), 2),
+            "details": details,
+        }
+
+    @staticmethod
+    def _volume_state(relative_volume: float) -> str:
+        if relative_volume >= 1.75:
+            return "high"
+        if relative_volume >= 1.1:
+            return "normal"
+        return "subdued"
+
+    @staticmethod
+    def _close_location_state(close_location: float) -> str:
+        if close_location >= 0.7:
+            return "strong_close"
+        if close_location <= 0.35:
+            return "weak_close"
+        return "mid_close"
+
+    @staticmethod
+    def _higher_timeframe_bias(candles: list[OHLCVCandle]) -> str:
+        if len(candles) < 20:
+            return "neutral"
+        closes = [float(candle.close) for candle in candles]
+        last_close = closes[-1]
+        sma_5 = sum(closes[-5:]) / 5
+        sma_20 = sum(closes[-20:]) / 20
+        if last_close >= sma_5 >= sma_20 and last_close >= sma_20 * 1.01:
+            return "supportive"
+        if last_close <= sma_5 <= sma_20 and last_close <= sma_20 * 0.99:
+            return "hostile"
+        return "neutral"
+
+    @staticmethod
+    def _follow_through_state(
+        *,
+        reversal_signal_flags: list[str],
+        higher_timeframe_bias: str,
+        close_location: float,
+        relative_volume: float,
+        body_fraction: float,
+    ) -> str:
+        if not reversal_signal_flags:
+            return "none"
+        if (
+            higher_timeframe_bias == "supportive"
+            and close_location >= 0.68
+            and relative_volume >= 1.1
+            and body_fraction >= 0.22
+        ):
+            return "constructive"
+        if higher_timeframe_bias == "hostile" or close_location < 0.55 or relative_volume < 1.0:
+            return "at_risk"
+        return "uncertain"
+
+    @staticmethod
+    def _confirmation_bonus(*, signal_count: int, volume_state: str, primary_signal_score: float) -> float:
+        if signal_count <= 0:
+            return 0.0
+        bonus = 0.02 + min(signal_count, 3) * 0.01
+        if volume_state == "high":
+            bonus += 0.01
+        if primary_signal_score >= 0.75:
+            bonus += 0.01
+        return round(min(bonus, 0.08), 2)
+
+    @staticmethod
+    def _build_summary(*, primary_signal: dict | None, signal_count: int) -> str:
+        if not isinstance(primary_signal, dict):
+            return "No supportive daily price action proxy fired."
+        return (
+            f"Daily price action proxy is supportive: primary_signal={primary_signal.get('code')}, "
+            f"signal_count={signal_count}, signal_kind={primary_signal.get('signal_kind')}."
+        )
+
+    @staticmethod
+    def _unavailable_context(reason: str) -> dict:
+        return {
+            "available": False,
+            "timeframe": "1D",
+            "method": "ohlcv_price_action_proxies_v1",
+            "bias": "neutral",
+            "signal_count": 0,
+            "triggered_signals": [],
+            "triggered_signal_codes": [],
+            "signal_definition_codes": [],
+            "primary_signal_code": None,
+            "primary_signal_kind": None,
+            "primary_signal_score": 0.0,
+            "confirmation_bonus": 0.0,
+            "summary": reason,
+            "evidence_points": [],
+        }
 
 
 class VisualAnalysisService:
@@ -355,11 +707,13 @@ class FusedAnalysisService:
         self,
         market_data_service: MarketDataService | None = None,
         quant_service: QuantAnalysisService | None = None,
+        price_action_service: PriceActionProxyService | None = None,
         visual_service: VisualAnalysisService | None = None,
         chart_service: ChartRenderService | None = None,
     ) -> None:
         self.market_data_service = market_data_service or MarketDataService()
         self.quant_service = quant_service or QuantAnalysisService()
+        self.price_action_service = price_action_service or PriceActionProxyService()
         self.visual_service = visual_service or VisualAnalysisService()
         self.chart_service = chart_service or ChartRenderService()
 
@@ -368,6 +722,7 @@ class FusedAnalysisService:
         return {
             "ticker": chart_payload["ticker"],
             "quant_summary": chart_payload["quant_summary"],
+            "price_action_context": chart_payload["price_action_context"],
             "visual_summary": chart_payload["visual_summary"],
             "chart_svg": chart_payload["chart_svg"],
             "combined_score": chart_payload["combined_score"],
@@ -395,6 +750,11 @@ class FusedAnalysisService:
             candles=analysis_candles,
             benchmark_candles=analysis_benchmark_candles,
         )
+        price_action_context = self.price_action_service.analyze(
+            candles=visible_candles,
+            relative_volume=quant_summary.get("relative_volume"),
+            atr_14=quant_summary.get("atr_14"),
+        )
         visual_summary = self.visual_service.analyze(candles=visible_candles, quant_summary=quant_summary)
         chart_svg = self.chart_service.render_standard_chart(
             ticker=ticker,
@@ -404,7 +764,10 @@ class FusedAnalysisService:
         )
         combined_score = round((quant_summary["quant_score"] * 0.6) + (visual_summary["visual_score"] * 0.4), 2)
         decision = "discard"
-        if combined_score >= 0.78 and quant_summary["risk_reward"] >= 1.8:
+        if quant_summary.get("history_quality") == "sparse":
+            decision = "watch" if combined_score >= 0.35 else "discard"
+            combined_score = min(combined_score, 0.45)
+        elif combined_score >= 0.78 and quant_summary["risk_reward"] >= 1.8:
             decision = "paper_enter"
         elif combined_score >= 0.58:
             decision = "watch"
@@ -414,12 +777,20 @@ class FusedAnalysisService:
             f"setup={visual_summary['setup_type']}, trend={quant_summary['trend']}, "
             f"alpha_gap={quant_summary['alpha_gap_pct_20']}%, R/R={quant_summary['risk_reward']}."
         )
+        if quant_summary.get("history_quality") in {"limited", "sparse"}:
+            rationale = (
+                f"{rationale} History quality={quant_summary.get('history_quality')} "
+                f"({quant_summary.get('history_bars')} bars), so confidence is degraded."
+            )
+        if price_action_context.get("primary_signal_code"):
+            rationale = f"{rationale} Price action proxy={price_action_context['primary_signal_code']}."
 
         return {
             "ticker": ticker.upper(),
             "timeframe": timeframe_label,
             "visible_candles": len(visible_candles),
             "quant_summary": quant_summary,
+            "price_action_context": price_action_context,
             "visual_summary": {
                 **visual_summary,
                 "chart_render_mode": "standardized_svg",

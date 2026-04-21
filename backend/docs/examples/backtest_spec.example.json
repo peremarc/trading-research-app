@@ -1,0 +1,127 @@
+{
+  "spec_version": "backtest_spec_v1",
+  "name": "failed_breakdown_reversal_long_on_supportive_context",
+  "description": "Validate failed breakdown reversal long setups on US equities using daily OHLCV bars with simple friction assumptions.",
+  "source": {
+    "requested_by": "trading-bot",
+    "source_app": "trading-research-app",
+    "reason": "validate_skill_candidate",
+    "linked_entity_type": "skill_candidate",
+    "linked_entity_id": "mem_4821"
+  },
+  "target": {
+    "type": "skill_candidate",
+    "code": "failed_breakdown_reversal_long",
+    "version": "draft_v1"
+  },
+  "universe": {
+    "market": "US_EQUITIES",
+    "tickers": [
+      "AAL",
+      "DAL",
+      "UAL",
+      "LUV",
+      "JBLU"
+    ],
+    "universe_code": "airlines_us",
+    "filters": {
+      "min_price": 5,
+      "min_avg_dollar_volume": 10000000
+    }
+  },
+  "data": {
+    "provider": "eod_dataset",
+    "dataset_version": "us_equities_eod_2026-04-19",
+    "timeframe": "1D",
+    "adjust_prices": true,
+    "corporate_actions_mode": "adjusted",
+    "start_date": "2022-01-01",
+    "end_date": "2026-04-19",
+    "warmup_bars": 250
+  },
+  "strategy": {
+    "playbook": "pullback_long",
+    "bias": "long",
+    "setup_code": "failed_breakdown_reversal_long",
+    "signal_codes": [
+      "failed_breakdown_reversal",
+      "support_reclaim_confirmation",
+      "high_relative_volume_reversal"
+    ],
+    "entry_rules": {
+      "trigger": "close_reclaims_support",
+      "confirmation": [
+        "relative_volume_ge_1_1",
+        "higher_timeframe_bias_supportive"
+      ]
+    },
+    "exit_rules": {
+      "stop_mode": "structural_invalidation",
+      "target_mode": "risk_reward_multiple",
+      "risk_reward_target": 2.0,
+      "time_stop_bars": 15
+    },
+    "risk_rules": {
+      "max_risk_per_trade_pct": 0.5,
+      "skip_if_near_earnings_days": 3,
+      "skip_regimes": [
+        "high_volatility_risk_off"
+      ]
+    },
+    "parameters": {
+      "support_lookback_bars": 20,
+      "min_rejection_wick_ratio": 0.35,
+      "min_close_location": 0.6
+    },
+    "context_requirements": {
+      "market_regime_allowed": [
+        "bullish",
+        "macro_uncertainty"
+      ],
+      "expiry_context_penalty_allowed": true
+    }
+  },
+  "execution_model": {
+    "initial_cash": 100000,
+    "position_sizing_mode": "risk_fraction",
+    "max_positions": 5,
+    "commission_bps": 5,
+    "slippage_bps": 8,
+    "allow_partial_exits": false,
+    "allow_reentry": false
+  },
+  "validation_plan": {
+    "mode": "single_split",
+    "in_sample": {
+      "start_date": "2022-01-01",
+      "end_date": "2025-06-30"
+    },
+    "out_of_sample": {
+      "start_date": "2025-07-01",
+      "end_date": "2026-04-19"
+    },
+    "min_trade_count": 30,
+    "min_distinct_tickers": 3,
+    "success_thresholds": {
+      "min_win_rate": 50,
+      "min_profit_factor": 1.2,
+      "max_drawdown_pct": -12,
+      "min_out_of_sample_return_pct": 3
+    }
+  },
+  "outputs": {
+    "include_trades": true,
+    "include_equity_curve": true,
+    "include_daily_stats": true,
+    "include_artifacts": true
+  },
+  "metadata": {
+    "tags": [
+      "reversal",
+      "skills",
+      "airlines"
+    ],
+    "notes": "Initial bounded validation before any paper promotion.",
+    "trace_id": "trace_bt_20260420_001"
+  }
+}

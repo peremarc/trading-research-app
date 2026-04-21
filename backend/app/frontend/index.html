@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Strategy Lab Console</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20260418-market-state-1">
+  <link rel="stylesheet" href="/assets/styles.css?v=20260420-ticker-trace-1">
 </head>
 <body>
   <div class="app-shell">
@@ -104,32 +104,57 @@
       <section class="panel panel-span-12 chat-panel">
         <div class="panel-heading">
           <div>
-            <h2>Chat con el Bot</h2>
-            <p>Preguntale que ha descubierto, que esta haciendo, que le falta o un resumen de operaciones.</p>
+            <h2>Conversaciones con el Bot</h2>
+            <p>Hilos persistentes para debatir ideas, revisar tickers y promover research o memoria sin disparar ejecucion.</p>
           </div>
         </div>
-        <div class="chat-layout">
-          <div class="chat-suggestions">
-            <button class="chat-chip" data-chat-prompt="Dame un resumen general">Resumen general</button>
-            <button class="chat-chip" data-chat-prompt="Que has descubierto hoy">Descubrimientos</button>
-            <button class="chat-chip" data-chat-prompt="Que estas haciendo ahora">Estado actual</button>
-            <button class="chat-chip" data-chat-prompt="Que herramientas te faltan para mejorar resultados">Herramientas</button>
-            <button class="chat-chip" data-chat-prompt="Resumen de las ultimas operaciones">Operaciones</button>
-            <button class="chat-chip" data-chat-prompt="Noticias de NVDA">Noticias</button>
-          </div>
-          <div id="chat-thread" class="chat-thread"></div>
-          <form id="chat-form" class="chat-form">
-            <textarea
-              id="chat-input"
-              class="chat-input"
-              rows="3"
-              placeholder="Ejemplo: que has descubierto, que estas haciendo ahora, que te falta para mejorar..."
-            ></textarea>
-            <div class="chat-actions">
-              <span class="muted">El chat responde con datos reales del runtime y la base de datos actual.</span>
-              <button id="chat-send" type="submit" class="action">Preguntar</button>
+        <div class="chat-workbench">
+          <aside class="chat-sidebar">
+            <div class="chat-sidebar-head">
+              <div>
+                <strong>Conversaciones</strong>
+                <p>Temas persistentes, archivables y recuperables.</p>
+              </div>
+              <button id="chat-new-conversation" type="button" class="action action-muted">Nueva</button>
             </div>
-          </form>
+            <label class="chat-archive-toggle">
+              <input id="chat-show-archived" type="checkbox">
+              <span>Mostrar archivadas</span>
+            </label>
+            <div id="chat-conversation-list" class="chat-conversation-list"></div>
+          </aside>
+          <div class="chat-main">
+            <div class="chat-toolbar">
+              <div id="chat-conversation-meta" class="chat-conversation-meta"></div>
+              <div class="chat-toolbar-actions">
+                <label class="chat-select-label" for="chat-llm-select">
+                  <span>Modelo</span>
+                  <select id="chat-llm-select" class="chat-select"></select>
+                </label>
+                <button id="chat-archive" type="button" class="action action-muted">Archivar</button>
+              </div>
+            </div>
+            <div class="chat-suggestions">
+              <button class="chat-chip" data-chat-prompt="Dame un resumen general">Resumen general</button>
+              <button class="chat-chip" data-chat-prompt="Que has descubierto hoy">Descubrimientos</button>
+              <button class="chat-chip" data-chat-prompt="Que opinas de NVDA">Ticker review</button>
+              <button class="chat-chip" data-chat-prompt="Idea: MSTR tiene riesgo de dilucion si mNAV sigue alto">Idea MSTR</button>
+              <button class="chat-chip" data-chat-prompt="Creo que AAL merece research por la relacion petroleo-aerolineas">Idea aerolineas</button>
+            </div>
+            <div id="chat-thread" class="chat-thread"></div>
+            <form id="chat-form" class="chat-form">
+              <textarea
+                id="chat-input"
+                class="chat-input"
+                rows="4"
+                placeholder="Ejemplo: que opinas de MSTR, creo que AAL merece research por X, no estoy de acuerdo con esta tesis..."
+              ></textarea>
+              <div class="chat-actions">
+                <span id="chat-status-hint" class="muted">El hilo guarda modelo, mensajes y acciones trazables.</span>
+                <button id="chat-send" type="submit" class="action">Enviar</button>
+              </div>
+            </form>
+          </div>
         </div>
       </section>
 
@@ -216,11 +241,111 @@
       <section class="panel panel-span-6">
         <div class="panel-heading">
           <div>
+            <h2>Macro Research Lane</h2>
+            <p>Senales macro y geopoliticas ya sintetizadas por el bot con activos, regimen y sesgo operativo.</p>
+          </div>
+        </div>
+        <div id="macro-research-signals" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Thematic Watchlists</h2>
+            <p>Watchlists creadas por tesis macro para convertir escenarios en universos operables.</p>
+          </div>
+        </div>
+        <div id="macro-theme-watchlists" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
             <h2>Activity Feed</h2>
             <p>Cambios y activaciones recientes.</p>
           </div>
         </div>
         <div id="activity-feed" class="activity-feed"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Skill Candidates</h2>
+            <p>Lecciones promovidas desde reviews que aun necesitan gate de paper o replay antes de activarse.</p>
+          </div>
+        </div>
+        <div id="skill-candidates" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Validated Skills</h2>
+            <p>Revisiones de skills ya activas o pendientes de integracion al catalogo base.</p>
+          </div>
+        </div>
+        <div id="skill-active-revisions" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Skill Gaps</h2>
+            <p>Huecos procedimentales detectados retrospectivamente desde reviews cuando falta skill activa o el catalogo no cubre el patron.</p>
+          </div>
+        </div>
+        <div id="skill-gaps" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Claim Review Queue</h2>
+            <p>Claims stale, contested o contradichos que necesitan confirmacion, contradiccion o retiro explicito.</p>
+          </div>
+        </div>
+        <div id="claim-review-queue" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Durable Claims</h2>
+            <p>Memoria curada ya disponible para el runtime del agente, con estado, frescura y evidencia resumida.</p>
+          </div>
+        </div>
+        <div id="durable-claims" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
+            <h2>Operator Disagreement</h2>
+            <p>Desacuerdos estructurados del operador con claims, gaps o candidates, ya convertidos en evidencia reutilizable.</p>
+          </div>
+        </div>
+        <div id="operator-disagreements" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Learning Workflows</h2>
+            <p>Workflows persistidos del loop de aprendizaje para revisar claims stale y auditar skill gaps o candidates pendientes.</p>
+          </div>
+        </div>
+        <div id="learning-workflows" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Learning Detail</h2>
+            <p>Detalle enlazado de workflow, claim, gap o candidate seleccionado desde las vistas operativas.</p>
+          </div>
+        </div>
+        <div id="learning-detail" class="stack-list"></div>
       </section>
 
       <section class="panel panel-span-12">
@@ -231,6 +356,36 @@
           </div>
         </div>
         <div id="open-positions" class="positions-board"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Corporate Event Context</h2>
+            <p>Fuente activa del calendario corporativo por ticker, fallback usado y frescura de la caché de respaldo.</p>
+          </div>
+        </div>
+        <div id="corporate-event-context" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
+            <h2>Ticker Trace</h2>
+            <p>Reconstruccion rapida del flujo de decisiones por ticker: senales, guards, paso por LLM, journal y posiciones.</p>
+          </div>
+        </div>
+        <div class="ticker-trace-shell">
+          <form id="ticker-trace-form" class="ticker-trace-toolbar">
+            <label class="ticker-trace-label" for="ticker-trace-input">
+              <span>Ticker</span>
+              <input id="ticker-trace-input" class="ticker-trace-input" type="text" maxlength="12" placeholder="Ej: LZM, MSTR, SPY">
+            </label>
+            <button type="submit" class="action">Ver trace</button>
+          </form>
+          <div id="ticker-trace-summary" class="ticker-trace-summary"></div>
+          <div id="ticker-trace-feed" class="stack-list"></div>
+        </div>
       </section>
 
       <section class="panel panel-span-12">
@@ -263,6 +418,6 @@
     </article>
   </template>
 
-  <script type="module" src="/assets/app.js?v=20260418-market-state-1"></script>
+  <script type="module" src="/assets/app.js?v=20260420-skills-ui-1"></script>
 </body>
 </html>

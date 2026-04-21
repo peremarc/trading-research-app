@@ -5,21 +5,26 @@ from datetime import date, datetime, timezone
 from datetime import timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.db.models.chat_message import ChatMessage
 from app.db.models.hypothesis import Hypothesis
+from app.db.models.journal import JournalEntry
 from app.db.models.signal_definition import SignalDefinition
 from app.db.models.setup import Setup
 from app.db.models.strategy import Strategy
 from app.db.models.watchlist import Watchlist
 from app.db.session import SessionLocal
-from app.domains.learning.schemas import DailyPlanRequest
 from app.domains.learning.agent import AIDecisionError, AutonomousTradingAgentService
-from app.domains.learning.services import OrchestratorService
+from app.domains.learning.schemas import JournalEntryCreate
+from app.domains.learning.services import JournalService, OrchestratorService
+from app.domains.learning.workflows import LearningWorkflowService, LearningWorkflowSyncReport
 from app.domains.execution.monitoring import IBKRRealtimePositionMonitorService
-from app.domains.market.services import MarketDataUnavailableError
+from app.domains.market.services import MarketDataService, MarketDataUnavailableError
 from app.domains.system.events import EventLogService
+from app.domains.system.market_hours import USMarketHoursService
 from app.domains.strategy.schemas import (
     HypothesisCreate,
     SignalDefinitionCreate,
@@ -443,6 +448,124 @@ class SeedService:
         elif session.query(SignalDefinition).count() == 0:
             created["signal_definitions"] = 0
 
+        created["signal_definitions"] += self._ensure_price_action_signal_definitions(session)
+        return created
+
+    def _ensure_price_action_signal_definitions(self, session: Session) -> int:
+        breakout_hypothesis = session.scalars(
+            select(Hypothesis).where(Hypothesis.code == "breakout_continuation")
+        ).first()
+        pullback_hypothesis = session.scalars(
+            select(Hypothesis).where(Hypothesis.code == "trend_pullback_continuation")
+        ).first()
+        breakout_strategy = session.scalars(select(Strategy).where(Strategy.code == "breakout_long")).first()
+        pullback_strategy = session.scalars(select(Strategy).where(Strategy.code == "pullback_long")).first()
+        breakout_setup = session.scalars(select(Setup).where(Setup.code == "breakout_consolidation_20d")).first()
+        pullback_setup = session.scalars(select(Setup).where(Setup.code == "pullback_sma20_resume")).first()
+
+        definitions = [
+            SignalDefinitionCreate(
+                code="failed_breakdown_reversal",
+                name="Failed Breakdown Reversal",
+                description="Daily price action trigger that undercuts nearby support and reclaims it by the close.",
+                hypothesis_id=pullback_hypothesis.id if pullback_hypothesis is not None else None,
+                strategy_id=pullback_strategy.id if pullback_strategy is not None else None,
+                setup_id=pullback_setup.id if pullback_setup is not None else None,
+                signal_kind="trigger",
+                definition="Low breaks below recent support, then the close recovers that level with constructive candle structure.",
+                parameters={"timeframe": "1D", "data_source": "ohlcv_volume_proxy"},
+                activation_conditions={
+                    "support_undercut_pct_min": 0.5,
+                    "support_reclaim_required": True,
+                    "close_location_min": 0.6,
+                },
+                intended_usage="Use as an auxiliary trigger for daily reversal or pullback timing, not as proof of order flow absorption.",
+                status="active",
+            ),
+            SignalDefinitionCreate(
+                code="rejection_wick_at_support",
+                name="Rejection Wick At Support",
+                description="Daily confirmation that price rejected a nearby support area with a long lower wick.",
+                hypothesis_id=pullback_hypothesis.id if pullback_hypothesis is not None else None,
+                strategy_id=pullback_strategy.id if pullback_strategy is not None else None,
+                setup_id=pullback_setup.id if pullback_setup is not None else None,
+                signal_kind="confirmation",
+                definition="Price probes support and closes back in the upper portion of the candle with a pronounced lower wick.",
+                parameters={"timeframe": "1D", "data_source": "ohlcv_volume_proxy"},
+                activation_conditions={
+                    "support_proximity_pct_max": 1.0,
+                    "lower_wick_fraction_min": 0.35,
+                    "close_location_min": 0.58,
+                },
+                intended_usage="Use as a support-hold confirmation based on candle structure only.",
+                status="active",
+            ),
+            SignalDefinitionCreate(
+                code="support_reclaim_confirmation",
+                name="Support Reclaim Confirmation",
+                description="Daily confirmation that price lost support and then reclaimed it on the following session.",
+                hypothesis_id=pullback_hypothesis.id if pullback_hypothesis is not None else None,
+                strategy_id=pullback_strategy.id if pullback_strategy is not None else None,
+                setup_id=pullback_setup.id if pullback_setup is not None else None,
+                signal_kind="confirmation",
+                definition="After a support loss, the next daily close recovers that level with constructive structure and non-weak volume.",
+                parameters={"timeframe": "1D", "data_source": "ohlcv_volume_proxy"},
+                activation_conditions={
+                    "prior_support_loss_required": True,
+                    "support_reclaim_required": True,
+                    "close_location_min": 0.6,
+                    "relative_volume_min": 1.05,
+                },
+                intended_usage="Use as a conservative confirmation after a failed breakdown sequence; it does not imply intraday order-flow confirmation.",
+                status="active",
+            ),
+            SignalDefinitionCreate(
+                code="high_relative_volume_reversal",
+                name="High Relative Volume Reversal",
+                description="Daily confirmation that a reversal attempt happened with elevated relative volume.",
+                hypothesis_id=pullback_hypothesis.id if pullback_hypothesis is not None else None,
+                strategy_id=None,
+                setup_id=None,
+                signal_kind="confirmation",
+                definition="Close recovers strongly versus the open and prior close while relative volume expands above its baseline.",
+                parameters={"timeframe": "1D", "data_source": "ohlcv_volume_proxy"},
+                activation_conditions={
+                    "relative_volume_min": 1.75,
+                    "close_location_min": 0.65,
+                    "close_above_open_or_prev_close": True,
+                },
+                intended_usage="Use as a timing confirmation when daily participation expands; do not interpret it as true order-flow confirmation.",
+                status="active",
+            ),
+            SignalDefinitionCreate(
+                code="breakout_failure_reclaim",
+                name="Breakout Failure Reclaim",
+                description="Daily trigger that briefly loses the prior breakout area and then reclaims it by the close.",
+                hypothesis_id=breakout_hypothesis.id if breakout_hypothesis is not None else None,
+                strategy_id=breakout_strategy.id if breakout_strategy is not None else None,
+                setup_id=breakout_setup.id if breakout_setup is not None else None,
+                signal_kind="trigger",
+                definition="Price trades back below the prior breakout reference but closes above it again on the same daily bar.",
+                parameters={"timeframe": "1D", "data_source": "ohlcv_volume_proxy"},
+                activation_conditions={
+                    "breakout_reference_lookback_days": 20,
+                    "breakout_reclaim_required": True,
+                    "close_location_min": 0.6,
+                },
+                intended_usage="Use as an auxiliary reclaim trigger inside breakout-continuation workflows.",
+                status="active",
+            ),
+        ]
+
+        created = 0
+        for definition in definitions:
+            existing = session.scalars(
+                select(SignalDefinition).where(SignalDefinition.code == definition.code)
+            ).first()
+            if existing is not None:
+                continue
+            self.signal_definition_service.create_signal_definition(session, definition)
+            created += 1
         return created
 
 
@@ -472,7 +595,24 @@ class BotRuntimeState:
     cycle_in_progress: bool = False
 
 
+@dataclass
+class LearningGovernanceRuntimeState:
+    enabled: bool = False
+    status: str = "idle"
+    interval_minutes: int = 30
+    last_sync_started_at: datetime | None = None
+    last_sync_completed_at: datetime | None = None
+    sync_runs: int = 0
+    last_summary: str | None = None
+    last_error: str | None = None
+    last_changed_workflows: int = 0
+    last_open_workflows: int = 0
+    last_open_items: int = 0
+
+
 class SchedulerService:
+    MARKET_DATA_PROBE_TICKER = "SPY"
+
     def __init__(
         self,
         settings: Settings,
@@ -480,17 +620,30 @@ class SchedulerService:
         trading_agent_service: AutonomousTradingAgentService | None = None,
         event_log_service: EventLogService | None = None,
         realtime_monitor_service: IBKRRealtimePositionMonitorService | None = None,
+        market_data_service: MarketDataService | None = None,
+        learning_workflow_service: LearningWorkflowService | None = None,
+        journal_service: JournalService | None = None,
     ) -> None:
         self.settings = settings
+        self.market_data_service = market_data_service or MarketDataService(cache_ttl_seconds=15)
         self.trading_agent_service = trading_agent_service or AutonomousTradingAgentService(settings)
         self.orchestrator_service = orchestrator_service or OrchestratorService(
-            trading_agent_service=self.trading_agent_service
+            trading_agent_service=self.trading_agent_service,
+            market_data_service=self.market_data_service,
+            halt_on_market_data_failure=True,
         )
         self.event_log_service = event_log_service or EventLogService()
+        self.learning_workflow_service = learning_workflow_service or LearningWorkflowService()
+        self.journal_service = journal_service or JournalService()
         self.realtime_monitor_service = realtime_monitor_service or IBKRRealtimePositionMonitorService(settings)
+        self.market_hours_service = USMarketHoursService()
         self.scheduler = BackgroundScheduler(timezone=settings.scheduler_timezone)
         self._configured = False
         self.runtime = BotRuntimeState()
+        self.learning_governance = LearningGovernanceRuntimeState(
+            enabled=bool(settings.learning_workflow_governance_enabled),
+            interval_minutes=max(int(settings.learning_workflow_governance_interval_minutes), 1),
+        )
 
     def configure(self) -> None:
         if self._configured:
@@ -517,6 +670,17 @@ class SchedulerService:
                 max_instances=1,
                 coalesce=True,
             )
+        if self.learning_governance.enabled:
+            self.scheduler.add_job(
+                self._run_learning_governance_job,
+                "interval",
+                minutes=self.learning_governance.interval_minutes,
+                id="learning_workflow_governance_job",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                next_run_time=datetime.now(timezone.utc),
+            )
         self._configured = True
 
     def boot(self) -> None:
@@ -532,9 +696,13 @@ class SchedulerService:
 
     def reset_runtime_state(self) -> None:
         self.runtime = BotRuntimeState()
+        self.learning_governance = LearningGovernanceRuntimeState(
+            enabled=bool(self.settings.learning_workflow_governance_enabled),
+            interval_minutes=max(int(self.settings.learning_workflow_governance_interval_minutes), 1),
+        )
         self.trading_agent_service.reset_runtime_state()
 
-    def start_bot(self) -> dict:
+    def start_bot(self, session: Session | None = None) -> dict:
         self.boot()
         self._resolve_open_incidents()
         self.runtime.status = "running"
@@ -542,17 +710,79 @@ class SchedulerService:
         self.runtime.last_error = None
         self.realtime_monitor_service.start()
         self._request_cycle_run()
-        return self.get_status_payload()
+        return self.get_status_payload(session=session)
 
-    def pause_bot(self, reason: str = "Bot paused by user.") -> dict:
+    def pause_bot(self, reason: str = "Bot paused by user.", session: Session | None = None) -> dict:
         self.runtime.status = "paused"
         self.runtime.pause_reason = reason
         self.runtime.cycle_in_progress = False
         self.realtime_monitor_service.stop()
         self._unschedule_next_cycle()
-        return self.get_status_payload()
+        return self.get_status_payload(session=session)
 
-    def get_status_payload(self) -> dict:
+    @staticmethod
+    def _normalize_journal_event_time(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _journal_entry_counts_as_llm_call(entry: JournalEntry) -> bool:
+        if entry.entry_type in {"ai_trade_decision", "ai_position_management"}:
+            return True
+        if entry.entry_type != "macro_signal":
+            return False
+        observations = entry.observations if isinstance(entry.observations, dict) else {}
+        evidence = observations.get("evidence") if isinstance(observations.get("evidence"), dict) else {}
+        return str(evidence.get("analysis_mode") or "").strip().lower() == "ai"
+
+    def _get_ai_usage_counts(self, session: Session) -> dict[str, int]:
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        last_hour_start = now - timedelta(hours=1)
+        entries = list(
+            session.scalars(
+                select(JournalEntry).where(
+                    JournalEntry.entry_type.in_(("ai_trade_decision", "ai_position_management", "macro_signal"))
+                )
+            ).all()
+        )
+        calls_today = 0
+        calls_last_hour = 0
+        for entry in entries:
+            if not self._journal_entry_counts_as_llm_call(entry):
+                continue
+            event_time = self._normalize_journal_event_time(entry.event_time)
+            if event_time is None or event_time < day_start:
+                continue
+            calls_today += 1
+            if event_time >= last_hour_start:
+                calls_last_hour += 1
+
+        chat_messages = list(
+            session.scalars(
+                select(ChatMessage).where(ChatMessage.role == "assistant")
+            ).all()
+        )
+        for message in chat_messages:
+            context = message.context if isinstance(message.context, dict) else {}
+            used_provider = str(context.get("used_provider") or "").strip().lower()
+            if not used_provider or used_provider == "local_rules":
+                continue
+            event_time = self._normalize_journal_event_time(message.created_at)
+            if event_time is None or event_time < day_start:
+                continue
+            calls_today += 1
+            if event_time >= last_hour_start:
+                calls_last_hour += 1
+        return {
+            "calls_last_hour": calls_last_hour,
+            "calls_today": calls_today,
+        }
+
+    def get_status_payload(self, session: Session | None = None) -> dict:
         incidents = [
             {
                 "incident_id": incident.incident_id,
@@ -565,6 +795,9 @@ class SchedulerService:
             }
             for incident in sorted(self.runtime.incidents, key=lambda item: item.incident_id, reverse=True)
         ]
+        ai_payload = self.trading_agent_service.get_status_payload()
+        if session is not None:
+            ai_payload.update(self._get_ai_usage_counts(session))
         return {
             "enabled": True,
             "running": self.scheduler.running,
@@ -596,7 +829,9 @@ class SchedulerService:
                 "cycle_runs": self.runtime.cycle_runs,
                 "incidents": incidents,
             },
-            "ai": self.trading_agent_service.get_status_payload(),
+            "ai": ai_payload,
+            "learning_governance": self._get_learning_governance_status_payload(),
+            "market_data": self._get_market_data_status_payload(),
             "monitor": self.realtime_monitor_service.get_status_payload(),
         }
 
@@ -615,11 +850,16 @@ class SchedulerService:
             self.runtime.cycle_runs += 1
             self.runtime.current_phase = None
         except MarketDataUnavailableError as exc:
-            self._register_incident(
-                source="market_data",
-                title="Market data API failure",
-                detail=str(exc),
-            )
+            if self._is_transient_market_data_error(exc):
+                self.runtime.last_cycle_completed_at = datetime.now(timezone.utc)
+                self.runtime.last_error = str(exc)
+                self.runtime.current_phase = None
+            else:
+                self._register_incident(
+                    source="market_data",
+                    title="Market data API failure",
+                    detail=str(exc),
+                )
         except AIDecisionError as exc:
             self._register_incident(
                 source="ai_model",
@@ -639,6 +879,32 @@ class SchedulerService:
     def _run_autonomous_bot_job(self) -> None:
         self.run_automation_cycle_once()
 
+    def _run_learning_governance_job(self) -> None:
+        if not self.learning_governance.enabled:
+            return
+
+        self.learning_governance.status = "running"
+        self.learning_governance.last_sync_started_at = datetime.now(timezone.utc)
+        self.learning_governance.last_error = None
+        try:
+            with SessionLocal() as session:
+                report = self.learning_workflow_service.sync_default_workflows_with_report(session)
+                self._record_learning_governance_sync(session, report=report)
+        except Exception as exc:
+            self.learning_governance.status = "error"
+            self.learning_governance.last_error = str(exc)
+            with SessionLocal() as session:
+                self._record_learning_governance_failure(session, detail=str(exc))
+            return
+
+        self.learning_governance.status = "idle"
+        self.learning_governance.last_sync_completed_at = datetime.now(timezone.utc)
+        self.learning_governance.sync_runs += 1
+        self.learning_governance.last_summary = report.summary
+        self.learning_governance.last_changed_workflows = report.changed_workflow_count
+        self.learning_governance.last_open_workflows = report.open_workflow_count
+        self.learning_governance.last_open_items = report.open_item_count
+
     def _schedule_next_cycle(self) -> None:
         if self.settings.scheduler_mode != "continuous":
             return
@@ -646,7 +912,7 @@ class SchedulerService:
             self._unschedule_next_cycle()
             return
 
-        idle_seconds = max(int(self.settings.scheduler_continuous_idle_seconds), 0)
+        idle_seconds = self._next_idle_seconds()
         next_run_time = datetime.now(timezone.utc) + timedelta(seconds=idle_seconds)
         self.scheduler.add_job(
             self._run_autonomous_bot_job,
@@ -657,6 +923,16 @@ class SchedulerService:
             max_instances=1,
             coalesce=True,
         )
+
+    def _next_idle_seconds(self) -> int:
+        base_idle_seconds = max(int(self.settings.scheduler_continuous_idle_seconds), 0)
+        market_closed_idle_seconds = max(int(self.settings.scheduler_market_closed_idle_seconds), 0)
+        if market_closed_idle_seconds <= 0:
+            return base_idle_seconds
+        market_session = self.market_hours_service.get_session_state()
+        if market_session.is_regular_session_open:
+            return base_idle_seconds
+        return max(base_idle_seconds, market_closed_idle_seconds)
 
     def _unschedule_next_cycle(self) -> None:
         try:
@@ -692,10 +968,7 @@ class SchedulerService:
         )
 
     def _execute_automation_cycle(self) -> None:
-        autonomous_orchestrator = OrchestratorService(
-            halt_on_market_data_failure=True,
-            trading_agent_service=self.trading_agent_service,
-        )
+        autonomous_orchestrator = self.orchestrator_service
         with SessionLocal() as session:
             dispatch_result = self.event_log_service.dispatch_pending(
                 session,
@@ -706,24 +979,174 @@ class SchedulerService:
             if dispatch_result["phases_run"]:
                 self.runtime.last_successful_phase = dispatch_result["phases_run"][-1]
                 return
-            self.runtime.current_phase = "plan"
-            autonomous_orchestrator.plan_daily_cycle(
-                session,
-                DailyPlanRequest(cycle_date=date.today(), market_context={"trigger": "autonomous_bot"}),
-            )
-            self.runtime.last_successful_phase = "plan"
             self.runtime.current_phase = "do"
             autonomous_orchestrator.run_do_phase(session)
             self.runtime.last_successful_phase = "do"
-            self.runtime.current_phase = "check"
-            autonomous_orchestrator.run_check_phase(session)
-            self.runtime.last_successful_phase = "check"
-            self.runtime.current_phase = "act"
-            autonomous_orchestrator.run_act_phase(session)
-            self.runtime.last_successful_phase = "act"
+            follow_up_dispatch = self.event_log_service.dispatch_pending(
+                session,
+                orchestrator_service=autonomous_orchestrator,
+                cycle_date=date.today(),
+                on_phase_start=self._mark_phase_started,
+            )
+            if follow_up_dispatch["phases_run"]:
+                self.runtime.last_successful_phase = follow_up_dispatch["phases_run"][-1]
 
     def _mark_phase_started(self, phase: str) -> None:
         self.runtime.current_phase = phase
+
+    def _get_learning_governance_status_payload(self) -> dict:
+        return {
+            "enabled": self.learning_governance.enabled,
+            "status": self.learning_governance.status,
+            "interval_minutes": self.learning_governance.interval_minutes,
+            "last_sync_started_at": self.learning_governance.last_sync_started_at.isoformat()
+            if self.learning_governance.last_sync_started_at
+            else None,
+            "last_sync_completed_at": self.learning_governance.last_sync_completed_at.isoformat()
+            if self.learning_governance.last_sync_completed_at
+            else None,
+            "sync_runs": self.learning_governance.sync_runs,
+            "last_summary": self.learning_governance.last_summary,
+            "last_error": self.learning_governance.last_error,
+            "last_changed_workflows": self.learning_governance.last_changed_workflows,
+            "last_open_workflows": self.learning_governance.last_open_workflows,
+            "last_open_items": self.learning_governance.last_open_items,
+        }
+
+    def _record_learning_governance_sync(self, session: Session, *, report: LearningWorkflowSyncReport) -> None:
+        self.journal_service.create_entry(
+            session,
+            payload=self._learning_governance_journal_payload(
+                entry_type="learning_workflow_sync",
+                reasoning="Scheduled governance sync refreshed learning workflows without affecting live execution policy.",
+                outcome=report.summary,
+                observations={
+                    "source": "scheduler_governance_lane",
+                    "workflow_count": report.workflow_count,
+                    "open_workflow_count": report.open_workflow_count,
+                    "open_item_count": report.open_item_count,
+                    "changed_workflow_count": report.changed_workflow_count,
+                    "opened_workflow_count": report.opened_workflow_count,
+                    "resolved_workflow_count": report.resolved_workflow_count,
+                    "changes": report.changes[:10],
+                },
+            ),
+        )
+
+    def _record_learning_governance_failure(self, session: Session, *, detail: str) -> None:
+        self.journal_service.create_entry(
+            session,
+            payload=self._learning_governance_journal_payload(
+                entry_type="learning_workflow_sync_failed",
+                reasoning="Scheduled governance sync failed; workflow state may be stale until the next successful pass.",
+                outcome=detail,
+                observations={
+                    "source": "scheduler_governance_lane",
+                    "error": detail,
+                },
+            ),
+        )
+
+    @staticmethod
+    def _learning_governance_journal_payload(
+        *,
+        entry_type: str,
+        reasoning: str,
+        outcome: str,
+        observations: dict,
+    ) -> JournalEntryCreate:
+        return JournalEntryCreate(
+            entry_type=entry_type,
+            market_context={
+                "workflow_governance": True,
+            },
+            observations=dict(observations or {}),
+            reasoning=reasoning,
+            decision="sync_learning_workflows",
+            outcome=outcome,
+        )
+
+    def _get_market_data_status_payload(self) -> dict:
+        checked_at = datetime.now(timezone.utc).isoformat()
+        provider = self.settings.market_data_provider
+        ticker = self.MARKET_DATA_PROBE_TICKER
+        fallback_payload = {
+            "provider": provider,
+            "probe_ticker": ticker,
+            "status": "error",
+            "ready": False,
+            "using_fallback": True,
+            "source": None,
+            "last_price": None,
+            "provider_error": None,
+            "last_checked_at": checked_at,
+        }
+
+        try:
+            overview = self.market_data_service.get_market_overview(ticker)
+        except Exception as exc:
+            fallback_payload["provider_error"] = str(exc)
+            if self._is_market_data_auth_error(str(exc)):
+                fallback_payload["status"] = "auth_required"
+            return fallback_payload
+
+        source = str(overview.get("provider_source") or provider).strip() or provider
+        provider_error = str(overview.get("provider_error") or "").strip() or None
+        market_signals = overview.get("market_signals") if isinstance(overview.get("market_signals"), dict) else {}
+        last_price = market_signals.get("last_price")
+        try:
+            normalized_last_price = float(last_price) if last_price is not None else None
+        except (TypeError, ValueError):
+            normalized_last_price = None
+
+        using_fallback = source != "ibkr_proxy_market_overview" or provider_error is not None
+        status = "ready"
+        ready = True
+        if provider_error and self._is_market_data_auth_error(provider_error):
+            status = "auth_required"
+            ready = False
+        elif using_fallback:
+            status = "fallback"
+            ready = False
+
+        if ready:
+            get_snapshot = getattr(self.market_data_service, "get_snapshot", None)
+            if callable(get_snapshot):
+                try:
+                    normalized_last_price = float(get_snapshot(ticker).price)
+                except Exception:
+                    pass
+
+        return {
+            "provider": provider,
+            "probe_ticker": ticker,
+            "status": status,
+            "ready": ready,
+            "using_fallback": using_fallback,
+            "source": source,
+            "last_price": normalized_last_price,
+            "provider_error": provider_error,
+            "last_checked_at": checked_at,
+        }
+
+    @staticmethod
+    def _is_transient_market_data_error(exc: MarketDataUnavailableError) -> bool:
+        message = str(exc).lower()
+        transient_markers = (
+            "cooling down",
+            "retry_after_seconds",
+            "run out of api credits",
+            "wait for the next minute",
+            "no bridge",
+            "gateway unavailable",
+            "upstream unavailable",
+        )
+        return any(marker in message for marker in transient_markers)
+
+    @staticmethod
+    def _is_market_data_auth_error(message: str | None) -> bool:
+        normalized = str(message or "").lower()
+        return "interactive login required" in normalized or "login required" in normalized
 
     def _register_incident(self, *, source: str, title: str, detail: str) -> None:
         incident = BotIncident(

@@ -379,6 +379,7 @@ def candidate_decision_schema() -> dict:
             "sizing": {"type": "object"},
             "exit_plan": {"type": "object"},
             "reasons_not_to_act": {"type": "array", "items": {"type": "string"}},
+            "claims_applied": {"type": "array", "items": {"type": "string"}},
             "risks": {"type": "array", "items": {"type": "string"}},
             "lessons_applied": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number"},
@@ -398,6 +399,7 @@ def candidate_decision_schema() -> dict:
             "invalidation",
             "risk_assessment",
             "reasons_not_to_act",
+            "claims_applied",
             "risks",
             "lessons_applied",
             "confidence",
@@ -425,6 +427,7 @@ def position_management_schema() -> dict:
             "invalidation": {"type": "string"},
             "risk_assessment": {"type": "string"},
             "reasons_not_to_act": {"type": "array", "items": {"type": "string"}},
+            "claims_applied": {"type": "array", "items": {"type": "string"}},
             "risks": {"type": "array", "items": {"type": "string"}},
             "lessons_applied": {"type": "array", "items": {"type": "string"}},
             "confidence": {"type": "number"},
@@ -443,6 +446,7 @@ def position_management_schema() -> dict:
             "invalidation",
             "risk_assessment",
             "reasons_not_to_act",
+            "claims_applied",
             "risks",
             "lessons_applied",
             "confidence",
@@ -772,8 +776,11 @@ def management_state_transition_for_action(action: str) -> StateTransition:
     )
 
 
-def build_candidate_decision_system_prompt() -> str:
-    return (
+def build_candidate_decision_system_prompt(
+    runtime_skill_prompt: str | None = None,
+    runtime_claim_prompt: str | None = None,
+) -> str:
+    prompt = (
         "You are the single decision-making trading research agent for this system. "
         "Do not produce free-form chain-of-thought. Follow the operating doctrine exactly. "
         f"Primary objective: {PRIMARY_OBJECTIVE} "
@@ -785,26 +792,41 @@ def build_candidate_decision_system_prompt() -> str:
         "Use only the supplied evidence. Do not invent indicators, prices, catalysts or fundamentals. "
         "Choose one execution action only: paper_enter, watch or discard. "
         "Also choose one protocol decision label only: IGNORE, WATCH, SET_ALERT, ENTER_LONG, ENTER_SHORT or NO_ACTION. "
+        "If durable claim memory materially influenced the decision, list the relevant claim keys in claims_applied; otherwise return an empty list. "
         "Prefer watch, set_alert, discard or cash when the setup is immature, crowded, illiquid or contextually weak. "
         "Return JSON only. Required fields are protocol_version, operating_state, action, decision, thesis, "
         "regime_assessment, active_playbook, evidence, entry_trigger, invalidation, risk_assessment, confidence, risks, "
-        "lessons_applied, reasons_not_to_act, next_action and next_state."
+        "lessons_applied, reasons_not_to_act, claims_applied, next_action and next_state."
     )
+    if isinstance(runtime_skill_prompt, str) and runtime_skill_prompt.strip():
+        prompt = f"{prompt}\n\n{runtime_skill_prompt.strip()}"
+    if isinstance(runtime_claim_prompt, str) and runtime_claim_prompt.strip():
+        prompt = f"{prompt}\n\n{runtime_claim_prompt.strip()}"
+    return prompt
 
 
-def build_position_management_system_prompt() -> str:
-    return (
+def build_position_management_system_prompt(
+    runtime_skill_prompt: str | None = None,
+    runtime_claim_prompt: str | None = None,
+) -> str:
+    prompt = (
         "You are the single decision-making trading research agent managing an already open paper position. "
         "Do not produce free-form chain-of-thought. Follow the operating doctrine exactly and remain conservative. "
         f"Primary objective: {PRIMARY_OBJECTIVE} "
         "When a position is open, react only to relevant events and do not re-underwrite the whole market from scratch. "
         "For this call you are in MONITOR state. Choose one execution action only: hold, tighten_stop, extend_target, "
-        "tighten_stop_and_extend_target, or close_position. Also choose one protocol decision label only: HOLD, REDUCE, "
-        "EXIT or NO_ACTION. Only intervene when the evidence is clear and the action improves risk-adjusted behaviour. "
+        "tighten_stop_and_extend_target, or close_position. Also choose one protocol decision label only: HOLD, REDUCE, EXIT or NO_ACTION. "
+        "If durable claim memory materially influenced the decision, list the relevant claim keys in claims_applied; otherwise return an empty list. "
+        "Only intervene when the evidence is clear and the action improves risk-adjusted behaviour. "
         "Return JSON only. Required fields are protocol_version, operating_state, action, decision, thesis, "
         "regime_assessment, active_playbook, evidence, invalidation, risk_assessment, confidence, risks, "
-        "lessons_applied, reasons_not_to_act, next_action and next_state."
+        "lessons_applied, reasons_not_to_act, claims_applied, next_action and next_state."
     )
+    if isinstance(runtime_skill_prompt, str) and runtime_skill_prompt.strip():
+        prompt = f"{prompt}\n\n{runtime_skill_prompt.strip()}"
+    if isinstance(runtime_claim_prompt, str) and runtime_claim_prompt.strip():
+        prompt = f"{prompt}\n\n{runtime_claim_prompt.strip()}"
+    return prompt
 
 
 def _default_entry_trigger(playbook_code: str) -> str:

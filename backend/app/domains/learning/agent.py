@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import json
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -14,6 +12,7 @@ from app.db.models.failure_pattern import FailurePattern
 from app.db.models.journal import JournalEntry
 from app.db.models.memory import MemoryItem
 from app.db.models.position import Position
+from app.domains.learning.claims import KnowledgeClaimService
 from app.domains.learning.planning import ResearchPlannerService
 from app.domains.learning.protocol import (
     DECISION_PROTOCOL_VERSION,
@@ -26,7 +25,16 @@ from app.domains.learning.protocol import (
     management_state_transition_for_action,
     position_management_schema,
 )
+from app.domains.learning.skills import SkillLifecycleService
 from app.domains.learning.world_state import MarketStateService
+from app.providers.llm import (
+    JSONDecisionProvider,
+    LLMProviderError,
+    LLMProviderSpec,
+    build_json_decision_provider,
+    normalize_provider_name,
+    provider_is_ready,
+)
 
 
 class AIDecisionError(RuntimeError):
@@ -50,6 +58,7 @@ class AgentDecision:
     invalidation: str | None = None
     risk_assessment: str | None = None
     reasons_not_to_act: list[str] = field(default_factory=list)
+    claims_applied: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -95,152 +104,8 @@ class ProviderSlot:
     slot_label: str
     provider_name: str
     model_name: str
-    provider: GeminiDecisionProvider | OpenAICompatibleDecisionProvider
+    provider: JSONDecisionProvider
     counts_as_fallback: bool = False
-
-
-class GeminiDecisionProvider:
-    def __init__(self, *, model: str, api_key: str, temperature: float, request_timeout_seconds: int) -> None:
-        self.model = model
-        self.api_key = api_key
-        self.temperature = temperature
-        self.request_timeout_seconds = max(int(request_timeout_seconds), 1)
-
-    def decide(self, *, system_prompt: str, user_prompt: str, response_json_schema: dict | None = None) -> dict:
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
-        payload = {
-            "system_instruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"parts": [{"text": user_prompt}]}],
-            "generationConfig": {
-                "temperature": self.temperature,
-                "responseMimeType": "application/json",
-                "responseJsonSchema": response_json_schema
-                or {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string"},
-                        "confidence": {"type": "number"},
-                        "thesis": {"type": "string"},
-                        "risks": {"type": "array", "items": {"type": "string"}},
-                        "lessons_applied": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["action", "confidence", "thesis", "risks", "lessons_applied"],
-                },
-            },
-        }
-        request = Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "x-goog-api-key": self.api_key,
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "trading-research-app/0.1",
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self.request_timeout_seconds) as response:
-                raw_payload = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError) as exc:
-            raise AIDecisionError(f"Gemini request failed: {exc}") from exc
-
-        content = self._extract_gemini_text(raw_payload)
-        if not content:
-            raise AIDecisionError("Gemini returned no decision content.")
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise AIDecisionError("Gemini returned malformed JSON decision content.") from exc
-
-    @staticmethod
-    def _extract_gemini_text(payload: dict) -> str:
-        candidates = payload.get("candidates") or []
-        if not candidates:
-            return ""
-        parts = candidates[0].get("content", {}).get("parts") or []
-        return "".join(part.get("text", "") for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str))
-
-
-class OpenAICompatibleDecisionProvider:
-    def __init__(
-        self,
-        *,
-        model: str,
-        api_base: str,
-        api_key: str | None,
-        temperature: float,
-        max_output_tokens: int,
-        request_timeout_seconds: int,
-    ) -> None:
-        self.model = model
-        self.api_base = api_base
-        self.api_key = api_key
-        self.temperature = temperature
-        self.max_output_tokens = max_output_tokens
-        self.request_timeout_seconds = max(int(request_timeout_seconds), 1)
-
-    def decide(self, *, system_prompt: str, user_prompt: str, response_json_schema: dict | None = None) -> dict:
-        endpoint = f"{self.api_base.rstrip('/')}/chat/completions"
-        del response_json_schema
-        payload = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "max_tokens": self.max_output_tokens,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "trading-research-app/0.1",
-        }
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        request = Request(
-            endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self.request_timeout_seconds) as response:
-                raw_payload = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, TimeoutError) as exc:
-            raise AIDecisionError(f"OpenAI-compatible provider request failed: {exc}") from exc
-
-        content = self._extract_message_content(raw_payload)
-        if not content:
-            raise AIDecisionError("OpenAI-compatible provider returned no decision content.")
-        try:
-            return self._extract_json_object(content)
-        except json.JSONDecodeError as exc:
-            raise AIDecisionError("OpenAI-compatible provider returned malformed JSON decision content.") from exc
-
-    @staticmethod
-    def _extract_message_content(payload: dict) -> str:
-        choices = payload.get("choices") or []
-        if not choices:
-            return ""
-        content = choices[0].get("message", {}).get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "".join(
-                part.get("text", "") for part in content if isinstance(part, dict) and isinstance(part.get("text"), str)
-            )
-        return ""
-
-    @staticmethod
-    def _extract_json_object(content: str) -> dict:
-        start = content.find("{")
-        end = content.rfind("}")
-        if start == -1 or end == -1 or end < start:
-            raise json.JSONDecodeError("No JSON object found.", content, 0)
-        return json.loads(content[start : end + 1])
 
 
 class AutonomousTradingAgentService:
@@ -248,16 +113,22 @@ class AutonomousTradingAgentService:
         self.settings = settings or get_settings()
         self.research_planner_service = ResearchPlannerService()
         self.market_state_service = MarketStateService(settings=self.settings)
+        self.skill_lifecycle_service = SkillLifecycleService()
+        self.knowledge_claim_service = KnowledgeClaimService()
         provider_slots = self._build_provider_slots()
-        primary_ready = any(slot.provider_name == self.settings.ai_primary_provider for slot in provider_slots)
-        fallback_ready = any(slot.provider_name == self.settings.ai_fallback_provider for slot in provider_slots)
+        primary_provider = self._primary_provider_name()
+        primary_model = self._primary_model_name(primary_provider)
+        fallback_provider_name = self._fallback_provider_name()
+        fallback_model_name = self._fallback_model_name(fallback_provider_name)
+        primary_ready = any(slot.provider_name == primary_provider for slot in provider_slots)
+        fallback_ready = any(slot.provider_name == fallback_provider_name for slot in provider_slots)
         self.runtime = AgentRuntimeState(
             enabled=self.settings.ai_agent_enabled,
-            provider=self.settings.ai_primary_provider,
-            model=self.settings.ai_primary_model,
+            provider=primary_provider,
+            model=primary_model,
             ready=primary_ready or fallback_ready,
-            fallback_provider=self.settings.ai_fallback_provider,
-            fallback_model=self.settings.ai_fallback_model,
+            fallback_provider=fallback_provider_name,
+            fallback_model=fallback_model_name,
             fallback_ready=fallback_ready,
             active_provider=provider_slots[0].provider_name if provider_slots else None,
             active_model=provider_slots[0].model_name if provider_slots else None,
@@ -274,9 +145,17 @@ class AutonomousTradingAgentService:
         self.runtime.last_error = None
         self.runtime.cooldown_until = None
         self.provider_slots = self._build_provider_slots()
-        primary_ready = any(slot.provider_name == self.settings.ai_primary_provider for slot in self.provider_slots)
-        fallback_ready = any(slot.provider_name == self.settings.ai_fallback_provider for slot in self.provider_slots)
+        primary_provider = self._primary_provider_name()
+        primary_model = self._primary_model_name(primary_provider)
+        fallback_provider_name = self._fallback_provider_name()
+        fallback_model_name = self._fallback_model_name(fallback_provider_name)
+        primary_ready = any(slot.provider_name == primary_provider for slot in self.provider_slots)
+        fallback_ready = any(slot.provider_name == fallback_provider_name for slot in self.provider_slots)
+        self.runtime.provider = primary_provider
+        self.runtime.model = primary_model
         self.runtime.ready = primary_ready or fallback_ready
+        self.runtime.fallback_provider = fallback_provider_name
+        self.runtime.fallback_model = fallback_model_name
         self.runtime.fallback_ready = fallback_ready
         self.runtime.active_provider = self.provider_slots[0].provider_name if self.provider_slots else None
         self.runtime.active_model = self.provider_slots[0].model_name if self.provider_slots else None
@@ -299,6 +178,8 @@ class AutonomousTradingAgentService:
             "last_decision_summary": self.runtime.last_decision_summary,
             "decision_count": self.runtime.decision_count,
             "fallback_count": self.runtime.fallback_count,
+            "calls_last_hour": 0,
+            "calls_today": 0,
             "last_error": self.runtime.last_error,
             "cooldown_until": self.runtime.cooldown_until.isoformat() if self.runtime.cooldown_until else None,
         }
@@ -321,21 +202,22 @@ class AutonomousTradingAgentService:
             self.runtime.last_error = message
             raise AIDecisionError(message)
 
-        user_prompt = json.dumps(
-            self._build_decision_context(
-                session,
-                ticker=ticker,
-                strategy_id=strategy_id,
-                strategy_version_id=strategy_version_id,
-                watchlist_code=watchlist_code,
-                signal_payload=signal_payload,
-                market_context=market_context or {},
-            ),
-            ensure_ascii=True,
+        context = self._build_decision_context(
+            session,
+            ticker=ticker,
+            strategy_id=strategy_id,
+            strategy_version_id=strategy_version_id,
+            watchlist_code=watchlist_code,
+            signal_payload=signal_payload,
+            market_context=market_context or {},
         )
+        user_prompt = json.dumps(context, ensure_ascii=True)
 
         raw_decision, used_provider, used_model = self._decide_with_fallback(
-            system_prompt=build_candidate_decision_system_prompt(),
+            system_prompt=build_candidate_decision_system_prompt(
+                self._build_runtime_skill_prompt(context.get("agent_protocol")),
+                self._build_runtime_claim_prompt(context.get("agent_protocol")),
+            ),
             user_prompt=user_prompt,
             response_json_schema=candidate_decision_schema(),
         )
@@ -349,6 +231,8 @@ class AutonomousTradingAgentService:
             signal_payload=signal_payload,
             market_context=market_context or {},
             decision=decision,
+            runtime_claims=self._extract_runtime_claims(context),
+            context_budget=self._extract_context_budget(context),
         )
         self.runtime.last_decision_at = datetime.now(timezone.utc)
         self.runtime.last_decision_provider = used_provider
@@ -359,6 +243,53 @@ class AutonomousTradingAgentService:
         self.runtime.decision_count += 1
         self.runtime.last_error = None
         return decision
+
+    def synthesize_macro_research(
+        self,
+        *,
+        theme: dict,
+        market_context: dict,
+        calendar_events: list[dict],
+        news_items: list[dict],
+        article_contexts: list[dict],
+    ) -> dict:
+        fallback = self._heuristic_macro_research(
+            theme=theme,
+            market_context=market_context,
+            calendar_events=calendar_events,
+            news_items=news_items,
+            article_contexts=article_contexts,
+        )
+        if not self.runtime.enabled or not self.runtime.ready:
+            return fallback
+
+        payload = {
+            "theme": theme,
+            "market_context": market_context,
+            "calendar_events": calendar_events,
+            "news_items": news_items,
+            "article_contexts": article_contexts,
+        }
+        try:
+            raw_result, used_provider, used_model = self._decide_with_fallback(
+                system_prompt=self._build_macro_research_system_prompt(),
+                user_prompt=json.dumps(payload, ensure_ascii=True),
+                response_json_schema=self._macro_research_schema(),
+            )
+        except AIDecisionError as exc:
+            return {
+                **fallback,
+                "analysis_mode": "heuristic_fallback",
+                "provider": self.runtime.provider,
+                "model": self.runtime.model,
+                "ai_error": str(exc),
+            }
+
+        normalized = self._normalize_macro_research_result(raw_result, fallback=fallback)
+        normalized["analysis_mode"] = "ai"
+        normalized["provider"] = used_provider
+        normalized["model"] = used_model
+        return normalized
 
     def build_trade_candidate_research_package(
         self,
@@ -488,17 +419,18 @@ class AutonomousTradingAgentService:
             self.runtime.last_error = message
             raise AIDecisionError(message)
 
-        user_prompt = json.dumps(
-            self._build_open_position_context(
-                session,
-                position=position,
-                market_snapshot=market_snapshot,
-            ),
-            ensure_ascii=True,
+        context = self._build_open_position_context(
+            session,
+            position=position,
+            market_snapshot=market_snapshot,
         )
+        user_prompt = json.dumps(context, ensure_ascii=True)
 
         raw_decision, used_provider, used_model = self._decide_with_fallback(
-            system_prompt=build_position_management_system_prompt(),
+            system_prompt=build_position_management_system_prompt(
+                self._build_runtime_skill_prompt(context.get("agent_protocol")),
+                self._build_runtime_claim_prompt(context.get("agent_protocol")),
+            ),
             user_prompt=user_prompt,
             response_json_schema=position_management_schema(),
         )
@@ -519,6 +451,8 @@ class AutonomousTradingAgentService:
             decision=decision,
             provider=used_provider,
             model=used_model,
+            runtime_claims=self._extract_runtime_claims(context),
+            context_budget=self._extract_context_budget(context),
         )
         self.runtime.last_decision_at = datetime.now(timezone.utc)
         self.runtime.last_decision_provider = used_provider
@@ -630,34 +564,30 @@ class AutonomousTradingAgentService:
         model: str | None,
         api_key: str | None,
         api_base: str | None,
-    ) -> GeminiDecisionProvider | OpenAICompatibleDecisionProvider | None:
-        if not self.settings.ai_agent_enabled or provider == "disabled" or not model:
+    ) -> JSONDecisionProvider | None:
+        if not self.settings.ai_agent_enabled:
             return None
-        if provider == "gemini" and api_key:
-            return GeminiDecisionProvider(
-                model=model,
-                api_key=api_key,
-                temperature=self.settings.ai_temperature,
-                request_timeout_seconds=self.settings.ai_request_timeout_seconds,
-            )
-        if provider == "openai_compatible" and api_base:
-            return OpenAICompatibleDecisionProvider(
-                model=model,
-                api_base=api_base,
-                api_key=api_key,
-                temperature=self.settings.ai_temperature,
-                max_output_tokens=self.settings.ai_max_output_tokens,
-                request_timeout_seconds=self.settings.ai_request_timeout_seconds,
-            )
-        return None
+        spec = LLMProviderSpec(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            api_base=api_base,
+            temperature=self.settings.ai_temperature,
+            max_output_tokens=self.settings.ai_max_output_tokens,
+            request_timeout_seconds=self.settings.ai_request_timeout_seconds,
+            codex_model=self._codex_gateway_codex_model() if normalize_provider_name(provider) == "codex_gateway" else None,
+        )
+        return build_json_decision_provider(spec)
 
     def _build_provider_slots(self) -> list[ProviderSlot]:
         if not self.settings.ai_agent_enabled:
             return []
 
         slots: list[ProviderSlot] = []
+        primary_provider = self._primary_provider_name()
+        primary_model = self._primary_model_name(primary_provider)
         seen_gemini_keys: set[str] = set()
-        if self.settings.ai_primary_provider == "gemini" and self.settings.ai_primary_model:
+        if primary_provider == "gemini" and primary_model:
             for slot_label, api_key in (
                 ("gemini_primary", self.settings.gemini_api_key),
                 ("gemini_free1", self.settings.gemini_api_key_free1),
@@ -669,7 +599,7 @@ class AutonomousTradingAgentService:
                 seen_gemini_keys.add(normalized_key)
                 provider = self._build_provider(
                     provider="gemini",
-                    model=self.settings.ai_primary_model,
+                    model=primary_model,
                     api_key=normalized_key,
                     api_base=None,
                 )
@@ -679,24 +609,43 @@ class AutonomousTradingAgentService:
                     ProviderSlot(
                         slot_label=slot_label,
                         provider_name="gemini",
-                        model_name=self.settings.ai_primary_model,
+                        model_name=primary_model,
                         provider=provider,
                         counts_as_fallback=slot_label != "gemini_primary",
                     )
                 )
+        else:
+            primary_provider_instance = self._build_provider(
+                provider=primary_provider,
+                model=primary_model,
+                api_key=self._primary_api_key(primary_provider),
+                api_base=self._primary_api_base(primary_provider),
+            )
+            if primary_provider_instance is not None and primary_model:
+                slots.append(
+                    ProviderSlot(
+                        slot_label=f"{primary_provider}_primary",
+                        provider_name=primary_provider,
+                        model_name=primary_model,
+                        provider=primary_provider_instance,
+                        counts_as_fallback=False,
+                    )
+                )
 
+        fallback_provider_name = self._fallback_provider_name()
+        fallback_model_name = self._fallback_model_name(fallback_provider_name)
         fallback_provider = self._build_provider(
-            provider=self.settings.ai_fallback_provider,
-            model=self.settings.ai_fallback_model,
-            api_key=self.settings.ai_fallback_api_key,
-            api_base=self.settings.ai_fallback_api_base,
+            provider=fallback_provider_name,
+            model=fallback_model_name,
+            api_key=self._fallback_api_key(fallback_provider_name),
+            api_base=self._fallback_api_base(fallback_provider_name),
         )
-        if fallback_provider is not None and self.settings.ai_fallback_model:
+        if fallback_provider is not None and fallback_model_name:
             slots.append(
                 ProviderSlot(
-                    slot_label=f"{self.settings.ai_fallback_provider}_fallback",
-                    provider_name=self.settings.ai_fallback_provider,
-                    model_name=self.settings.ai_fallback_model,
+                    slot_label=f"{fallback_provider_name}_fallback",
+                    provider_name=fallback_provider_name,
+                    model_name=fallback_model_name,
                     provider=fallback_provider,
                     counts_as_fallback=True,
                 )
@@ -711,13 +660,255 @@ class AutonomousTradingAgentService:
         api_key: str | None,
         api_base: str | None,
     ) -> bool:
-        if provider == "disabled" or not model:
-            return False
-        if provider == "gemini":
-            return bool(api_key)
-        if provider == "openai_compatible":
-            return bool(api_base)
-        return False
+        return provider_is_ready(
+            LLMProviderSpec(
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                api_base=api_base,
+            )
+        )
+
+    def _primary_provider_name(self) -> str:
+        return normalize_provider_name(self.settings.llm_provider or self.settings.ai_primary_provider or "gemini")
+
+    def _primary_model_name(self, provider: str) -> str | None:
+        provider_name = normalize_provider_name(provider)
+        if provider_name == "codex_gateway":
+            return self._first_non_empty(
+                self.settings.llm_model,
+                self.settings.codex_gateway_model_label,
+                self.settings.ai_primary_model,
+            )
+        return self._first_non_empty(self.settings.llm_model, self.settings.ai_primary_model)
+
+    def _primary_api_key(self, provider: str) -> str | None:
+        provider_name = normalize_provider_name(provider)
+        if provider_name == "codex_gateway":
+            return self._first_non_empty(self.settings.codex_gateway_api_key)
+        if provider_name == "gemini":
+            return self._first_non_empty(self.settings.gemini_api_key)
+        return None
+
+    def _primary_api_base(self, provider: str) -> str | None:
+        provider_name = normalize_provider_name(provider)
+        if provider_name == "codex_gateway":
+            return self._first_non_empty(self.settings.codex_gateway_base_url)
+        return None
+
+    def _fallback_provider_name(self) -> str:
+        return normalize_provider_name(self.settings.ai_fallback_provider or "openai_compatible")
+
+    def _fallback_model_name(self, provider: str) -> str | None:
+        provider_name = normalize_provider_name(provider)
+        if provider_name == "codex_gateway":
+            return self._first_non_empty(self.settings.codex_gateway_model_label, self.settings.ai_fallback_model)
+        return self._first_non_empty(self.settings.ai_fallback_model)
+
+    def _fallback_api_key(self, provider: str) -> str | None:
+        provider_name = normalize_provider_name(provider)
+        if provider_name == "codex_gateway":
+            return self._first_non_empty(self.settings.codex_gateway_api_key)
+        return self._first_non_empty(self.settings.ai_fallback_api_key)
+
+    def _fallback_api_base(self, provider: str) -> str | None:
+        provider_name = normalize_provider_name(provider)
+        if provider_name == "codex_gateway":
+            return self._first_non_empty(self.settings.codex_gateway_base_url)
+        return self._first_non_empty(self.settings.ai_fallback_api_base)
+
+    def _codex_gateway_codex_model(self) -> str | None:
+        return self._first_non_empty(self.settings.codex_gateway_codex_model)
+
+    @staticmethod
+    def _first_non_empty(*values: str | None) -> str | None:
+        for value in values:
+            normalized = (value or "").strip()
+            if normalized:
+                return normalized
+        return None
+
+    @staticmethod
+    def _build_macro_research_system_prompt() -> str:
+        return (
+            "You are the macro and geopolitical research branch of a trading bot. "
+            "Use the supplied headlines, macro events, and article extracts to build a falsifiable market thesis. "
+            "Focus on likely price impact for liquid US-listed assets or widely used ETF proxies. "
+            "Prefer concrete scenario language, acknowledge uncertainty, and propose research or execution ideas "
+            "that could realistically be turned into watchlists, hedges, or tactical setups. "
+            "Return JSON only."
+        )
+
+    @staticmethod
+    def _macro_research_schema() -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "regime": {"type": "string"},
+                "relevance": {"type": "string"},
+                "timeframe": {"type": "string"},
+                "scenario": {"type": "string"},
+                "importance": {"type": "number"},
+                "impact_hypothesis": {"type": "string"},
+                "affected_assets": {"type": "array", "items": {"type": "string"}},
+                "asset_impacts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ticker": {"type": "string"},
+                            "bias": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["ticker", "bias", "reason"],
+                    },
+                },
+                "strategy_ideas": {"type": "array", "items": {"type": "string"}},
+                "risk_flags": {"type": "array", "items": {"type": "string"}},
+                "evidence_points": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": [
+                "summary",
+                "regime",
+                "relevance",
+                "timeframe",
+                "scenario",
+                "importance",
+                "impact_hypothesis",
+                "affected_assets",
+                "asset_impacts",
+                "strategy_ideas",
+                "risk_flags",
+                "evidence_points",
+            ],
+        }
+
+    @staticmethod
+    def _string_list(value) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        results: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text:
+                results.append(text)
+        return results
+
+    @staticmethod
+    def _asset_impacts(value) -> list[dict]:
+        if not isinstance(value, list):
+            return []
+        impacts: list[dict] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            ticker = str(item.get("ticker") or "").strip().upper()
+            bias = str(item.get("bias") or "").strip().lower()
+            reason = str(item.get("reason") or "").strip()
+            if ticker and bias and reason:
+                impacts.append({"ticker": ticker, "bias": bias, "reason": reason})
+        return impacts
+
+    def _normalize_macro_research_result(self, payload: dict, *, fallback: dict) -> dict:
+        normalized = {
+            "summary": str(payload.get("summary") or fallback["summary"]).strip(),
+            "regime": str(payload.get("regime") or fallback["regime"]).strip() or fallback["regime"],
+            "relevance": str(payload.get("relevance") or fallback["relevance"]).strip() or fallback["relevance"],
+            "timeframe": str(payload.get("timeframe") or fallback["timeframe"]).strip() or fallback["timeframe"],
+            "scenario": str(payload.get("scenario") or fallback["scenario"]).strip() or fallback["scenario"],
+            "importance": float(payload.get("importance") if isinstance(payload.get("importance"), (int, float)) else fallback["importance"]),
+            "impact_hypothesis": str(payload.get("impact_hypothesis") or fallback["impact_hypothesis"]).strip(),
+            "affected_assets": self._string_list(payload.get("affected_assets")) or list(fallback["affected_assets"]),
+            "asset_impacts": self._asset_impacts(payload.get("asset_impacts")) or list(fallback["asset_impacts"]),
+            "strategy_ideas": self._string_list(payload.get("strategy_ideas")) or list(fallback["strategy_ideas"]),
+            "risk_flags": self._string_list(payload.get("risk_flags")) or list(fallback["risk_flags"]),
+            "evidence_points": self._string_list(payload.get("evidence_points")) or list(fallback["evidence_points"]),
+        }
+        normalized["importance"] = round(min(max(normalized["importance"], 0.0), 1.0), 2)
+        return normalized
+
+    def _heuristic_macro_research(
+        self,
+        *,
+        theme: dict,
+        market_context: dict,
+        calendar_events: list[dict],
+        news_items: list[dict],
+        article_contexts: list[dict],
+    ) -> dict:
+        title = str(theme.get("title") or "macro theme").strip()
+        default_regime = str(theme.get("default_regime") or "macro_uncertainty").strip()
+        timeframe = str(theme.get("timeframe") or "1D-1M").strip()
+        relevance = str(theme.get("relevance") or "cross_asset").strip()
+        focus_assets = self._string_list(theme.get("focus_assets"))
+        strategy_templates = self._string_list(theme.get("strategy_templates"))
+        evidence_points: list[str] = []
+        evidence_points.extend(
+            str(item.get("title") or "").strip()
+            for item in calendar_events[:2]
+            if isinstance(item, dict) and str(item.get("title") or "").strip()
+        )
+        evidence_points.extend(
+            str(item.get("title") or "").strip()
+            for item in news_items[:3]
+            if isinstance(item, dict) and str(item.get("title") or "").strip()
+        )
+        evidence_points.extend(
+            str(item.get("title") or "").strip()
+            for item in article_contexts[:1]
+            if isinstance(item, dict) and str(item.get("title") or "").strip()
+        )
+        evidence_points = evidence_points[:6]
+        scenario = evidence_points[0] if evidence_points else title
+        importance = round(
+            min(
+                1.0,
+                0.55
+                + (0.1 if calendar_events else 0.0)
+                + (0.1 if news_items else 0.0)
+                + (0.05 if article_contexts else 0.0),
+            ),
+            2,
+        )
+        market_regime = str(market_context.get("market_state_regime") or "").strip()
+        impact_hypothesis = (
+            f"{title} could reprice {', '.join(focus_assets[:4]) or 'liquid macro proxies'} "
+            f"through sector rotation, volatility expansion, and changes in risk appetite."
+        )
+        summary = (
+            f"{title}: {impact_hypothesis} "
+            f"Current market regime reference: {market_regime or default_regime}."
+        )
+        asset_impacts = [
+            {
+                "ticker": asset,
+                "bias": "monitor",
+                "reason": f"{asset} is a liquid proxy for the {title.lower()} theme.",
+            }
+            for asset in focus_assets[:6]
+        ]
+        risk_flags = [
+            "headline risk can reverse quickly before price confirms the thesis",
+            "macro timing is harder than thematic direction; wait for market confirmation",
+        ]
+        return {
+            "summary": summary,
+            "regime": default_regime,
+            "relevance": relevance,
+            "timeframe": timeframe,
+            "scenario": scenario,
+            "importance": importance,
+            "impact_hypothesis": impact_hypothesis,
+            "affected_assets": focus_assets[:8],
+            "asset_impacts": asset_impacts,
+            "strategy_ideas": strategy_templates[:5],
+            "risk_flags": risk_flags,
+            "evidence_points": evidence_points,
+            "analysis_mode": "heuristic",
+            "provider": None,
+            "model": None,
+        }
 
     def _decide_with_fallback(
         self,
@@ -733,7 +924,7 @@ class AutonomousTradingAgentService:
         errors: list[str] = []
         for slot in self.provider_slots:
             try:
-                payload = slot.provider.decide(
+                payload = slot.provider.generate_json(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     response_json_schema=response_json_schema,
@@ -742,7 +933,7 @@ class AutonomousTradingAgentService:
                 if slot.counts_as_fallback:
                     self.runtime.fallback_count += 1
                 return payload, slot.provider_name, slot.model_name
-            except AIDecisionError as exc:
+            except LLMProviderError as exc:
                 errors.append(f"{slot.slot_label}:{slot.model_name}: {exc}")
                 continue
         message = " | ".join(errors) if errors else "No AI provider is configured and ready."
@@ -780,12 +971,41 @@ class AutonomousTradingAgentService:
         signal_payload: dict,
         market_context: dict,
     ) -> dict:
+        decision_context = signal_payload.get("decision_context") if isinstance(signal_payload.get("decision_context"), dict) else {}
+        skill_context = (
+            signal_payload.get("skill_context")
+            if isinstance(signal_payload.get("skill_context"), dict)
+            else decision_context.get("skill_context")
+            if isinstance(decision_context.get("skill_context"), dict)
+            else {}
+        )
         protocol_context = build_candidate_protocol_context(
             ticker=ticker,
             watchlist_code=watchlist_code,
             signal_payload=signal_payload,
             market_context=market_context,
             persisted_market_state=self.market_state_service.get_latest_protocol_market_state(session),
+        )
+        runtime_skill_selection = self.skill_lifecycle_service.build_runtime_selection(
+            session,
+            skill_context=skill_context,
+            max_packets=self.settings.ai_runtime_skill_limit,
+            max_steps_per_packet=self.settings.ai_runtime_skill_step_limit,
+        )
+        runtime_claim_selection = self.knowledge_claim_service.build_runtime_selection(
+            session,
+            ticker=ticker,
+            strategy_version_id=strategy_version_id,
+            max_packets=self.settings.ai_runtime_claim_limit,
+            max_evidence_per_packet=self.settings.ai_runtime_claim_evidence_limit,
+        )
+        runtime_skills = [item for item in runtime_skill_selection.get("packets", []) if isinstance(item, dict)]
+        runtime_claims = [item for item in runtime_claim_selection.get("packets", []) if isinstance(item, dict)]
+        protocol_context["runtime_skills"] = runtime_skills
+        protocol_context["runtime_claims"] = runtime_claims
+        protocol_context["context_budget"] = self._build_runtime_context_budget(
+            skill_budget=runtime_skill_selection.get("budget"),
+            claim_budget=runtime_claim_selection.get("budget"),
         )
         recent_journal = list(
             session.scalars(
@@ -825,13 +1045,14 @@ class AutonomousTradingAgentService:
                 "risk_reward": signal_payload.get("risk_reward"),
                 "quant_summary": signal_payload.get("quant_summary"),
                 "visual_summary": signal_payload.get("visual_summary"),
-                "decision_context": signal_payload.get("decision_context"),
+                "decision_context": decision_context,
                 "risk_budget": signal_payload.get("risk_budget"),
                 "position_sizing": signal_payload.get("position_sizing"),
                 "research_plan": signal_payload.get("research_plan"),
                 "decision_trace": signal_payload.get("decision_trace"),
                 "score_breakdown": signal_payload.get("score_breakdown"),
                 "guard_results": signal_payload.get("guard_results"),
+                "skill_context": skill_context,
                 "rationale": signal_payload.get("rationale"),
             },
             "recent_journal": [
@@ -872,6 +1093,15 @@ class AutonomousTradingAgentService:
         position: Position,
         market_snapshot: dict,
     ) -> dict:
+        entry_context = position.entry_context if isinstance(position.entry_context, dict) else {}
+        skill_context = (
+            entry_context.get("management_context", {}).get("skill_context")
+            if isinstance(entry_context.get("management_context"), dict)
+            and isinstance(entry_context.get("management_context", {}).get("skill_context"), dict)
+            else entry_context.get("skill_context")
+            if isinstance(entry_context.get("skill_context"), dict)
+            else {}
+        )
         protocol_context = build_position_management_protocol_context(
             position={
                 "id": position.id,
@@ -882,10 +1112,31 @@ class AutonomousTradingAgentService:
                 "target_price": position.target_price,
                 "side": position.side,
                 "thesis": position.thesis,
-                "entry_context": position.entry_context or {},
+                "entry_context": entry_context,
             },
             market_snapshot=market_snapshot,
             persisted_market_state=self.market_state_service.get_latest_protocol_market_state(session),
+        )
+        runtime_skill_selection = self.skill_lifecycle_service.build_runtime_selection(
+            session,
+            skill_context=skill_context,
+            max_packets=self.settings.ai_runtime_skill_limit,
+            max_steps_per_packet=self.settings.ai_runtime_skill_step_limit,
+        )
+        runtime_claim_selection = self.knowledge_claim_service.build_runtime_selection(
+            session,
+            ticker=position.ticker,
+            strategy_version_id=position.strategy_version_id,
+            max_packets=self.settings.ai_runtime_claim_limit,
+            max_evidence_per_packet=self.settings.ai_runtime_claim_evidence_limit,
+        )
+        runtime_skills = [item for item in runtime_skill_selection.get("packets", []) if isinstance(item, dict)]
+        runtime_claims = [item for item in runtime_claim_selection.get("packets", []) if isinstance(item, dict)]
+        protocol_context["runtime_skills"] = runtime_skills
+        protocol_context["runtime_claims"] = runtime_claims
+        protocol_context["context_budget"] = self._build_runtime_context_budget(
+            skill_budget=runtime_skill_selection.get("budget"),
+            claim_budget=runtime_claim_selection.get("budget"),
         )
         recent_journal = list(
             session.scalars(
@@ -923,7 +1174,8 @@ class AutonomousTradingAgentService:
                 "target_price": position.target_price,
                 "side": position.side,
                 "thesis": position.thesis,
-                "entry_context": position.entry_context or {},
+                "entry_context": entry_context,
+                "skill_context": skill_context,
                 "pnl_pct": pnl_pct,
             },
             "market_snapshot": market_snapshot,
@@ -959,6 +1211,67 @@ class AutonomousTradingAgentService:
             ],
         }
 
+    def _build_runtime_context_budget(self, *, skill_budget: dict | None, claim_budget: dict | None) -> dict:
+        normalized_skill_budget = dict(skill_budget or {})
+        normalized_claim_budget = dict(claim_budget or {})
+        available_runtime_skill_count = int(normalized_skill_budget.get("available_count") or 0)
+        loaded_runtime_skill_count = int(normalized_skill_budget.get("loaded_count") or 0)
+        available_runtime_claim_count = int(normalized_claim_budget.get("available_count") or 0)
+        loaded_runtime_claim_count = int(normalized_claim_budget.get("loaded_count") or 0)
+        return {
+            "runtime_skills_enabled": bool(normalized_skill_budget.get("enabled")),
+            "max_runtime_skills": self.settings.ai_runtime_skill_limit,
+            "max_steps_per_skill": self.settings.ai_runtime_skill_step_limit,
+            "available_runtime_skill_count": available_runtime_skill_count,
+            "loaded_runtime_skill_count": loaded_runtime_skill_count,
+            "truncated_runtime_skill_count": max(available_runtime_skill_count - loaded_runtime_skill_count, 0),
+            "runtime_claims_enabled": bool(normalized_claim_budget.get("enabled")),
+            "max_runtime_claims": self.settings.ai_runtime_claim_limit,
+            "max_evidence_per_claim": self.settings.ai_runtime_claim_evidence_limit,
+            "available_runtime_claim_count": available_runtime_claim_count,
+            "loaded_runtime_claim_count": loaded_runtime_claim_count,
+            "truncated_runtime_claim_count": max(available_runtime_claim_count - loaded_runtime_claim_count, 0),
+            "runtime_skills": normalized_skill_budget,
+            "runtime_claims": normalized_claim_budget,
+            "available_runtime_item_count": available_runtime_skill_count + available_runtime_claim_count,
+            "loaded_runtime_item_count": loaded_runtime_skill_count + loaded_runtime_claim_count,
+            "policy": (
+                "load only context-relevant procedural skills and durable claims; reserve most model context for live market evidence"
+            ),
+        }
+
+    def _build_runtime_skill_prompt(self, agent_protocol: dict | None) -> str:
+        if not isinstance(agent_protocol, dict):
+            return ""
+        runtime_skills = agent_protocol.get("runtime_skills")
+        return self.skill_lifecycle_service.render_runtime_skill_prompt(runtime_skills)
+
+    def _build_runtime_claim_prompt(self, agent_protocol: dict | None) -> str:
+        if not isinstance(agent_protocol, dict):
+            return ""
+        runtime_claims = agent_protocol.get("runtime_claims")
+        return self.knowledge_claim_service.render_runtime_claim_prompt(runtime_claims)
+
+    @staticmethod
+    def _extract_runtime_claims(context: dict | None) -> list[dict]:
+        if not isinstance(context, dict):
+            return []
+        agent_protocol = context.get("agent_protocol")
+        if not isinstance(agent_protocol, dict):
+            return []
+        runtime_claims = agent_protocol.get("runtime_claims")
+        return [item for item in runtime_claims if isinstance(item, dict)] if isinstance(runtime_claims, list) else []
+
+    @staticmethod
+    def _extract_context_budget(context: dict | None) -> dict:
+        if not isinstance(context, dict):
+            return {}
+        agent_protocol = context.get("agent_protocol")
+        if not isinstance(agent_protocol, dict):
+            return {}
+        context_budget = agent_protocol.get("context_budget")
+        return context_budget if isinstance(context_budget, dict) else {}
+
     def _parse_decision(self, payload: dict, allowed_actions: set[str] | None = None) -> AgentDecision:
         allowed_actions = allowed_actions or {"paper_enter", "watch", "discard"}
         action = self._coerce_action_from_payload(payload, allowed_actions)
@@ -989,6 +1302,11 @@ class AutonomousTradingAgentService:
             for item in payload.get("reasons_not_to_act", [])
             if str(item).strip()
         ]
+        claims_applied = [
+            str(item).strip()
+            for item in payload.get("claims_applied", [])
+            if str(item).strip()
+        ]
         return AgentDecision(
             action=action,
             confidence=confidence,
@@ -1005,6 +1323,7 @@ class AutonomousTradingAgentService:
             invalidation=invalidation,
             risk_assessment=risk_assessment,
             reasons_not_to_act=reasons_not_to_act,
+            claims_applied=claims_applied,
         )
 
     @staticmethod
@@ -1048,7 +1367,11 @@ class AutonomousTradingAgentService:
         signal_payload: dict,
         market_context: dict,
         decision: AgentDecision,
+        runtime_claims: list[dict] | None = None,
+        context_budget: dict | None = None,
     ) -> None:
+        claim_payload = [item for item in (runtime_claims or []) if isinstance(item, dict)]
+        budget_payload = dict(context_budget or {})
         session.add(
             JournalEntry(
                 entry_type="ai_trade_decision",
@@ -1077,7 +1400,10 @@ class AutonomousTradingAgentService:
                     "invalidation": decision.invalidation,
                     "risk_assessment": decision.risk_assessment,
                     "reasons_not_to_act": decision.reasons_not_to_act,
+                    "claims_applied": decision.claims_applied,
                     "risks": decision.risks,
+                    "runtime_claims": claim_payload,
+                    "context_budget": budget_payload,
                     "raw_payload": decision.raw_payload,
                 },
                 reasoning=decision.thesis,
@@ -1102,8 +1428,11 @@ class AutonomousTradingAgentService:
                     "next_state": decision.next_state,
                     "regime": decision.regime,
                     "active_playbook": decision.active_playbook,
+                    "claims_applied": decision.claims_applied,
                     "risks": decision.risks,
                     "lessons_applied": decision.lessons_applied,
+                    "runtime_claims": claim_payload,
+                    "context_budget": budget_payload,
                 },
                 importance=max(0.55, decision.confidence),
             )
@@ -1119,7 +1448,11 @@ class AutonomousTradingAgentService:
         decision: AgentDecision,
         provider: str,
         model: str,
+        runtime_claims: list[dict] | None = None,
+        context_budget: dict | None = None,
     ) -> None:
+        claim_payload = [item for item in (runtime_claims or []) if isinstance(item, dict)]
+        budget_payload = dict(context_budget or {})
         session.add(
             JournalEntry(
                 entry_type="ai_position_management",
@@ -1144,7 +1477,10 @@ class AutonomousTradingAgentService:
                     "invalidation": decision.invalidation,
                     "risk_assessment": decision.risk_assessment,
                     "reasons_not_to_act": decision.reasons_not_to_act,
+                    "claims_applied": decision.claims_applied,
                     "risks": decision.risks,
+                    "runtime_claims": claim_payload,
+                    "context_budget": budget_payload,
                     "raw_payload": decision.raw_payload,
                 },
                 reasoning=decision.thesis,
@@ -1170,8 +1506,11 @@ class AutonomousTradingAgentService:
                     "next_state": decision.next_state,
                     "regime": decision.regime,
                     "active_playbook": decision.active_playbook,
+                    "claims_applied": decision.claims_applied,
                     "risks": decision.risks,
                     "lessons_applied": decision.lessons_applied,
+                    "runtime_claims": claim_payload,
+                    "context_budget": budget_payload,
                 },
                 importance=max(0.55, decision.confidence),
             )

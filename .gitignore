@@ -1,3 +1,4 @@
+.codex
 .codex/
 __pycache__/
 *.py[cod]
@@ -15,6 +16,7 @@ backend/.env.*
 # Test and tooling caches
 .pytest_cache/
 backend/.pytest_cache/
+backend/.cache/
 
 # Local build metadata
 *.egg-info/

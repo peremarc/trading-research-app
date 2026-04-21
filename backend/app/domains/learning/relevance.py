@@ -13,6 +13,8 @@ from app.db.models.decision_context import DecisionContextSnapshot, FeatureOutco
 from app.db.models.position import Position
 from app.db.models.signal import TradeSignal
 from app.db.models.strategy import StrategyVersion
+from app.domains.learning.claims import KnowledgeClaimService
+from app.domains.learning.skills import ClaimSkillBridgeService, SkillPromotionService
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,35 @@ COMBO_FEATURE_DEFINITIONS: tuple[tuple[tuple[str, str], tuple[str, str], str], .
     (("quant", "setup"), ("calendar", "near_macro_high_impact"), "setup__near_macro_high_impact"),
     (("quant", "setup"), ("macro", "primary_regime"), "setup__primary_regime"),
     (("quant", "trend"), ("macro", "primary_regime"), "trend__primary_regime"),
+    (("quant", "setup"), ("intermarket", "airline_bias"), "setup__airline_bias"),
+    (
+        ("intermarket", "sector_strength_state"),
+        ("intermarket", "oil_pressure_state"),
+        "sector_strength__oil_pressure",
+    ),
+    (
+        ("intermarket", "sector_strength_state"),
+        ("intermarket", "put_call_state"),
+        "sector_strength__put_call_state",
+    ),
+    (("quant", "setup"), ("price_action", "primary_signal"), "setup__price_action_primary"),
+    (
+        ("quant", "setup"),
+        ("calendar", "days_to_quarterly_expiry_bucket"),
+        "setup__days_to_quarterly_expiry_bucket",
+    ),
+    (("quant", "setup"), ("mstr", "mnav_bucket"), "setup__mnav_bucket"),
+    (
+        ("price_action", "primary_signal"),
+        ("price_action", "higher_timeframe_bias"),
+        "price_action_primary__higher_timeframe_bias",
+    ),
+    (
+        ("mstr", "atm_risk_context"),
+        ("mstr", "btc_proxy_state"),
+        "mstr_atm_risk__btc_proxy_state",
+    ),
+    (("quant", "setup"), ("skill", "primary_skill"), "setup__primary_skill"),
 )
 COMBO_FEATURE_DEFINITIONS_BY_KEY = {definition[2]: definition for definition in COMBO_FEATURE_DEFINITIONS}
 ACTIONABLE_COMBO_KEYS = set(COMBO_FEATURE_DEFINITIONS_BY_KEY)
@@ -113,6 +144,16 @@ class DecisionContextService:
             position_context={
                 "entry_context": signal_context,
                 "executed_entry_context": executed_entry_context,
+                "timing_profile": dict(signal_context.get("timing_profile") or {}),
+                "execution_plan_timing": dict(signal_context.get("execution_plan_timing") or {}),
+                "price_action_context": dict(signal_context.get("price_action_context") or {}),
+                "executed_price_action_context": dict(executed_entry_context.get("price_action_context") or {}),
+                "intermarket_context": dict(signal_context.get("intermarket_context") or {}),
+                "executed_intermarket_context": dict(executed_entry_context.get("intermarket_context") or {}),
+                "mstr_context": dict(signal_context.get("mstr_context") or {}),
+                "executed_mstr_context": dict(executed_entry_context.get("mstr_context") or {}),
+                "skill_context": dict(signal_context.get("skill_context") or {}),
+                "executed_skill_context": dict(executed_entry_context.get("skill_context") or {}),
                 "research_plan": dict(signal_context.get("research_plan") or {}),
                 "decision_trace": dict(signal_context.get("decision_trace") or {}),
                 "executed_research_plan": dict(executed_entry_context.get("research_plan") or {}),
@@ -283,6 +324,70 @@ class FeatureRelevanceService:
         macro = snapshot.macro_context or {}
         if not macro:
             macro = decision_macro
+        price_action = (
+            position_context.get("price_action_context")
+            if isinstance(position_context.get("price_action_context"), dict)
+            else {}
+        )
+        if not price_action and isinstance(decision_context.get("price_action_context"), dict):
+            price_action = dict(decision_context.get("price_action_context") or {})
+        if not price_action:
+            entry_context = (
+                position_context.get("entry_context") if isinstance(position_context.get("entry_context"), dict) else {}
+            )
+            price_action = (
+                entry_context.get("price_action_context")
+                if isinstance(entry_context.get("price_action_context"), dict)
+                else {}
+            )
+        intermarket = (
+            position_context.get("intermarket_context")
+            if isinstance(position_context.get("intermarket_context"), dict)
+            else {}
+        )
+        if not intermarket and isinstance(decision_context.get("intermarket_context"), dict):
+            intermarket = dict(decision_context.get("intermarket_context") or {})
+        if not intermarket:
+            entry_context = (
+                position_context.get("entry_context") if isinstance(position_context.get("entry_context"), dict) else {}
+            )
+            intermarket = (
+                entry_context.get("intermarket_context")
+                if isinstance(entry_context.get("intermarket_context"), dict)
+                else {}
+            )
+        mstr_context = (
+            position_context.get("mstr_context")
+            if isinstance(position_context.get("mstr_context"), dict)
+            else {}
+        )
+        if not mstr_context and isinstance(decision_context.get("mstr_context"), dict):
+            mstr_context = dict(decision_context.get("mstr_context") or {})
+        if not mstr_context:
+            entry_context = (
+                position_context.get("entry_context") if isinstance(position_context.get("entry_context"), dict) else {}
+            )
+            mstr_context = (
+                entry_context.get("mstr_context")
+                if isinstance(entry_context.get("mstr_context"), dict)
+                else {}
+            )
+        skill_context = (
+            position_context.get("skill_context")
+            if isinstance(position_context.get("skill_context"), dict)
+            else {}
+        )
+        if not skill_context and isinstance(decision_context.get("skill_context"), dict):
+            skill_context = dict(decision_context.get("skill_context") or {})
+        if not skill_context:
+            entry_context = (
+                position_context.get("entry_context") if isinstance(position_context.get("entry_context"), dict) else {}
+            )
+            skill_context = (
+                entry_context.get("skill_context")
+                if isinstance(entry_context.get("skill_context"), dict)
+                else {}
+            )
         ai = snapshot.ai_context or {}
 
         active_regimes = macro.get("active_regimes") if isinstance(macro.get("active_regimes"), list) else []
@@ -306,6 +411,9 @@ class FeatureRelevanceService:
                 macro_events = int(decision_calendar.get("macro_event_count") or 0)
             elif isinstance(decision_calendar.get("near_macro_high_impact_days"), int):
                 macro_events = 1
+        expiry_context = calendar.get("expiry_context") if isinstance(calendar.get("expiry_context"), dict) else {}
+        if not expiry_context and isinstance(decision_calendar.get("expiry_context"), dict):
+            expiry_context = dict(decision_calendar.get("expiry_context") or {})
         news_articles = news.get("articles") if isinstance(news.get("articles"), list) else []
         if not news_articles:
             if isinstance(news.get("article_count"), int):
@@ -333,9 +441,204 @@ class FeatureRelevanceService:
             FeatureObservation("visual", "setup_type", self._stringify(visual.get("setup_type"), fallback="unknown")),
             FeatureObservation("calendar", "near_earnings", "true" if corporate_events > 0 else "false"),
             FeatureObservation("calendar", "near_macro_high_impact", "true" if macro_events > 0 else "false"),
+            FeatureObservation(
+                "calendar",
+                "expiration_week",
+                "true" if bool(expiry_context.get("expiration_week")) else "false",
+            ),
+            FeatureObservation(
+                "calendar",
+                "pre_expiry_window",
+                "true" if bool(expiry_context.get("pre_expiry_window")) else "false",
+            ),
+            FeatureObservation(
+                "calendar",
+                "expiry_day",
+                "true" if bool(expiry_context.get("expiry_day")) else "false",
+            ),
+            FeatureObservation(
+                "calendar",
+                "post_expiry_window",
+                "true" if bool(expiry_context.get("post_expiry_window")) else "false",
+            ),
+            FeatureObservation(
+                "calendar",
+                "days_to_quarterly_expiry_bucket",
+                self._bucketize_days_to_expiry(expiry_context.get("days_to_event")),
+            ),
+            FeatureObservation(
+                "calendar",
+                "expiry_phase",
+                self._stringify(expiry_context.get("phase"), fallback="none"),
+            ),
             FeatureObservation("news", "has_news", "true" if len(news_articles) > 0 else "false"),
             FeatureObservation("web", "has_external_confirmation", "true" if len(web_search_results or []) > 0 or web_articles > 0 else "false"),
             FeatureObservation("macro", "primary_regime", self._stringify(active_regimes[0] if active_regimes else None, fallback="none")),
+            FeatureObservation(
+                "price_action",
+                "primary_signal",
+                self._stringify(
+                    price_action.get("primary_signal_code")
+                    if price_action.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "signal_bias",
+                self._stringify(
+                    price_action.get("bias")
+                    if price_action.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "volume_state",
+                self._stringify(
+                    price_action.get("volume_state")
+                    if price_action.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "close_location_state",
+                self._stringify(
+                    price_action.get("close_location_state")
+                    if price_action.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "higher_timeframe_bias",
+                self._stringify(
+                    price_action.get("higher_timeframe_bias")
+                    if price_action.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "follow_through_state",
+                self._stringify(
+                    price_action.get("follow_through_state")
+                    if price_action.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "intermarket",
+                "airline_bias",
+                self._stringify(
+                    intermarket.get("bias")
+                    if intermarket.get("applicable") and intermarket.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "intermarket",
+                "oil_pressure_state",
+                self._stringify(
+                    intermarket.get("oil_pressure_state")
+                    if intermarket.get("applicable") and intermarket.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "intermarket",
+                "sector_strength_state",
+                self._stringify(
+                    intermarket.get("sector_strength_state")
+                    if intermarket.get("applicable") and intermarket.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "intermarket",
+                "put_call_state",
+                self._stringify(
+                    intermarket.get("put_call_state")
+                    if intermarket.get("applicable") and intermarket.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "mstr",
+                "context_available",
+                "true" if mstr_context.get("applicable") and mstr_context.get("available", True) else "false",
+            ),
+            FeatureObservation(
+                "mstr",
+                "mnav_bucket",
+                self._stringify(
+                    mstr_context.get("mnav_bucket")
+                    if mstr_context.get("applicable") and mstr_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "mstr",
+                "atm_risk_context",
+                self._stringify(
+                    mstr_context.get("atm_risk_context")
+                    if mstr_context.get("applicable") and mstr_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "mstr",
+                "recent_btc_purchase",
+                "true" if bool(mstr_context.get("recent_btc_purchase")) else "false",
+            ),
+            FeatureObservation(
+                "mstr",
+                "bps_trend",
+                self._stringify(
+                    mstr_context.get("bps_trend")
+                    if mstr_context.get("applicable") and mstr_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "mstr",
+                "share_dilution_accelerating",
+                "true" if bool(mstr_context.get("share_dilution_accelerating")) else "false",
+            ),
+            FeatureObservation(
+                "mstr",
+                "btc_proxy_state",
+                self._stringify(
+                    mstr_context.get("btc_proxy_state")
+                    if mstr_context.get("applicable") and mstr_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "skill",
+                "primary_skill",
+                self._stringify(skill_context.get("primary_skill_code"), fallback="none"),
+            ),
+            FeatureObservation(
+                "skill",
+                "risk_skill_active",
+                "true" if bool(skill_context.get("risk_skill_active")) else "false",
+            ),
             FeatureObservation("ai", "action", self._stringify(ai.get("action"), fallback="none")),
             FeatureObservation("planner", "execution_outcome", self._stringify(snapshot.execution_outcome, fallback="unknown")),
         ]
@@ -366,6 +669,24 @@ class FeatureRelevanceService:
         return fallback
 
     @staticmethod
+    def _bucketize_days_to_expiry(value: object) -> str:
+        if not isinstance(value, int):
+            return "none"
+        if value < 0:
+            return "post_window"
+        if value == 0:
+            return "T"
+        if value == 1:
+            return "T-1"
+        if value == 2:
+            return "T-2"
+        if value == 3:
+            return "T-3"
+        if value <= 7:
+            return "same_week"
+        return "later"
+
+    @staticmethod
     def _calculate_relevance_score(avg_pnl_pct: float | None, sample_size: int) -> float | None:
         if avg_pnl_pct is None or sample_size <= 0:
             return None
@@ -379,6 +700,9 @@ class StrategyContextAdaptationService:
     MIN_WIN_RATE_FOR_SUPPORT = 60.0
 
     def refresh_rules(self, session: Session) -> int:
+        skill_promotion_service = SkillPromotionService()
+        knowledge_claim_service = KnowledgeClaimService()
+        claim_skill_bridge_service = ClaimSkillBridgeService()
         session.query(StrategyContextRule).filter(StrategyContextRule.source == "feature_outcome_stat").delete()
         session.commit()
 
@@ -406,58 +730,72 @@ class StrategyContextAdaptationService:
         )
 
         created = 0
+        created_rules: list[StrategyContextRule] = []
         for stat in negative_stats:
             if not self._is_actionable_feature(stat):
                 continue
-            session.add(
-                StrategyContextRule(
-                    strategy_id=stat.strategy_id,
-                    strategy_version_id=stat.strategy_version_id,
-                    feature_scope=stat.feature_scope,
-                    feature_key=stat.feature_key,
-                    feature_value=stat.feature_value,
-                    action_type="downgrade_to_watch",
-                    rationale=self._build_rule_rationale(stat, supportive=False),
-                    confidence=min(max((stat.relevance_score or 0.0) / 10.0, 0.0), 1.0),
-                    status="active",
-                    source="feature_outcome_stat",
-                    evidence_payload={
-                        "sample_size": stat.sample_size,
-                        "avg_pnl_pct": stat.avg_pnl_pct,
-                        "wins_count": stat.wins_count,
-                        "losses_count": stat.losses_count,
-                        "relevance_score": stat.relevance_score,
-                    },
-                )
+            rule = StrategyContextRule(
+                strategy_id=stat.strategy_id,
+                strategy_version_id=stat.strategy_version_id,
+                feature_scope=stat.feature_scope,
+                feature_key=stat.feature_key,
+                feature_value=stat.feature_value,
+                action_type="downgrade_to_watch",
+                rationale=self._build_rule_rationale(stat, supportive=False),
+                confidence=min(max((stat.relevance_score or 0.0) / 10.0, 0.0), 1.0),
+                status="active",
+                source="feature_outcome_stat",
+                evidence_payload={
+                    "sample_size": stat.sample_size,
+                    "avg_pnl_pct": stat.avg_pnl_pct,
+                    "wins_count": stat.wins_count,
+                    "losses_count": stat.losses_count,
+                    "relevance_score": stat.relevance_score,
+                    "promotion_trace": skill_promotion_service.build_temporary_rule_trace(
+                        feature_scope=stat.feature_scope,
+                        feature_key=stat.feature_key,
+                        feature_value=stat.feature_value,
+                    ),
+                },
             )
+            session.add(rule)
+            created_rules.append(rule)
             created += 1
         for stat in positive_stats:
             if not self._is_actionable_feature(stat):
                 continue
-            session.add(
-                StrategyContextRule(
-                    strategy_id=stat.strategy_id,
-                    strategy_version_id=stat.strategy_version_id,
-                    feature_scope=stat.feature_scope,
-                    feature_key=stat.feature_key,
-                    feature_value=stat.feature_value,
-                    action_type="boost_confidence",
-                    rationale=self._build_rule_rationale(stat, supportive=True),
-                    confidence=min(max((stat.relevance_score or 0.0) / 10.0, 0.0), 1.0),
-                    status="active",
-                    source="feature_outcome_stat",
-                    evidence_payload={
-                        "sample_size": stat.sample_size,
-                        "avg_pnl_pct": stat.avg_pnl_pct,
-                        "win_rate": stat.win_rate,
-                        "wins_count": stat.wins_count,
-                        "losses_count": stat.losses_count,
-                        "relevance_score": stat.relevance_score,
-                    },
-                )
+            rule = StrategyContextRule(
+                strategy_id=stat.strategy_id,
+                strategy_version_id=stat.strategy_version_id,
+                feature_scope=stat.feature_scope,
+                feature_key=stat.feature_key,
+                feature_value=stat.feature_value,
+                action_type="boost_confidence",
+                rationale=self._build_rule_rationale(stat, supportive=True),
+                confidence=min(max((stat.relevance_score or 0.0) / 10.0, 0.0), 1.0),
+                status="active",
+                source="feature_outcome_stat",
+                evidence_payload={
+                    "sample_size": stat.sample_size,
+                    "avg_pnl_pct": stat.avg_pnl_pct,
+                    "win_rate": stat.win_rate,
+                    "wins_count": stat.wins_count,
+                    "losses_count": stat.losses_count,
+                    "relevance_score": stat.relevance_score,
+                    "promotion_trace": skill_promotion_service.build_temporary_rule_trace(
+                        feature_scope=stat.feature_scope,
+                        feature_key=stat.feature_key,
+                        feature_value=stat.feature_value,
+                    ),
+                },
             )
+            session.add(rule)
+            created_rules.append(rule)
             created += 1
         session.commit()
+        for rule in created_rules:
+            claim = knowledge_claim_service.record_strategy_rule_claim(session, rule=rule)
+            claim_skill_bridge_service.maybe_promote_claim(session, claim=claim)
         return created
 
     def evaluate_entry(self, session: Session, *, strategy_version_id: int | None, signal_payload: dict) -> dict | None:
@@ -561,6 +899,29 @@ class StrategyContextAdaptationService:
         macro_context = (
             decision_context.get("macro_context") if isinstance(decision_context.get("macro_context"), dict) else {}
         )
+        price_action_context = (
+            decision_context.get("price_action_context")
+            if isinstance(decision_context.get("price_action_context"), dict)
+            else {}
+        )
+        intermarket_context = (
+            decision_context.get("intermarket_context")
+            if isinstance(decision_context.get("intermarket_context"), dict)
+            else {}
+        )
+        mstr_context = (
+            decision_context.get("mstr_context")
+            if isinstance(decision_context.get("mstr_context"), dict)
+            else {}
+        )
+        skill_context = (
+            decision_context.get("skill_context")
+            if isinstance(decision_context.get("skill_context"), dict)
+            else {}
+        )
+        expiry_context = (
+            calendar_context.get("expiry_context") if isinstance(calendar_context.get("expiry_context"), dict) else {}
+        )
         active_regimes = macro_context.get("active_regimes") if isinstance(macro_context.get("active_regimes"), list) else []
         base_features = [
             FeatureObservation("quant", "trend", FeatureRelevanceService._stringify(quant.get("trend"), fallback="unknown")),
@@ -595,6 +956,36 @@ class StrategyContextAdaptationService:
                 "true" if isinstance(calendar_context.get("near_macro_high_impact_days"), int) else "false",
             ),
             FeatureObservation(
+                "calendar",
+                "expiration_week",
+                "true" if bool(expiry_context.get("expiration_week")) else "false",
+            ),
+            FeatureObservation(
+                "calendar",
+                "pre_expiry_window",
+                "true" if bool(expiry_context.get("pre_expiry_window")) else "false",
+            ),
+            FeatureObservation(
+                "calendar",
+                "expiry_day",
+                "true" if bool(expiry_context.get("expiry_day")) else "false",
+            ),
+            FeatureObservation(
+                "calendar",
+                "post_expiry_window",
+                "true" if bool(expiry_context.get("post_expiry_window")) else "false",
+            ),
+            FeatureObservation(
+                "calendar",
+                "days_to_quarterly_expiry_bucket",
+                FeatureRelevanceService._bucketize_days_to_expiry(expiry_context.get("days_to_event")),
+            ),
+            FeatureObservation(
+                "calendar",
+                "expiry_phase",
+                FeatureRelevanceService._stringify(expiry_context.get("phase"), fallback="none"),
+            ),
+            FeatureObservation(
                 "news",
                 "has_news",
                 "true" if int(news_context.get("article_count") or 0) > 0 else "false",
@@ -603,6 +994,171 @@ class StrategyContextAdaptationService:
                 "macro",
                 "primary_regime",
                 FeatureRelevanceService._stringify(active_regimes[0] if active_regimes else None, fallback="none"),
+            ),
+            FeatureObservation(
+                "price_action",
+                "primary_signal",
+                FeatureRelevanceService._stringify(
+                    price_action_context.get("primary_signal_code")
+                    if price_action_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "signal_bias",
+                FeatureRelevanceService._stringify(
+                    price_action_context.get("bias")
+                    if price_action_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "volume_state",
+                FeatureRelevanceService._stringify(
+                    price_action_context.get("volume_state")
+                    if price_action_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "close_location_state",
+                FeatureRelevanceService._stringify(
+                    price_action_context.get("close_location_state")
+                    if price_action_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "higher_timeframe_bias",
+                FeatureRelevanceService._stringify(
+                    price_action_context.get("higher_timeframe_bias")
+                    if price_action_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "price_action",
+                "follow_through_state",
+                FeatureRelevanceService._stringify(
+                    price_action_context.get("follow_through_state")
+                    if price_action_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "intermarket",
+                "airline_bias",
+                FeatureRelevanceService._stringify(
+                    intermarket_context.get("bias")
+                    if intermarket_context.get("applicable") and intermarket_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "intermarket",
+                "oil_pressure_state",
+                FeatureRelevanceService._stringify(
+                    intermarket_context.get("oil_pressure_state")
+                    if intermarket_context.get("applicable") and intermarket_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "intermarket",
+                "sector_strength_state",
+                FeatureRelevanceService._stringify(
+                    intermarket_context.get("sector_strength_state")
+                    if intermarket_context.get("applicable") and intermarket_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "intermarket",
+                "put_call_state",
+                FeatureRelevanceService._stringify(
+                    intermarket_context.get("put_call_state")
+                    if intermarket_context.get("applicable") and intermarket_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "mstr",
+                "context_available",
+                "true" if mstr_context.get("applicable") and mstr_context.get("available", True) else "false",
+            ),
+            FeatureObservation(
+                "mstr",
+                "mnav_bucket",
+                FeatureRelevanceService._stringify(
+                    mstr_context.get("mnav_bucket")
+                    if mstr_context.get("applicable") and mstr_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "mstr",
+                "atm_risk_context",
+                FeatureRelevanceService._stringify(
+                    mstr_context.get("atm_risk_context")
+                    if mstr_context.get("applicable") and mstr_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "mstr",
+                "recent_btc_purchase",
+                "true" if bool(mstr_context.get("recent_btc_purchase")) else "false",
+            ),
+            FeatureObservation(
+                "mstr",
+                "bps_trend",
+                FeatureRelevanceService._stringify(
+                    mstr_context.get("bps_trend")
+                    if mstr_context.get("applicable") and mstr_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "mstr",
+                "share_dilution_accelerating",
+                "true" if bool(mstr_context.get("share_dilution_accelerating")) else "false",
+            ),
+            FeatureObservation(
+                "mstr",
+                "btc_proxy_state",
+                FeatureRelevanceService._stringify(
+                    mstr_context.get("btc_proxy_state")
+                    if mstr_context.get("applicable") and mstr_context.get("available", True)
+                    else None,
+                    fallback="none",
+                ),
+            ),
+            FeatureObservation(
+                "skill",
+                "primary_skill",
+                FeatureRelevanceService._stringify(skill_context.get("primary_skill_code"), fallback="none"),
+            ),
+            FeatureObservation(
+                "skill",
+                "risk_skill_active",
+                "true" if bool(skill_context.get("risk_skill_active")) else "false",
             ),
             FeatureObservation("ai", "action", FeatureRelevanceService._stringify(ai_overlay.get("action"), fallback="none")),
         ]
@@ -650,5 +1206,15 @@ class StrategyContextAdaptationService:
             ("calendar", "near_macro_high_impact"),
             ("news", "has_news"),
             ("macro", "primary_regime"),
+            ("price_action", "primary_signal"),
+            ("price_action", "signal_bias"),
+            ("price_action", "volume_state"),
+            ("price_action", "close_location_state"),
+            ("intermarket", "airline_bias"),
+            ("intermarket", "oil_pressure_state"),
+            ("intermarket", "sector_strength_state"),
+            ("intermarket", "put_call_state"),
+            ("skill", "primary_skill"),
+            ("skill", "risk_skill_active"),
             ("ai", "action"),
         } or (stat.feature_scope == "combo" and stat.feature_key in ACTIONABLE_COMBO_KEYS)

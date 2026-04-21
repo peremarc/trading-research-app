@@ -12,7 +12,7 @@ class NearTermCalendarService:
             CalendarEvent(
                 event_type="earnings",
                 title=f"Earnings {ticker}",
-                event_date="2026-04-18",
+                event_date="2026-04-20",
                 ticker=ticker,
                 source="stub",
             )
@@ -51,6 +51,20 @@ class StubWebResearchService:
             text="AI demand remains strong and earnings expectations improved.",
             source="stub",
         )
+
+
+class OverviewMarketDataService:
+    def get_market_overview(self, ticker: str, *, sec_type: str = "STK") -> dict:
+        return {
+            "available": True,
+            "symbol": ticker.upper(),
+            "sec_type": sec_type,
+            "provider_source": "test_fixture",
+            "market_signals": {"available": True, "last_price": 100.5},
+            "options_sentiment": {"available": True, "put_call_ratio": 1.12},
+            "corporate_events": [],
+            "provider_error": None,
+        }
 
 
 def test_agent_can_build_trade_execution_plan() -> None:
@@ -146,6 +160,16 @@ def test_execute_plan_rejects_duplicate_expensive_steps(session) -> None:
 
     with pytest.raises(AgentToolError, match="repeats tool 'news.get_ticker_news'"):
         gateway.execute_plan(session, plan)
+
+
+def test_market_overview_tool_executes(session) -> None:
+    gateway = AgentToolGatewayService(market_data_service=OverviewMarketDataService())
+
+    result = gateway.execute(session, "market.get_overview", {"ticker": "NVDA"})
+
+    assert result["symbol"] == "NVDA"
+    assert result["provider_source"] == "test_fixture"
+    assert result["market_signals"]["last_price"] == 100.5
 
 
 def test_execute_plan_rejects_non_open_position_references(session) -> None:
@@ -440,11 +464,14 @@ def test_execute_plan_persists_web_research_and_multitimeframe_visual_into_entry
     assert results[-1]["tool_name"] == "positions.open"
     assert results[-1]["status"] == "completed"
     assert results[-1]["result"]["ticker"] == "NVDA"
+    assert all(isinstance(step["elapsed_ms"], (int, float)) for step in results)
 
     positions = gateway.position_service.list_positions(session)
     assert len(positions) == 1
     assert positions[0].entry_context["source"] == "planner_test"
     assert "positions.list_open" in positions[0].entry_context["research_execution"]["successful_tools"]
+    assert positions[0].entry_context["research_execution"]["total_elapsed_ms"] >= 0
+    assert positions[0].entry_context["research_execution"]["slowest_tool"] is not None
     assert positions[0].entry_context["web_research"]["search_results"][0]["title"].endswith("article")
     assert positions[0].entry_context["web_research"]["fetched_articles"][0]["title"] == "NVDA article"
     assert [item["timeframe"] for item in positions[0].entry_context["multitimeframe_visual"]["timeframes"]] == [

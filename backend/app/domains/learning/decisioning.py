@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
+from threading import Lock
+from time import perf_counter
 
 from sqlalchemy import false, or_, select
 from sqlalchemy.orm import Session
@@ -12,7 +16,14 @@ from app.db.models.strategy import StrategyVersion
 from app.domains.learning.macro import MacroContextService
 from app.domains.learning.protocol import build_regime_policy_context, infer_candidate_playbook
 from app.domains.learning.relevance import StrategyContextAdaptationService
-from app.domains.market.services import CalendarService, NewsService
+from app.domains.learning.skills import SkillLifecycleService, SkillRouterService
+from app.domains.market.services import (
+    CalendarService,
+    MSTRContextService,
+    MarketDataService,
+    MarketDataUnavailableError,
+    NewsService,
+)
 from app.providers.calendar import CalendarProviderError
 from app.providers.news import NewsProviderError
 
@@ -20,12 +31,17 @@ from app.providers.news import NewsProviderError
 class RiskBudgetService:
     SECTOR_HINTS = {
         "AAPL": "technology",
+        "AAL": "airlines",
         "AMD": "technology",
+        "ALK": "airlines",
         "AMZN": "consumer_discretionary",
         "AVGO": "technology",
         "CRM": "technology",
+        "DAL": "airlines",
         "DDOG": "technology",
         "GOOGL": "communication_services",
+        "JBLU": "airlines",
+        "JETS": "airlines",
         "MDB": "technology",
         "META": "communication_services",
         "MSFT": "technology",
@@ -36,12 +52,15 @@ class RiskBudgetService:
         "PLTR": "technology",
         "ROKU": "communication_services",
         "SHOP": "technology",
+        "SKYW": "airlines",
         "SNAP": "communication_services",
         "SNOW": "technology",
         "SQ": "financials",
         "TSLA": "consumer_discretionary",
+        "UAL": "airlines",
         "U": "technology",
         "UBER": "consumer_discretionary",
+        "LUV": "airlines",
     }
 
     def __init__(self, *, settings: Settings | None = None) -> None:
@@ -56,6 +75,7 @@ class RiskBudgetService:
         strategy_rules: dict,
         macro_fit: dict,
         calendar_context: dict,
+        mstr_context: dict | None = None,
         market_context: dict | None = None,
         signal_payload: dict | None = None,
     ) -> dict:
@@ -66,6 +86,7 @@ class RiskBudgetService:
             strategy_rules=strategy_rules,
             macro_fit=macro_fit,
             calendar_context=calendar_context,
+            mstr_context=mstr_context,
             market_context=market_context,
             signal_payload=signal_payload,
         )
@@ -179,6 +200,32 @@ class RiskBudgetService:
             advisories.append(
                 f"event-risk overlap already covers {len(event_risk_profiles)} open position(s)"
             )
+        mstr_context_payload = (
+            candidate_profile.get("mstr_context") if isinstance(candidate_profile.get("mstr_context"), dict) else {}
+        )
+        if mstr_context_payload.get("applicable"):
+            atm_risk = str(mstr_context_payload.get("atm_risk_context") or "").strip()
+            preference = str(mstr_context_payload.get("exposure_preference") or "").strip()
+            if atm_risk == "high":
+                advisories.append("MSTR carries elevated ATM/dilution risk; keep fresh size conservative")
+            elif atm_risk == "moderate":
+                advisories.append("MSTR is in the opportunistic ATM band; avoid treating valuation as benign")
+            if preference and preference != "neutral":
+                advisories.append(f"MSTR context preference: {preference}")
+        expiry_context = (
+            candidate_profile.get("expiry_context") if isinstance(candidate_profile.get("expiry_context"), dict) else {}
+        )
+        expiry_reason = str(expiry_context.get("reason") or "").strip()
+        if expiry_context.get("expiry_day"):
+            advisories.append("quarterly expiry day active; keep fresh risk very selective")
+        elif expiry_context.get("phase") == "tight_pre_expiry_window":
+            advisories.append("quarterly expiry is within T-1; tighten fresh-risk appetite")
+        elif expiry_context.get("pre_expiry_window"):
+            advisories.append("quarterly expiry window active; penalize marginal entries")
+        elif expiry_context.get("post_expiry_window"):
+            advisories.append("post-expiry cleanup window active; prefer re-evaluation over forcing entries")
+        if expiry_reason and expiry_reason not in advisories:
+            advisories.append(expiry_reason)
 
         return {
             "candidate_profile": candidate_profile,
@@ -221,6 +268,7 @@ class RiskBudgetService:
                 "candidate_sector_tag": candidate_profile["sector_tag"],
                 "candidate_regime_tags": candidate_profile["regime_tags"],
                 "candidate_event_risk_flags": candidate_profile["event_risk_flags"],
+                "candidate_context_risk_flags": candidate_profile.get("context_risk_flags", []),
                 "used_portfolio_risk_amount": used_portfolio_risk_amount,
                 "remaining_portfolio_risk_amount": remaining_portfolio_risk_amount,
                 "same_ticker_open_risk_amount": round(sum(item["open_risk_amount"] for item in same_ticker_profiles), 2),
@@ -237,6 +285,7 @@ class RiskBudgetService:
         strategy_rules: dict,
         macro_fit: dict,
         calendar_context: dict,
+        mstr_context: dict | None,
         market_context: dict,
         signal_payload: dict,
     ) -> dict:
@@ -251,17 +300,35 @@ class RiskBudgetService:
             for item in macro_fit.get("active_regimes", [])
             if isinstance(item, str) and item.strip()
         ]
+        expiry_context = (
+            calendar_context.get("expiry_context") if isinstance(calendar_context.get("expiry_context"), dict) else {}
+        )
         event_risk_flags: list[str] = []
         if isinstance(calendar_context.get("near_earnings_days"), int):
             event_risk_flags.append("near_earnings")
         if isinstance(calendar_context.get("near_macro_high_impact_days"), int):
             event_risk_flags.append("near_macro_high_impact")
+        if expiry_context.get("pre_expiry_window"):
+            event_risk_flags.append("quarterly_expiry_window")
+        if expiry_context.get("phase") == "tight_pre_expiry_window":
+            event_risk_flags.append("quarterly_expiry_tight_window")
+        if expiry_context.get("expiry_day"):
+            event_risk_flags.append("quarterly_expiry_day")
+        context_risk_flags: list[str] = []
+        if isinstance(mstr_context, dict) and mstr_context.get("applicable"):
+            if str(mstr_context.get("atm_risk_context") or "").strip() == "high":
+                context_risk_flags.append("mstr_atm_risk_high")
+            if bool(mstr_context.get("share_dilution_accelerating")):
+                context_risk_flags.append("mstr_dilution_accelerating")
 
         return {
             "ticker": ticker.upper(),
             "sector_tag": sector_tag,
             "regime_tags": active_regimes[:3],
             "event_risk_flags": event_risk_flags,
+            "context_risk_flags": context_risk_flags,
+            "expiry_context": dict(expiry_context),
+            "mstr_context": dict(mstr_context or {}),
             "execution_mode": self._coerce_string(market_context.get("execution_mode")) or "default",
         }
 
@@ -288,6 +355,11 @@ class RiskBudgetService:
             "event_risk_flags": [
                 item
                 for item in candidate_profile.get("event_risk_flags", [])
+                if isinstance(item, str) and item.strip()
+            ],
+            "context_risk_flags": [
+                item
+                for item in candidate_profile.get("context_risk_flags", [])
                 if isinstance(item, str) and item.strip()
             ],
             "open_risk_amount": round(risk_amount or 0.0, 2),
@@ -516,6 +588,7 @@ class PositionSizingService:
         reward_multiplier = self._reward_multiplier(risk_reward)
         exposure_multiplier = self._exposure_multiplier(portfolio)
         event_multiplier = self._event_multiplier(risk_budget)
+        specialized_context_multiplier = self._specialized_context_multiplier(risk_budget)
         regime_multiplier = self._coerce_non_negative_float(regime_policy.get("risk_multiplier"))
         if regime_multiplier is None:
             regime_multiplier = 1.0
@@ -526,6 +599,7 @@ class PositionSizingService:
             * reward_multiplier
             * exposure_multiplier
             * event_multiplier
+            * specialized_context_multiplier
             * regime_multiplier
         )
         adjusted_risk_amount = round(min(adjusted_risk_amount, remaining_portfolio_risk_amount), 2)
@@ -561,6 +635,8 @@ class PositionSizingService:
             reasons.append("size reduced by aggregate exposure overlap")
         if event_multiplier < 1.0:
             reasons.append("size reduced by near-event risk")
+        if specialized_context_multiplier < 1.0:
+            reasons.append("size reduced by specialized context risk")
         if regime_multiplier < 1.0:
             reasons.append("size reduced by regime policy")
         if stop_source == "atr_fallback":
@@ -582,6 +658,7 @@ class PositionSizingService:
             "reward_multiplier": round(reward_multiplier, 2),
             "exposure_multiplier": round(exposure_multiplier, 2),
             "event_multiplier": round(event_multiplier, 2),
+            "specialized_context_multiplier": round(specialized_context_multiplier, 2),
             "regime_multiplier": round(regime_multiplier, 2),
             "regime_policy_version": regime_policy.get("policy_version"),
             "portfolio_risk_after_trade": round(
@@ -658,7 +735,33 @@ class PositionSizingService:
     def _event_multiplier(risk_budget: dict) -> float:
         candidate_profile = risk_budget.get("candidate_profile") if isinstance(risk_budget.get("candidate_profile"), dict) else {}
         event_flags = candidate_profile.get("event_risk_flags") if isinstance(candidate_profile.get("event_risk_flags"), list) else []
+        expiry_context = (
+            candidate_profile.get("expiry_context") if isinstance(candidate_profile.get("expiry_context"), dict) else {}
+        )
+        if expiry_context.get("expiry_day"):
+            return 0.65
+        if expiry_context.get("phase") == "tight_pre_expiry_window":
+            return 0.72
+        if expiry_context.get("pre_expiry_window"):
+            return 0.82
         return 0.8 if event_flags else 1.0
+
+    @staticmethod
+    def _specialized_context_multiplier(risk_budget: dict) -> float:
+        candidate_profile = risk_budget.get("candidate_profile") if isinstance(risk_budget.get("candidate_profile"), dict) else {}
+        mstr_context = candidate_profile.get("mstr_context") if isinstance(candidate_profile.get("mstr_context"), dict) else {}
+        if not mstr_context or not mstr_context.get("applicable") or not mstr_context.get("available", True):
+            return 1.0
+
+        atm_risk_context = str(mstr_context.get("atm_risk_context") or "").strip()
+        btc_proxy_state = str(mstr_context.get("btc_proxy_state") or "").strip()
+        if atm_risk_context == "high" and btc_proxy_state == "weak":
+            return 0.68
+        if atm_risk_context == "high":
+            return 0.8
+        if atm_risk_context == "moderate":
+            return 0.9
+        return 1.0
 
     @staticmethod
     def _blocked_result(*, risk_budget: dict, summary: str, reasons: list[str] | None = None) -> dict:
@@ -718,6 +821,474 @@ class PositionSizingService:
         return None
 
 
+class IntermarketContextService:
+    AIRLINE_SECTOR_TAGS = {"airlines", "airline", "air_travel", "air_transport"}
+    OPTIONS_RANKING_BASIS = "volume"
+    OPTIONS_RANKING_LIMIT = 60
+    AIRLINE_TICKER_HINTS = {
+        "AAL",
+        "ALK",
+        "DAL",
+        "JBLU",
+        "JETS",
+        "LUV",
+        "SKYW",
+        "UAL",
+    }
+    AIRLINE_PROXY_SYMBOLS = {
+        "sector_etf": "JETS",
+        "benchmark": "SPY",
+        "oil_proxy": "USO",
+    }
+
+    def __init__(self, market_data_service: MarketDataService | None = None) -> None:
+        self.market_data_service = market_data_service or MarketDataService()
+
+    def build_context(
+        self,
+        *,
+        ticker: str,
+        strategy_rules: dict,
+        market_context: dict | None = None,
+        signal_payload: dict | None = None,
+        market_overview: dict | None = None,
+    ) -> dict:
+        market_context = dict(market_context or {})
+        signal_payload = dict(signal_payload or {})
+        sector_tag = self._resolve_sector_tag(
+            ticker=ticker,
+            strategy_rules=strategy_rules,
+            market_context=market_context,
+            signal_payload=signal_payload,
+        )
+        if sector_tag not in self.AIRLINE_SECTOR_TAGS:
+            return self._not_applicable_context(sector_tag=sector_tag)
+
+        try:
+            ticker_snapshot = self.market_data_service.get_snapshot(ticker)
+            sector_snapshot = self.market_data_service.get_snapshot(self.AIRLINE_PROXY_SYMBOLS["sector_etf"])
+            benchmark_snapshot = self.market_data_service.get_snapshot(self.AIRLINE_PROXY_SYMBOLS["benchmark"])
+            oil_snapshot = self.market_data_service.get_snapshot(self.AIRLINE_PROXY_SYMBOLS["oil_proxy"])
+            ticker_history = self.market_data_service.get_history(ticker, limit=25)
+            sector_history = self.market_data_service.get_history(self.AIRLINE_PROXY_SYMBOLS["sector_etf"], limit=25)
+        except (MarketDataUnavailableError, RuntimeError, ValueError) as exc:
+            return self._unavailable_context(sector_tag=sector_tag, provider_error=str(exc))
+
+        sector_rs = round(float(sector_snapshot.month_performance) - float(benchmark_snapshot.month_performance), 4)
+        ticker_vs_sector = round(float(ticker_snapshot.month_performance) - float(sector_snapshot.month_performance), 4)
+        oil_proxy_change = round(float(oil_snapshot.month_performance), 4)
+        ticker_close_location = round(self._close_location(ticker_history), 2)
+        sector_close_location = round(self._close_location(sector_history), 2)
+
+        sector_strength_state = self._strength_state(sector_rs)
+        oil_pressure_state = self._oil_pressure_state(oil_proxy_change)
+        ticker_vs_sector_state = self._relative_state(ticker_vs_sector)
+        ticker_close_state = self._close_state(ticker_close_location)
+        sector_close_state = self._close_state(sector_close_location)
+        options_sentiment = self._build_options_sentiment(ticker, market_overview=market_overview)
+        put_call_state = str(options_sentiment.get("put_call_state") or "unavailable").strip()
+
+        supportive_signals: list[str] = []
+        risk_flags: list[str] = []
+        score = 0.5
+
+        if sector_strength_state == "strong":
+            score += 0.18
+            supportive_signals.append("sector_outperforming_spy")
+        elif sector_strength_state == "weak":
+            score -= 0.18
+            risk_flags.append("sector_underperforming_spy")
+
+        if oil_pressure_state == "tailwind":
+            score += 0.16
+            supportive_signals.append("oil_proxy_easing")
+        elif oil_pressure_state == "headwind":
+            score -= 0.16
+            risk_flags.append("oil_proxy_rising")
+
+        if ticker_vs_sector_state == "leading":
+            score += 0.08
+            supportive_signals.append("ticker_leading_sector")
+        elif ticker_vs_sector_state == "lagging":
+            score -= 0.08
+            risk_flags.append("ticker_lagging_sector")
+
+        if ticker_close_state == "strong_close":
+            score += 0.05
+            supportive_signals.append("ticker_closed_near_range_high")
+        elif ticker_close_state == "weak_close":
+            score -= 0.05
+            risk_flags.append("ticker_closed_near_range_low")
+
+        if sector_close_state == "strong_close":
+            score += 0.04
+            supportive_signals.append("sector_closed_near_range_high")
+        elif sector_close_state == "weak_close":
+            score -= 0.04
+            risk_flags.append("sector_closed_near_range_low")
+
+        if put_call_state == "fearful":
+            score += 0.06
+            supportive_signals.append("options_put_call_fear")
+        elif put_call_state == "complacent":
+            score -= 0.06
+            risk_flags.append("options_put_call_complacency")
+
+        bias = "mixed"
+        if score >= 0.66:
+            bias = "supportive"
+        elif score <= 0.34:
+            bias = "headwind"
+
+        evidence_points = self._dedupe(
+            [
+                f"JETS vs SPY 20d={round(sector_rs * 100, 2)}%",
+                f"{ticker.upper()} vs JETS 20d={round(ticker_vs_sector * 100, 2)}%",
+                f"USO 20d={round(oil_proxy_change * 100, 2)}%",
+                f"{ticker.upper()} close_location_20d={round(ticker_close_location * 100, 1)}%",
+                f"JETS close_location_20d={round(sector_close_location * 100, 1)}%",
+            ]
+            + self._build_options_evidence(ticker=ticker, options_sentiment=options_sentiment)
+            + supportive_signals
+            + risk_flags
+        )
+
+        return {
+            "applicable": True,
+            "available": True,
+            "theme": "airline_sector_intermarket",
+            "sector_tag": sector_tag,
+            "proxy_symbols": dict(self.AIRLINE_PROXY_SYMBOLS),
+            "score": round(max(min(score, 1.0), 0.0), 2),
+            "bias": bias,
+            "sector_relative_strength_20d": sector_rs,
+            "ticker_relative_strength_vs_sector_20d": ticker_vs_sector,
+            "oil_proxy_month_performance": oil_proxy_change,
+            "ticker_month_performance": round(float(ticker_snapshot.month_performance), 4),
+            "sector_month_performance": round(float(sector_snapshot.month_performance), 4),
+            "benchmark_month_performance": round(float(benchmark_snapshot.month_performance), 4),
+            "ticker_close_location_20d": ticker_close_location,
+            "sector_close_location_20d": sector_close_location,
+            "sector_strength_state": sector_strength_state,
+            "oil_pressure_state": oil_pressure_state,
+            "ticker_vs_sector_state": ticker_vs_sector_state,
+            "ticker_close_state": ticker_close_state,
+            "sector_close_state": sector_close_state,
+            "options_sentiment": options_sentiment,
+            "put_call_state": put_call_state,
+            "put_call_ratio": options_sentiment.get("put_call_ratio"),
+            "put_call_ratio_source": options_sentiment.get("ratio_source"),
+            "option_implied_vol_pct": options_sentiment.get("option_implied_vol_pct"),
+            "supportive_signals": supportive_signals,
+            "risk_flags": risk_flags,
+            "evidence_points": evidence_points,
+            "summary": self._build_summary(
+                ticker=ticker,
+                bias=bias,
+                sector_strength_state=sector_strength_state,
+                oil_pressure_state=oil_pressure_state,
+                ticker_vs_sector_state=ticker_vs_sector_state,
+                put_call_state=put_call_state,
+            ),
+            "provider_error": None,
+        }
+
+    @classmethod
+    def _resolve_sector_tag(
+        cls,
+        *,
+        ticker: str,
+        strategy_rules: dict,
+        market_context: dict,
+        signal_payload: dict,
+    ) -> str:
+        explicit = str(
+            market_context.get("sector_tag")
+            or signal_payload.get("sector_tag")
+            or strategy_rules.get("sector_tag")
+            or ""
+        ).strip().lower()
+        if explicit:
+            return explicit
+        if ticker.upper() in cls.AIRLINE_TICKER_HINTS:
+            return "airlines"
+        return "unknown"
+
+    @classmethod
+    def _not_applicable_context(cls, *, sector_tag: str) -> dict:
+        return {
+            "applicable": False,
+            "available": False,
+            "theme": "not_applicable",
+            "sector_tag": sector_tag,
+            "score": 0.5,
+            "bias": "neutral",
+            "options_sentiment": cls._default_options_sentiment(),
+            "put_call_state": "none",
+            "put_call_ratio": None,
+            "put_call_ratio_source": None,
+            "option_implied_vol_pct": None,
+            "supportive_signals": [],
+            "risk_flags": [],
+            "evidence_points": [],
+            "summary": "No sector-specific intermarket model applied.",
+            "provider_error": None,
+        }
+
+    @classmethod
+    def _unavailable_context(cls, *, sector_tag: str, provider_error: str) -> dict:
+        return {
+            "applicable": True,
+            "available": False,
+            "theme": "airline_sector_intermarket",
+            "sector_tag": sector_tag,
+            "proxy_symbols": dict(cls.AIRLINE_PROXY_SYMBOLS),
+            "score": 0.5,
+            "bias": "neutral",
+            "options_sentiment": cls._default_options_sentiment(provider_error=provider_error),
+            "put_call_state": "unavailable",
+            "put_call_ratio": None,
+            "put_call_ratio_source": None,
+            "option_implied_vol_pct": None,
+            "supportive_signals": [],
+            "risk_flags": [],
+            "evidence_points": [],
+            "summary": "Airline intermarket context is applicable, but the proxy data is unavailable.",
+            "provider_error": provider_error,
+        }
+
+    def _build_options_sentiment(self, ticker: str, *, market_overview: dict | None = None) -> dict:
+        payload = self._default_options_sentiment()
+        upstream = self._load_options_sentiment_from_overview(ticker=ticker, market_overview=market_overview)
+        if upstream is None:
+            get_options_sentiment = getattr(self.market_data_service, "get_options_sentiment", None)
+            if not callable(get_options_sentiment):
+                payload["provider_error"] = "Options sentiment is not supported by the current market data service."
+                return payload
+
+            try:
+                upstream = dict(get_options_sentiment(ticker, sec_type="STK") or {})
+            except (MarketDataUnavailableError, RuntimeError, ValueError) as exc:
+                payload["provider_error"] = str(exc)
+                return payload
+
+        payload["available"] = bool(upstream.get("available", True))
+        payload["option_implied_vol_pct"] = self._coerce_non_negative_float(upstream.get("option_implied_vol_pct"))
+        payload["fallback_reason"] = str(upstream.get("fallback_reason") or "").strip() or None
+        payload["provider_error"] = str(upstream.get("provider_error") or "").strip() or None
+
+        put_call_ratio = self._coerce_non_negative_float(upstream.get("put_call_ratio"))
+        ratio_source = str(upstream.get("put_call_ratio_source") or "snapshot").strip() or "snapshot"
+        if put_call_ratio is None:
+            put_call_ratio = self._coerce_non_negative_float(upstream.get("put_call_volume_ratio"))
+            if put_call_ratio is not None:
+                ratio_source = "snapshot_volume_ratio"
+
+        if put_call_ratio is not None:
+            payload["ratio_available"] = True
+            payload["put_call_ratio"] = round(put_call_ratio, 4)
+            payload["put_call_state"] = self._classify_put_call_state(put_call_ratio)
+            payload["ratio_source"] = ratio_source
+            return payload
+
+        if payload["available"] and not payload["provider_error"]:
+            ranking_hit = self._lookup_put_call_ranking_hit(ticker)
+            if ranking_hit is not None:
+                payload["ratio_available"] = True
+                payload["put_call_ratio"] = ranking_hit.get("put_call_ratio")
+                payload["put_call_state"] = str(ranking_hit.get("put_call_state") or "unavailable")
+                payload["ratio_source"] = str(ranking_hit.get("ratio_source") or "")
+                payload["ranking_rank"] = ranking_hit.get("ranking_rank")
+                payload["ranking_basis"] = ranking_hit.get("ranking_basis")
+                return payload
+
+        return payload
+
+    def _lookup_put_call_ranking_hit(self, ticker: str) -> dict | None:
+        get_rankings = getattr(self.market_data_service, "get_options_sentiment_rankings", None)
+        if not callable(get_rankings):
+            return None
+
+        normalized_ticker = ticker.strip().upper()
+        for direction, state in (("high", "fearful"), ("low", "complacent")):
+            try:
+                rankings = dict(
+                    get_rankings(
+                        basis=self.OPTIONS_RANKING_BASIS,
+                        direction=direction,
+                        instrument="STK",
+                        location=None,
+                        limit=self.OPTIONS_RANKING_LIMIT,
+                    )
+                    or {}
+                )
+            except (MarketDataUnavailableError, RuntimeError, ValueError):
+                continue
+            if not rankings.get("available"):
+                continue
+            contracts = rankings.get("contracts") if isinstance(rankings.get("contracts"), list) else []
+            for contract in contracts:
+                if not isinstance(contract, dict):
+                    continue
+                if str(contract.get("symbol") or "").strip().upper() != normalized_ticker:
+                    continue
+                return {
+                    "put_call_ratio": self._coerce_non_negative_float(contract.get("ratio")),
+                    "put_call_state": state,
+                    "ratio_source": f"{self.OPTIONS_RANKING_BASIS}_ranking_{direction}",
+                    "ranking_rank": contract.get("rank"),
+                    "ranking_basis": self.OPTIONS_RANKING_BASIS,
+                }
+        return None
+
+    def _load_options_sentiment_from_overview(self, *, ticker: str, market_overview: dict | None = None) -> dict | None:
+        overview = dict(market_overview or {})
+        if not overview:
+            get_market_overview = getattr(self.market_data_service, "get_market_overview", None)
+            if not callable(get_market_overview):
+                return None
+            try:
+                overview = dict(get_market_overview(ticker, sec_type="STK") or {})
+            except (MarketDataUnavailableError, RuntimeError, ValueError):
+                return None
+
+        options_sentiment = overview.get("options_sentiment")
+        if not isinstance(options_sentiment, dict):
+            return None
+        if not options_sentiment:
+            return None
+        return dict(options_sentiment)
+
+    @staticmethod
+    def _default_options_sentiment(provider_error: str | None = None) -> dict:
+        return {
+            "available": False,
+            "ratio_available": False,
+            "put_call_ratio": None,
+            "put_call_state": "unavailable",
+            "ratio_source": None,
+            "option_implied_vol_pct": None,
+            "fallback_reason": None,
+            "ranking_rank": None,
+            "ranking_basis": None,
+            "provider_error": provider_error,
+        }
+
+    @staticmethod
+    def _classify_put_call_state(put_call_ratio: float) -> str:
+        if put_call_ratio >= 1.2:
+            return "fearful"
+        if put_call_ratio <= 0.6:
+            return "complacent"
+        return "neutral"
+
+    @staticmethod
+    def _build_options_evidence(*, ticker: str, options_sentiment: dict) -> list[str]:
+        evidence: list[str] = []
+        put_call_ratio = options_sentiment.get("put_call_ratio")
+        if isinstance(put_call_ratio, (int, float)):
+            source = str(options_sentiment.get("ratio_source") or "snapshot").strip() or "snapshot"
+            evidence.append(f"{ticker.upper()} put_call_ratio={round(float(put_call_ratio), 2)} via {source}")
+        if isinstance(options_sentiment.get("option_implied_vol_pct"), (int, float)):
+            evidence.append(
+                f"{ticker.upper()} option_iv={round(float(options_sentiment['option_implied_vol_pct']), 1)}%"
+            )
+        if not evidence:
+            fallback_reason = str(options_sentiment.get("fallback_reason") or "").strip()
+            if fallback_reason:
+                evidence.append(f"{ticker.upper()} options fallback active")
+        return evidence
+
+    @staticmethod
+    def _coerce_non_negative_float(value: object) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)) and float(value) >= 0:
+            return float(value)
+        if isinstance(value, str):
+            try:
+                parsed = float(value.strip())
+            except ValueError:
+                return None
+            return parsed if parsed >= 0 else None
+        return None
+
+    @staticmethod
+    def _close_location(candles: list) -> float:
+        if not candles:
+            return 0.5
+        lows = [float(candle.low) for candle in candles[-20:]]
+        highs = [float(candle.high) for candle in candles[-20:]]
+        last_close = float(candles[-1].close)
+        low = min(lows)
+        high = max(highs)
+        price_range = max(high - low, 0.01)
+        return max(min((last_close - low) / price_range, 1.0), 0.0)
+
+    @staticmethod
+    def _strength_state(relative_strength: float) -> str:
+        if relative_strength >= 0.03:
+            return "strong"
+        if relative_strength <= -0.03:
+            return "weak"
+        return "neutral"
+
+    @staticmethod
+    def _oil_pressure_state(oil_proxy_change: float) -> str:
+        if oil_proxy_change >= 0.04:
+            return "headwind"
+        if oil_proxy_change <= -0.04:
+            return "tailwind"
+        return "neutral"
+
+    @staticmethod
+    def _relative_state(relative_strength: float) -> str:
+        if relative_strength >= 0.02:
+            return "leading"
+        if relative_strength <= -0.02:
+            return "lagging"
+        return "in_line"
+
+    @staticmethod
+    def _close_state(close_location: float) -> str:
+        if close_location >= 0.7:
+            return "strong_close"
+        if close_location <= 0.3:
+            return "weak_close"
+        return "mid_range"
+
+    @staticmethod
+    def _build_summary(
+        *,
+        ticker: str,
+        bias: str,
+        sector_strength_state: str,
+        oil_pressure_state: str,
+        ticker_vs_sector_state: str,
+        put_call_state: str,
+    ) -> str:
+        return (
+            f"Airline intermarket context for {ticker.upper()} is {bias}: "
+            f"sector_strength={sector_strength_state}, oil_pressure={oil_pressure_state}, "
+            f"ticker_vs_sector={ticker_vs_sector_state}, put_call_state={put_call_state}."
+        )
+
+    @staticmethod
+    def _dedupe(values: list[str]) -> list[str]:
+        results: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = str(value).strip()
+            if not text:
+                continue
+            marker = text.lower()
+            if marker in seen:
+                continue
+            seen.add(marker)
+            results.append(text)
+        return results
+
+
 class DecisionContextAssemblerService:
     def __init__(
         self,
@@ -727,8 +1298,13 @@ class DecisionContextAssemblerService:
         strategy_context_adaptation_service: StrategyContextAdaptationService | None = None,
         news_service: NewsService | None = None,
         calendar_service: CalendarService | None = None,
+        market_data_service: MarketDataService | None = None,
         risk_budget_service: RiskBudgetService | None = None,
         regime_policy_service: RegimePolicyService | None = None,
+        intermarket_context_service: IntermarketContextService | None = None,
+        mstr_context_service: MSTRContextService | None = None,
+        skill_router_service: SkillRouterService | None = None,
+        skill_lifecycle_service: SkillLifecycleService | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.macro_context_service = macro_context_service or MacroContextService()
@@ -737,8 +1313,22 @@ class DecisionContextAssemblerService:
         )
         self.news_service = news_service or NewsService()
         self.calendar_service = calendar_service or CalendarService()
+        self.market_data_service = market_data_service or MarketDataService()
         self.risk_budget_service = risk_budget_service or RiskBudgetService(settings=self.settings)
         self.regime_policy_service = regime_policy_service or RegimePolicyService()
+        self.intermarket_context_service = intermarket_context_service or IntermarketContextService(
+            market_data_service=self.market_data_service
+        )
+        self.mstr_context_service = mstr_context_service or MSTRContextService(
+            settings=self.settings,
+            market_data_service=self.market_data_service,
+        )
+        self.skill_router_service = skill_router_service or SkillRouterService()
+        self.skill_lifecycle_service = skill_lifecycle_service or SkillLifecycleService()
+        self.io_parallelism_enabled = bool(self.settings.decision_context_io_parallelism_enabled)
+        self.io_max_workers = max(int(self.settings.decision_context_io_max_workers), 1)
+        self._io_executor: ThreadPoolExecutor | None = None
+        self._io_executor_lock = Lock()
 
     def build_trade_candidate_context(
         self,
@@ -750,34 +1340,84 @@ class DecisionContextAssemblerService:
         signal_payload: dict,
         market_context: dict | None = None,
     ) -> dict:
+        started_at = perf_counter()
+        timings: dict[str, float] = {}
+
+        def record_timing(stage: str, stage_started_at: float) -> None:
+            timings[stage] = round((perf_counter() - stage_started_at) * 1000, 2)
+
         version = session.get(StrategyVersion, strategy_version_id) if strategy_version_id is not None else None
+        stage_started_at = perf_counter()
         strategy_rules = self._build_strategy_rules(version)
+        record_timing("strategy_rules", stage_started_at)
+
+        stage_started_at = perf_counter()
         macro_context = self.macro_context_service.get_context(session, limit=6).model_dump(mode="json")
-        calendar_context = self._build_calendar_context(ticker=ticker)
-        news_context = self._build_news_context(ticker=ticker)
-        learned_rule_signal_payload = {
-            **signal_payload,
-            "decision_context": {
-                "calendar_context": calendar_context,
-                "news_context": news_context,
-                "macro_context": macro_context,
-            },
-        }
-        learned_rule_guard = self.strategy_context_adaptation_service.evaluate_entry(
-            session,
-            strategy_version_id=strategy_version_id,
-            signal_payload=learned_rule_signal_payload,
+        record_timing("macro_context", stage_started_at)
+
+        initial_io_results, initial_io_timings = self._run_io_tasks(
+            {
+                "market_overview": lambda: self._load_market_overview(ticker=ticker),
+                "news_context": lambda: self._build_news_context(ticker=ticker),
+                "mstr_context": lambda: self.mstr_context_service.build_context(
+                    ticker=ticker,
+                    market_context=dict(market_context or {}),
+                    signal_payload=signal_payload,
+                ),
+            }
         )
-        supporting_rules = self.strategy_context_adaptation_service.list_supporting_rules(
-            session,
-            strategy_version_id=strategy_version_id,
-            signal_payload=learned_rule_signal_payload,
+        market_overview = dict(initial_io_results.get("market_overview") or {})
+        news_context = dict(initial_io_results.get("news_context") or {})
+        mstr_context = dict(initial_io_results.get("mstr_context") or {})
+        timings.update(initial_io_timings)
+
+        price_action_context = (
+            dict(signal_payload.get("price_action_context") or {})
+            if isinstance(signal_payload.get("price_action_context"), dict)
+            else {}
         )
+        secondary_io_results, secondary_io_timings = self._run_io_tasks(
+            {
+                "corporate_calendar_context": lambda: self._build_corporate_calendar_context(
+                    ticker=ticker,
+                    market_overview=market_overview,
+                ),
+                "macro_calendar_context": self._build_macro_calendar_context,
+                "intermarket_context": lambda: self.intermarket_context_service.build_context(
+                    ticker=ticker,
+                    strategy_rules=strategy_rules,
+                    market_context=dict(market_context or {}),
+                    signal_payload=signal_payload,
+                    market_overview=market_overview,
+                ),
+            }
+        )
+        intermarket_context = dict(secondary_io_results.get("intermarket_context") or {})
+        corporate_calendar_context = dict(secondary_io_results.get("corporate_calendar_context") or {})
+        macro_calendar_context = dict(secondary_io_results.get("macro_calendar_context") or {})
+        timings["intermarket_context"] = secondary_io_timings.get("intermarket_context", 0.0)
+        timings["corporate_calendar_context"] = secondary_io_timings.get("corporate_calendar_context", 0.0)
+        timings["macro_calendar_context"] = secondary_io_timings.get("macro_calendar_context", 0.0)
+        timings["calendar_context"] = round(
+            max(
+                secondary_io_timings.get("corporate_calendar_context", 0.0),
+                secondary_io_timings.get("macro_calendar_context", 0.0),
+            ),
+            2,
+        )
+        calendar_context = self._compose_calendar_context(
+            corporate_context=corporate_calendar_context,
+            macro_context=macro_calendar_context,
+        )
+        stage_started_at = perf_counter()
         macro_fit = self._build_macro_fit(
             ticker=ticker,
             macro_context=macro_context,
             strategy_rules=strategy_rules,
         )
+        record_timing("macro_fit", stage_started_at)
+
+        stage_started_at = perf_counter()
         risk_budget = self.risk_budget_service.build_trade_candidate_budget(
             session,
             ticker=ticker,
@@ -785,16 +1425,78 @@ class DecisionContextAssemblerService:
             strategy_rules=strategy_rules,
             macro_fit=macro_fit,
             calendar_context=calendar_context,
+            mstr_context=mstr_context,
             market_context=market_context,
             signal_payload=signal_payload,
         )
+        record_timing("risk_budget", stage_started_at)
+
+        stage_started_at = perf_counter()
         regime_policy = self.regime_policy_service.evaluate_trade_candidate_policy(
             signal_payload=signal_payload,
             market_context=dict(market_context or {}),
             portfolio=dict(risk_budget.get("portfolio") or {}),
             risk_budget=risk_budget,
         )
+        record_timing("regime_policy", stage_started_at)
         risk_budget["regime_policy"] = regime_policy
+
+        stage_started_at = perf_counter()
+        skill_context = self.skill_router_service.route_trade_candidate(
+            ticker=ticker,
+            signal_payload=signal_payload,
+            strategy_rules=strategy_rules,
+            market_context=dict(market_context or {}),
+            macro_context=macro_context,
+            calendar_context=calendar_context,
+            news_context=news_context,
+            price_action_context=price_action_context,
+            intermarket_context=intermarket_context,
+            mstr_context=mstr_context,
+            regime_policy=regime_policy,
+            risk_budget=risk_budget,
+        )
+        skill_context = self.skill_lifecycle_service.attach_runtime_state(session, skill_context)
+        record_timing("skill_routing", stage_started_at)
+
+        learned_rule_signal_payload = {
+            **signal_payload,
+            "decision_context": {
+                "calendar_context": calendar_context,
+                "news_context": news_context,
+                "macro_context": macro_context,
+                "price_action_context": price_action_context,
+                "intermarket_context": intermarket_context,
+                "mstr_context": mstr_context,
+                "skill_context": skill_context,
+            },
+        }
+        stage_started_at = perf_counter()
+        learned_rule_guard = self.strategy_context_adaptation_service.evaluate_entry(
+            session,
+            strategy_version_id=strategy_version_id,
+            signal_payload=learned_rule_signal_payload,
+        )
+        record_timing("learned_rule_guard", stage_started_at)
+
+        stage_started_at = perf_counter()
+        supporting_rules = self.strategy_context_adaptation_service.list_supporting_rules(
+            session,
+            strategy_version_id=strategy_version_id,
+            signal_payload=learned_rule_signal_payload,
+        )
+        record_timing("supporting_rules", stage_started_at)
+
+        stage_started_at = perf_counter()
+        matched_rules = self._list_active_strategy_rules(
+            session,
+            strategy_id=strategy_id,
+            strategy_version_id=strategy_version_id,
+        )
+        record_timing("matched_strategy_rules", stage_started_at)
+
+        total_ms = round((perf_counter() - started_at) * 1000, 2)
+        slowest_stage = max(timings.items(), key=lambda item: item[1]) if timings else None
 
         return {
             "ticker": ticker.upper(),
@@ -805,18 +1507,70 @@ class DecisionContextAssemblerService:
             "macro_context": macro_context,
             "calendar_context": calendar_context,
             "news_context": news_context,
+            "price_action_context": price_action_context,
+            "intermarket_context": intermarket_context,
+            "mstr_context": mstr_context,
+            "skill_context": skill_context,
             "macro_fit": macro_fit,
             "portfolio": dict(risk_budget.get("portfolio") or {}),
             "risk_budget": risk_budget,
             "regime_policy": regime_policy,
             "learned_rule_guard": learned_rule_guard,
             "supporting_context_rules": supporting_rules,
-            "matched_strategy_context_rules": self._list_active_strategy_rules(
-                session,
-                strategy_id=strategy_id,
-                strategy_version_id=strategy_version_id,
-            ),
+            "matched_strategy_context_rules": matched_rules,
+            "timing_profile": {
+                "version": "decision_context_timing_v1",
+                "io_parallelism_enabled": self.io_parallelism_enabled and self.io_max_workers > 1,
+                "io_max_workers": self.io_max_workers,
+                "total_ms": total_ms,
+                "stages_ms": timings,
+                "slowest_stage": slowest_stage[0] if slowest_stage is not None else None,
+                "slowest_stage_ms": slowest_stage[1] if slowest_stage is not None else None,
+            },
         }
+
+    def _get_io_executor(self) -> ThreadPoolExecutor | None:
+        if not self.io_parallelism_enabled or self.io_max_workers <= 1:
+            return None
+        with self._io_executor_lock:
+            if self._io_executor is None:
+                self._io_executor = ThreadPoolExecutor(
+                    max_workers=self.io_max_workers,
+                    thread_name_prefix="decision-context-io",
+                )
+            return self._io_executor
+
+    def _run_io_tasks(self, tasks: dict[str, Callable[[], object]]) -> tuple[dict[str, object], dict[str, float]]:
+        if not tasks:
+            return {}, {}
+
+        executor = self._get_io_executor()
+        if executor is None or len(tasks) == 1:
+            results: dict[str, object] = {}
+            timings: dict[str, float] = {}
+            for stage, task in tasks.items():
+                stage_started_at = perf_counter()
+                results[stage] = task()
+                timings[stage] = round((perf_counter() - stage_started_at) * 1000, 2)
+            return results, timings
+
+        futures = {
+            executor.submit(self._timed_io_task, stage=stage, task=task): stage
+            for stage, task in tasks.items()
+        }
+        results: dict[str, object] = {}
+        timings: dict[str, float] = {}
+        for future in futures:
+            stage, result, elapsed_ms = future.result()
+            results[stage] = result
+            timings[stage] = elapsed_ms
+        return results, timings
+
+    @staticmethod
+    def _timed_io_task(*, stage: str, task: Callable[[], object]) -> tuple[str, object, float]:
+        started_at = perf_counter()
+        result = task()
+        return stage, result, round((perf_counter() - started_at) * 1000, 2)
 
     @staticmethod
     def _build_strategy_rules(version: StrategyVersion | None) -> dict:
@@ -927,34 +1681,169 @@ class DecisionContextAssemblerService:
             ),
         }
 
-    def _build_calendar_context(self, *, ticker: str) -> dict:
+    def _build_corporate_calendar_context(self, *, ticker: str, market_overview: dict | None = None) -> dict:
         calendar_error: str | None = None
-        try:
-            corporate_events = [
-                event.__dict__ for event in self.calendar_service.list_ticker_events(ticker, days_ahead=14)
-            ]
-        except CalendarProviderError as exc:
-            corporate_events = []
-            calendar_error = str(exc)
+        corporate_events = self._extract_corporate_events_from_overview(
+            market_overview=market_overview,
+            ticker=ticker,
+            days_ahead=14,
+        )
+        if not corporate_events:
+            try:
+                corporate_events = [
+                    event.__dict__ for event in self.calendar_service.list_ticker_events(ticker, days_ahead=14)
+                ]
+            except CalendarProviderError as exc:
+                corporate_events = []
+                calendar_error = str(exc)
 
+        return {
+            "corporate_events": corporate_events[:5],
+            "corporate_event_count": len(corporate_events),
+            "near_earnings_days": self._nearest_event_days(corporate_events, event_types={"earnings"}),
+            "provider_error": calendar_error,
+        }
+
+    def _build_macro_calendar_context(self) -> dict:
+        calendar_error: str | None = None
         try:
             macro_events = [event.__dict__ for event in self.calendar_service.list_macro_events(days_ahead=7)]
         except CalendarProviderError as exc:
             macro_events = []
-            calendar_error = calendar_error or str(exc)
-
-        near_earnings_days = self._nearest_event_days(corporate_events)
-        near_macro_high_impact_days = self._nearest_high_impact_macro_days(macro_events)
-
+            calendar_error = str(exc)
+        expiry_context = self._build_expiry_context()
         return {
-            "corporate_events": corporate_events[:5],
             "macro_events": macro_events[:5],
-            "corporate_event_count": len(corporate_events),
             "macro_event_count": len(macro_events),
-            "near_earnings_days": near_earnings_days,
-            "near_macro_high_impact_days": near_macro_high_impact_days,
+            "near_macro_high_impact_days": self._nearest_high_impact_macro_days(macro_events),
+            "quarterly_expiry_date": expiry_context.get("quarterly_expiry_date"),
+            "days_to_quarterly_expiry": expiry_context.get("days_to_event"),
+            "expiration_week": bool(expiry_context.get("expiration_week")),
+            "pre_expiry_window": bool(expiry_context.get("pre_expiry_window")),
+            "expiry_day": bool(expiry_context.get("expiry_day")),
+            "post_expiry_window": bool(expiry_context.get("post_expiry_window")),
+            "expiry_context": expiry_context,
             "provider_error": calendar_error,
         }
+
+    @classmethod
+    def _compose_calendar_context(cls, *, corporate_context: dict, macro_context: dict) -> dict:
+        corporate_payload = dict(corporate_context or {})
+        macro_payload = dict(macro_context or {})
+        return {
+            "corporate_events": list(corporate_payload.get("corporate_events") or []),
+            "macro_events": list(macro_payload.get("macro_events") or []),
+            "corporate_event_count": int(corporate_payload.get("corporate_event_count") or 0),
+            "macro_event_count": int(macro_payload.get("macro_event_count") or 0),
+            "near_earnings_days": corporate_payload.get("near_earnings_days"),
+            "near_macro_high_impact_days": macro_payload.get("near_macro_high_impact_days"),
+            "quarterly_expiry_date": macro_payload.get("quarterly_expiry_date"),
+            "days_to_quarterly_expiry": macro_payload.get("days_to_quarterly_expiry"),
+            "expiration_week": bool(macro_payload.get("expiration_week")),
+            "pre_expiry_window": bool(macro_payload.get("pre_expiry_window")),
+            "expiry_day": bool(macro_payload.get("expiry_day")),
+            "post_expiry_window": bool(macro_payload.get("post_expiry_window")),
+            "expiry_context": dict(macro_payload.get("expiry_context") or {}),
+            "provider_error": cls._merge_provider_errors(
+                corporate_payload.get("provider_error"),
+                macro_payload.get("provider_error"),
+            ),
+        }
+
+    @staticmethod
+    def _merge_provider_errors(*errors: object) -> str | None:
+        cleaned = [
+            str(error).strip()
+            for error in errors
+            if isinstance(error, str) and str(error).strip()
+        ]
+        if not cleaned:
+            return None
+        if len(cleaned) == 1:
+            return cleaned[0]
+        return "; ".join(cleaned)
+
+    def _build_expiry_context(self) -> dict:
+        get_expiry_context = getattr(self.calendar_service, "get_quarterly_expiry_context", None)
+        if not callable(get_expiry_context):
+            return {
+                "available": False,
+                "source": "unavailable",
+                "quarterly_expiry_date": None,
+                "days_to_event": None,
+                "expiration_week": False,
+                "pre_expiry_window": False,
+                "expiry_day": False,
+                "post_expiry_window": False,
+                "phase": "unavailable",
+                "risk_penalty": 0.0,
+                "reason": "Quarterly expiry context is unavailable from the active calendar service.",
+            }
+        try:
+            payload = dict(get_expiry_context() or {})
+        except Exception as exc:
+            return {
+                "available": False,
+                "source": "error",
+                "quarterly_expiry_date": None,
+                "days_to_event": None,
+                "expiration_week": False,
+                "pre_expiry_window": False,
+                "expiry_day": False,
+                "post_expiry_window": False,
+                "phase": "error",
+                "risk_penalty": 0.0,
+                "reason": f"Quarterly expiry context failed: {exc}",
+            }
+        payload.setdefault("available", True)
+        payload.setdefault("source", "internal")
+        payload.setdefault("quarterly_expiry_date", None)
+        payload.setdefault("days_to_event", None)
+        payload.setdefault("expiration_week", False)
+        payload.setdefault("pre_expiry_window", False)
+        payload.setdefault("expiry_day", False)
+        payload.setdefault("post_expiry_window", False)
+        payload.setdefault("phase", "normal")
+        payload.setdefault("risk_penalty", 0.0)
+        payload.setdefault("reason", "No quarterly expiry context available.")
+        return payload
+
+    def _load_market_overview(self, *, ticker: str) -> dict:
+        get_market_overview = getattr(self.market_data_service, "get_market_overview", None)
+        if not callable(get_market_overview):
+            return {}
+        try:
+            return dict(get_market_overview(ticker, sec_type="STK") or {})
+        except (MarketDataUnavailableError, RuntimeError, ValueError):
+            return {}
+
+    @classmethod
+    def _extract_corporate_events_from_overview(
+        cls,
+        *,
+        market_overview: dict | None,
+        ticker: str,
+        days_ahead: int,
+    ) -> list[dict]:
+        overview = dict(market_overview or {})
+        events = overview.get("corporate_events")
+        if not isinstance(events, list):
+            return []
+
+        today = date.today()
+        cutoff = today + timedelta(days=max(int(days_ahead), 1))
+        filtered: list[dict] = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_ticker = str(event.get("ticker") or ticker).strip().upper()
+            if event_ticker and event_ticker != ticker.upper():
+                continue
+            event_date = cls._parse_event_date(event.get("event_date"))
+            if event_date is None or event_date < today or event_date > cutoff:
+                continue
+            filtered.append(dict(event))
+        return filtered
 
     def _build_news_context(self, *, ticker: str) -> dict:
         news_error: str | None = None
@@ -1039,10 +1928,14 @@ class DecisionContextAssemblerService:
         }
 
     @staticmethod
-    def _nearest_event_days(events: list[dict]) -> int | None:
+    def _nearest_event_days(events: list[dict], event_types: set[str] | None = None) -> int | None:
         today = date.today()
         deltas: list[int] = []
         for event in events:
+            if event_types is not None:
+                event_type = str(event.get("event_type") or "").strip().lower()
+                if event_type not in event_types:
+                    continue
             event_date = DecisionContextAssemblerService._parse_event_date(event.get("event_date"))
             if event_date is None:
                 continue
@@ -1179,6 +2072,12 @@ class DecisionContextAssemblerService:
 class EntryScoringService:
     ENTER_THRESHOLD = 0.72
     WATCH_THRESHOLD = 0.55
+    REVERSAL_PRICE_ACTION_SIGNALS = {
+        "failed_breakdown_reversal",
+        "support_reclaim_confirmation",
+        "rejection_wick_at_support",
+        "high_relative_volume_reversal",
+    }
 
     def evaluate(self, *, signal_payload: dict, decision_context: dict) -> dict:
         quant = signal_payload.get("quant_summary") if isinstance(signal_payload.get("quant_summary"), dict) else {}
@@ -1191,6 +2090,21 @@ class EntryScoringService:
             decision_context.get("calendar_context") if isinstance(decision_context.get("calendar_context"), dict) else {}
         )
         news_context = decision_context.get("news_context") if isinstance(decision_context.get("news_context"), dict) else {}
+        price_action_context = (
+            decision_context.get("price_action_context")
+            if isinstance(decision_context.get("price_action_context"), dict)
+            else {}
+        )
+        intermarket_context = (
+            decision_context.get("intermarket_context")
+            if isinstance(decision_context.get("intermarket_context"), dict)
+            else {}
+        )
+        mstr_context = (
+            decision_context.get("mstr_context")
+            if isinstance(decision_context.get("mstr_context"), dict)
+            else {}
+        )
         portfolio = decision_context.get("portfolio") if isinstance(decision_context.get("portfolio"), dict) else {}
         risk_budget = decision_context.get("risk_budget") if isinstance(decision_context.get("risk_budget"), dict) else {}
         regime_policy = decision_context.get("regime_policy") if isinstance(decision_context.get("regime_policy"), dict) else {}
@@ -1225,8 +2139,21 @@ class EntryScoringService:
         calendar_score, calendar_advisories = self._score_calendar_fit(
             strategy_rules=strategy_rules,
             calendar_context=calendar_context,
+            signal_payload=signal_payload,
         )
         news_score, news_advisories = self._score_news_fit(news_context)
+        price_action_bonus, price_action_advisories, price_action_guard_reasons = self._score_price_action_confirmation(
+            price_action_context=price_action_context,
+            quant=quant,
+            calendar_context=calendar_context,
+            regime_policy=regime_policy,
+        )
+        intermarket_score, intermarket_guard_reasons, intermarket_advisories = self._score_intermarket_fit(
+            intermarket_context=intermarket_context,
+        )
+        mstr_score, mstr_guard_reasons, mstr_advisories = self._score_mstr_fit(
+            mstr_context=mstr_context,
+        )
         portfolio_fit_score, portfolio_guard_reasons, portfolio_advisories = self._score_portfolio_fit(
             strategy_rules=strategy_rules,
             portfolio=portfolio,
@@ -1238,20 +2165,25 @@ class EntryScoringService:
         learned_rule_bonus, supporting_rule_advisories = self._score_supporting_rules(supporting_rules)
 
         raw_score = (
-            (technical_score * 0.34)
-            + (visual_score * 0.15)
+            (technical_score * 0.30)
+            + (visual_score * 0.13)
             + (strategy_fit_score * 0.11)
-            + (macro_fit_score * 0.07)
+            + (macro_fit_score * 0.06)
+            + (intermarket_score * 0.05)
+            + (mstr_score * 0.05)
             + (regime_policy_score * 0.07)
             + (calendar_score * 0.06)
-            + (news_score * 0.05)
-            + (portfolio_fit_score * 0.07)
-            + (risk_budget_score * 0.08)
+            + (news_score * 0.04)
+            + (portfolio_fit_score * 0.06)
+            + (risk_budget_score * 0.07)
         )
-        final_score = self._clamp(raw_score + learned_rule_bonus - learned_rule_penalty)
+        final_score = self._clamp(raw_score + learned_rule_bonus - learned_rule_penalty + price_action_bonus)
         guard_reasons = (
             strategy_guard_reasons
             + macro_guard_reasons
+            + price_action_guard_reasons
+            + intermarket_guard_reasons
+            + mstr_guard_reasons
             + regime_policy_guard_reasons
             + portfolio_guard_reasons
             + risk_budget_guard_reasons
@@ -1260,6 +2192,9 @@ class EntryScoringService:
         guard_types = (
             (["strategy_rule"] * len(strategy_guard_reasons))
             + (["macro_conflict"] * len(macro_guard_reasons))
+            + (["price_action_conflict"] * len(price_action_guard_reasons))
+            + (["intermarket_conflict"] * len(intermarket_guard_reasons))
+            + (["mstr_context_conflict"] * len(mstr_guard_reasons))
             + (["regime_policy"] * len(regime_policy_guard_reasons))
             + (["portfolio_limit"] * len(portfolio_guard_reasons))
             + (["risk_budget"] * len(risk_budget_guard_reasons))
@@ -1275,7 +2210,16 @@ class EntryScoringService:
         elif final_score >= self.WATCH_THRESHOLD:
             recommended_action = "watch"
 
-        advisories = strategy_advisories + macro_advisories + regime_policy_advisories + portfolio_advisories + risk_budget_advisories
+        advisories = (
+            strategy_advisories
+            + macro_advisories
+            + price_action_advisories
+            + intermarket_advisories
+            + mstr_advisories
+            + regime_policy_advisories
+            + portfolio_advisories
+            + risk_budget_advisories
+        )
         advisories += calendar_advisories + news_advisories + supporting_rule_advisories
         summary_parts = [
             f"entry_score={round(final_score, 2)}",
@@ -1283,6 +2227,9 @@ class EntryScoringService:
             f"visual={round(visual_score, 2)}",
             f"strategy_fit={round(strategy_fit_score, 2)}",
             f"macro_fit={round(macro_fit_score, 2)}",
+            f"price_action_bonus={round(price_action_bonus, 2)}",
+            f"intermarket_fit={round(intermarket_score, 2)}",
+            f"mstr_fit={round(mstr_score, 2)}",
             f"regime_policy={round(regime_policy_score, 2)}",
             f"calendar_fit={round(calendar_score, 2)}",
             f"news_fit={round(news_score, 2)}",
@@ -1306,6 +2253,9 @@ class EntryScoringService:
                 "visual_score": round(visual_score, 2),
                 "strategy_fit_score": round(strategy_fit_score, 2),
                 "macro_fit_score": round(macro_fit_score, 2),
+                "price_action_bonus": round(price_action_bonus, 2),
+                "intermarket_score": round(intermarket_score, 2),
+                "mstr_score": round(mstr_score, 2),
                 "regime_policy_score": round(regime_policy_score, 2),
                 "calendar_score": round(calendar_score, 2),
                 "news_score": round(news_score, 2),
@@ -1449,11 +2399,18 @@ class EntryScoringService:
         return EntryScoringService._clamp(score), guard_reasons, advisories
 
     @staticmethod
-    def _score_calendar_fit(*, strategy_rules: dict, calendar_context: dict) -> tuple[float, list[str]]:
+    def _score_calendar_fit(*, strategy_rules: dict, calendar_context: dict, signal_payload: dict) -> tuple[float, list[str]]:
         score = 0.7
         advisories: list[str] = []
         near_earnings_days = calendar_context.get("near_earnings_days")
         near_macro_days = calendar_context.get("near_macro_high_impact_days")
+        expiry_context = (
+            calendar_context.get("expiry_context") if isinstance(calendar_context.get("expiry_context"), dict) else {}
+        )
+        quant = signal_payload.get("quant_summary") if isinstance(signal_payload.get("quant_summary"), dict) else {}
+        visual = signal_payload.get("visual_summary") if isinstance(signal_payload.get("visual_summary"), dict) else {}
+        setup = str(quant.get("setup") or visual.get("setup_type") or "").strip().lower()
+        breakout_sensitive = "breakout" in setup
 
         if isinstance(near_earnings_days, int):
             if near_earnings_days <= 1:
@@ -1473,6 +2430,37 @@ class EntryScoringService:
             elif near_macro_days <= 3:
                 score = min(score, 0.45)
                 advisories.append(f"high-impact macro event is near ({near_macro_days} days away)")
+
+        if expiry_context.get("available"):
+            days_to_expiry = expiry_context.get("days_to_event")
+            phase = str(expiry_context.get("phase") or "").strip().lower()
+            reason = str(expiry_context.get("reason") or "").strip()
+            if expiry_context.get("expiry_day"):
+                score = min(score, 0.32 if breakout_sensitive else 0.38)
+                advisories.append("quarterly derivatives expiry is active today; do not treat the session as directional")
+            elif phase == "tight_pre_expiry_window":
+                score = min(score, 0.4 if breakout_sensitive else 0.46)
+                advisories.append(
+                    f"quarterly derivatives expiry is very close ({days_to_expiry} day away); keep new entries selective"
+                )
+            elif expiry_context.get("pre_expiry_window"):
+                score = min(score, 0.5 if breakout_sensitive else 0.56)
+                advisories.append(
+                    f"quarterly derivatives expiry is near ({days_to_expiry} days away); penalize marginal setups"
+                )
+            elif expiry_context.get("expiration_week"):
+                score = min(score, 0.62)
+                advisories.append("expiration week is active; short-term execution noise can rise")
+            elif expiry_context.get("post_expiry_window"):
+                advisories.append("post-expiry cleanup window active; re-evaluate once roll noise clears")
+            if breakout_sensitive and (
+                expiry_context.get("expiry_day")
+                or phase == "tight_pre_expiry_window"
+                or expiry_context.get("pre_expiry_window")
+            ):
+                advisories.append("breakout-style entries are more vulnerable to expiry-week noise")
+            if reason and phase in {"expiry_day", "tight_pre_expiry_window", "pre_expiry_window"}:
+                advisories.append(reason)
 
         avoid_near_earnings = strategy_rules.get("avoid_near_earnings_days")
         if isinstance(avoid_near_earnings, int) and isinstance(near_earnings_days, int) and near_earnings_days <= avoid_near_earnings:
@@ -1509,6 +2497,154 @@ class EntryScoringService:
             score = min(score + 0.04, 1.0) if positive_hits >= negative_hits else max(score - 0.04, 0.0)
 
         return EntryScoringService._clamp(score), advisories
+
+    @staticmethod
+    def _score_price_action_confirmation(
+        *,
+        price_action_context: dict,
+        quant: dict,
+        calendar_context: dict,
+        regime_policy: dict,
+    ) -> tuple[float, list[str], list[str]]:
+        if not price_action_context or price_action_context.get("available") is False:
+            return 0.0, [], []
+
+        confirmation_bonus = EntryScoringService._clamp(price_action_context.get("confirmation_bonus", 0.0))
+        primary_signal_code = str(price_action_context.get("primary_signal_code") or "").strip()
+        signal_count = int(price_action_context.get("signal_count") or 0)
+        summary = str(price_action_context.get("summary") or "").strip()
+        if confirmation_bonus <= 0 or not primary_signal_code:
+            return 0.0, [], []
+
+        advisories: list[str] = []
+        guard_reasons: list[str] = []
+        is_reversal_signal = primary_signal_code in EntryScoringService.REVERSAL_PRICE_ACTION_SIGNALS
+        higher_timeframe_bias = str(price_action_context.get("higher_timeframe_bias") or "neutral").strip()
+        follow_through_state = str(price_action_context.get("follow_through_state") or "none").strip()
+        near_earnings_days = calendar_context.get("near_earnings_days")
+        regime_label = str(regime_policy.get("regime_label") or "").strip()
+        trend = str(quant.get("trend") or "").strip()
+
+        if is_reversal_signal and trend == "downtrend":
+            guard_reasons.append("reversal proxy fired against a clear daily downtrend")
+            return 0.0, advisories, guard_reasons
+
+        if is_reversal_signal and higher_timeframe_bias == "hostile":
+            guard_reasons.append("reversal proxy fired while higher timeframe bias remains hostile")
+            return 0.0, advisories, guard_reasons
+
+        if is_reversal_signal and isinstance(near_earnings_days, int) and near_earnings_days <= 3:
+            advisories.append(f"reversal proxy ignored because earnings are imminent ({near_earnings_days} day(s))")
+            return 0.0, advisories, guard_reasons
+
+        if is_reversal_signal and regime_label == "high_volatility_risk_off":
+            advisories.append("reversal proxy ignored in high_volatility_risk_off regime")
+            return 0.0, advisories, guard_reasons
+
+        adjusted_bonus = confirmation_bonus
+        if is_reversal_signal and follow_through_state == "at_risk":
+            adjusted_bonus = min(adjusted_bonus, 0.01)
+            advisories.append("reversal proxy fired but follow-through risk remains elevated")
+        elif is_reversal_signal and follow_through_state == "uncertain":
+            adjusted_bonus = min(adjusted_bonus, 0.03)
+            advisories.append("reversal proxy fired but follow-through confirmation is still limited")
+
+        advisory = summary or f"daily price action proxy confirms entry timing via {primary_signal_code}"
+        if signal_count > 1:
+            advisory = f"{advisory} ({signal_count} proxies active)"
+        advisories.insert(0, advisory)
+        return round(adjusted_bonus, 2), advisories, guard_reasons
+
+    @staticmethod
+    def _score_intermarket_fit(intermarket_context: dict) -> tuple[float, list[str], list[str]]:
+        if not intermarket_context or not intermarket_context.get("applicable"):
+            return 0.5, [], []
+        if intermarket_context.get("available") is False:
+            provider_error = str(intermarket_context.get("provider_error") or "").strip()
+            advisory = "intermarket proxy data is unavailable"
+            if provider_error:
+                advisory += f": {provider_error}"
+            return 0.5, [], [advisory]
+
+        score = EntryScoringService._clamp(intermarket_context.get("score", 0.5))
+        bias = str(intermarket_context.get("bias") or "mixed").strip()
+        guard_reasons: list[str] = []
+        advisories: list[str] = []
+        summary = str(intermarket_context.get("summary") or "").strip()
+        risk_flags = [
+            str(item)
+            for item in intermarket_context.get("risk_flags", [])
+            if isinstance(item, str) and str(item).strip()
+        ]
+        supportive_signals = [
+            str(item)
+            for item in intermarket_context.get("supportive_signals", [])
+            if isinstance(item, str) and str(item).strip()
+        ]
+
+        if score <= 0.25 or (bias == "headwind" and {"oil_proxy_rising", "sector_underperforming_spy"} <= set(risk_flags)):
+            guard_reasons.append(summary or "sector-specific intermarket context is strongly hostile")
+        elif bias == "headwind":
+            advisories.append(summary or "sector-specific intermarket context remains hostile")
+        elif bias == "supportive":
+            advisories.append(summary or "sector-specific intermarket context is supportive")
+
+        if supportive_signals and bias != "supportive":
+            advisories.append("intermarket support exists but is not yet decisive: " + ", ".join(supportive_signals[:3]))
+        if risk_flags and bias != "headwind":
+            advisories.append("intermarket risks remain active: " + ", ".join(risk_flags[:3]))
+
+        return score, guard_reasons, advisories
+
+    @staticmethod
+    def _score_mstr_fit(mstr_context: dict) -> tuple[float, list[str], list[str]]:
+        if not mstr_context or not mstr_context.get("applicable"):
+            return 0.5, [], []
+        if mstr_context.get("available") is False:
+            provider_error = str(mstr_context.get("provider_error") or "").strip()
+            advisory = "MSTR-specific Strategy metrics are unavailable"
+            if provider_error:
+                advisory += f": {provider_error}"
+            return 0.5, [], [advisory]
+
+        score = EntryScoringService._clamp(mstr_context.get("score", 0.5))
+        bias = str(mstr_context.get("bias") or "mixed").strip()
+        atm_risk_context = str(mstr_context.get("atm_risk_context") or "unavailable").strip()
+        btc_proxy_state = str(mstr_context.get("btc_proxy_state") or "unavailable").strip()
+        summary = str(mstr_context.get("summary") or "").strip()
+        risk_flags = [
+            str(item)
+            for item in mstr_context.get("risk_flags", [])
+            if isinstance(item, str) and str(item).strip()
+        ]
+        guard_reasons: list[str] = []
+        advisories: list[str] = []
+
+        if atm_risk_context == "high" and btc_proxy_state == "weak":
+            guard_reasons.append(
+                summary or "BTC proxy is weak while MSTR carries elevated ATM/dilution risk"
+            )
+        elif score <= 0.22 and bias == "headwind":
+            guard_reasons.append(summary or "MSTR-specific context is strongly hostile")
+        elif atm_risk_context == "high":
+            advisories.append("MSTR context implies elevated ATM/dilution risk; reduce confidence or size")
+        elif atm_risk_context == "moderate":
+            advisories.append("MSTR is in the opportunistic ATM band; treat upside capture more selectively")
+        elif bias == "supportive":
+            advisories.append(summary or "MSTR-specific context is supportive")
+
+        if bool(mstr_context.get("recent_btc_purchase")):
+            advisories.append("recent BTC purchase disclosure supports the treasury accumulation thesis")
+        if bool(mstr_context.get("recent_capital_raise")):
+            advisories.append("recent share-count expansion suggests active capital-markets activity")
+        if bool(mstr_context.get("share_dilution_accelerating")):
+            advisories.append("share dilution is outpacing BTC accumulation at the moment")
+        if bool(mstr_context.get("stale")):
+            advisories.append("Strategy metrics context is stale; use it as a weaker overlay")
+        if risk_flags and not guard_reasons:
+            advisories.append("MSTR-specific risks: " + ", ".join(risk_flags[:3]))
+
+        return score, guard_reasons, advisories
 
     @staticmethod
     def _score_portfolio_fit(*, strategy_rules: dict, portfolio: dict) -> tuple[float, list[str], list[str]]:

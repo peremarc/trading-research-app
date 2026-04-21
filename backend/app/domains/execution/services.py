@@ -3,11 +3,15 @@ from sqlalchemy.orm import Session
 
 from app.db.models.position import Position
 from app.domains.learning.agent import AIDecisionError, AutonomousTradingAgentService
+from app.domains.learning.claims import KnowledgeClaimService
+from app.domains.learning.skills import SkillGapService, SkillLifecycleService, SkillPromotionService, SkillRouterService
+from app.domains.market.analysis import PriceActionProxyService
 from app.domains.learning.schemas import JournalEntryCreate, MemoryItemCreate
 from app.domains.learning.services import JournalService, MemoryService
 from app.domains.learning.tools import AgentToolGatewayService
-from app.domains.market.services import MarketDataService
+from app.domains.market.services import CalendarService, MSTRContextService, MarketDataService
 from app.domains.system.events import EventLogService
+from app.domains.system.market_hours import USMarketHoursService
 from app.domains.execution.repositories import PositionRepository, TradeReviewRepository
 from app.domains.execution.schemas import (
     AutoExitBatchResult,
@@ -125,15 +129,24 @@ class ExitManagementService:
     def __init__(
         self,
         market_data_service: MarketDataService | None = None,
+        calendar_service: CalendarService | None = None,
         position_service: PositionService | None = None,
         trading_agent_service: AutonomousTradingAgentService | None = None,
         agent_tool_gateway_service: AgentToolGatewayService | None = None,
+        skill_router_service: SkillRouterService | None = None,
+        skill_lifecycle_service: SkillLifecycleService | None = None,
         execution_event_source: str = "orchestrator_do",
     ) -> None:
         self.market_data_service = market_data_service or MarketDataService()
+        self.calendar_service = calendar_service or CalendarService()
         self.position_service = position_service or PositionService()
         self.trading_agent_service = trading_agent_service or AutonomousTradingAgentService()
         self.execution_event_source = execution_event_source
+        self.market_hours_service = USMarketHoursService()
+        self.price_action_service = PriceActionProxyService()
+        self.mstr_context_service = MSTRContextService(market_data_service=self.market_data_service)
+        self.skill_router_service = skill_router_service or SkillRouterService()
+        self.skill_lifecycle_service = skill_lifecycle_service or SkillLifecycleService()
         self.agent_tool_gateway_service = agent_tool_gateway_service or AgentToolGatewayService(
             market_data_service=self.market_data_service,
             position_service=self.position_service,
@@ -246,19 +259,28 @@ class ExitManagementService:
             agent_decision = None
             agent_plan = None
             agent_error: str | None = None
-            try:
-                agent_decision = self.trading_agent_service.advise_open_position_management(
-                    session,
-                    position=position,
-                    market_snapshot=market_snapshot_payload,
-                )
-                agent_plan = self.trading_agent_service.plan_open_position_management_execution(
-                    position=position,
-                    market_snapshot=market_snapshot_payload,
-                    decision=agent_decision,
-                )
-            except AIDecisionError as exc:
-                agent_error = str(exc)
+            market_session = self.market_hours_service.get_session_state()
+            agent_settings = getattr(self.trading_agent_service, "settings", None)
+            ai_market_closed_enabled = bool(getattr(agent_settings, "ai_market_closed_enabled", False))
+            ai_management_allowed = (
+                realtime_quote is not None
+                or market_session.is_regular_session_open
+                or ai_market_closed_enabled
+            )
+            if ai_management_allowed:
+                try:
+                    agent_decision = self.trading_agent_service.advise_open_position_management(
+                        session,
+                        position=position,
+                        market_snapshot=market_snapshot_payload,
+                    )
+                    agent_plan = self.trading_agent_service.plan_open_position_management_execution(
+                        position=position,
+                        market_snapshot=market_snapshot_payload,
+                        decision=agent_decision,
+                    )
+                except AIDecisionError as exc:
+                    agent_error = str(exc)
             if agent_plan is not None and agent_plan.should_execute and any(
                 step.tool_name == "positions.close" for step in agent_plan.steps
             ):
@@ -298,10 +320,14 @@ class ExitManagementService:
                 continue
 
             management_update = self._build_management_update(
+                session,
                 position,
                 snapshot.price,
                 snapshot.atr_14,
                 snapshot.sma_20,
+                price_action_context=self._build_price_action_context(position.ticker, snapshot),
+                expiry_context=self._build_expiry_context(),
+                mstr_context=self._build_mstr_context(position.ticker),
                 agent_action=agent_decision.action if agent_decision is not None else None,
                 agent_rationale=agent_decision.thesis if agent_decision is not None else None,
                 agent_risks=agent_decision.risks if agent_decision is not None else None,
@@ -515,13 +541,17 @@ class ExitManagementService:
             "monitor_event": realtime_quote,
         }
 
-    @staticmethod
     def _build_management_update(
+        self,
+        session: Session,
         position: Position,
         market_price: float,
         atr_14: float,
         sma_20: float,
         *,
+        price_action_context: dict | None = None,
+        expiry_context: dict | None = None,
+        mstr_context: dict | None = None,
         agent_action: str | None = None,
         agent_rationale: str | None = None,
         agent_risks: list[str] | None = None,
@@ -585,7 +615,23 @@ class ExitManagementService:
             "ai_action": agent_action,
             "ai_risks": agent_risks or [],
             "ai_error": ai_error,
+            "expiry_context": dict(expiry_context or {}),
+            "price_action_context": dict(price_action_context or {}),
+            "mstr_context": dict(mstr_context or {}),
         }
+        management_context["skill_context"] = self.skill_router_service.route_position_management(
+            position=position,
+            market_price=market_price,
+            expiry_context=dict(expiry_context or {}),
+            price_action_context=dict(price_action_context or {}),
+            mstr_context=dict(mstr_context or {}),
+            ai_action=agent_action,
+            ai_error=ai_error,
+        )
+        management_context["skill_context"] = self.skill_lifecycle_service.attach_runtime_state(
+            session,
+            management_context["skill_context"],
+        )
         if realtime_quote is not None:
             management_context["monitor_event"] = realtime_quote
 
@@ -599,6 +645,69 @@ class ExitManagementService:
             "note": note,
         }
 
+    def _build_price_action_context(self, ticker: str, snapshot) -> dict:
+        get_history = getattr(self.market_data_service, "get_history", None)
+        if not callable(get_history):
+            return {
+                "available": False,
+                "timeframe": "1D",
+                "method": "ohlcv_price_action_proxies_v1",
+                "summary": "Daily price action proxy unavailable during management update.",
+            }
+
+        try:
+            candles = get_history(ticker, limit=30)
+        except Exception as exc:
+            return {
+                "available": False,
+                "timeframe": "1D",
+                "method": "ohlcv_price_action_proxies_v1",
+                "summary": f"Daily price action proxy unavailable during management update: {exc}",
+            }
+
+        return self.price_action_service.analyze(
+            candles=candles,
+            relative_volume=getattr(snapshot, "relative_volume", None),
+            atr_14=getattr(snapshot, "atr_14", None),
+        )
+
+    def _build_expiry_context(self) -> dict:
+        get_expiry_context = getattr(self.calendar_service, "get_quarterly_expiry_context", None)
+        if not callable(get_expiry_context):
+            return {
+                "available": False,
+                "source": "unavailable",
+                "phase": "unavailable",
+                "reason": "Quarterly expiry context is unavailable during management update.",
+            }
+        try:
+            payload = dict(get_expiry_context() or {})
+        except Exception as exc:
+            return {
+                "available": False,
+                "source": "error",
+                "phase": "error",
+                "reason": f"Quarterly expiry context failed during management update: {exc}",
+            }
+        payload.setdefault("available", True)
+        payload.setdefault("source", "internal")
+        payload.setdefault("phase", "normal")
+        payload.setdefault("reason", "No quarterly expiry context available.")
+        return payload
+
+    def _build_mstr_context(self, ticker: str) -> dict:
+        try:
+            return self.mstr_context_service.build_context(ticker=ticker)
+        except Exception as exc:
+            return {
+                "applicable": ticker.strip().upper() == "MSTR",
+                "available": False,
+                "theme": "strategy_company_mstr_context",
+                "ticker": ticker.strip().upper(),
+                "summary": f"MSTR context unavailable during management update: {exc}",
+                "provider_error": str(exc),
+            }
+
 
 class TradeReviewService:
     def __init__(
@@ -608,12 +717,20 @@ class TradeReviewService:
         memory_service: MemoryService | None = None,
         strategy_evolution_service: StrategyEvolutionService | None = None,
         event_log_service: EventLogService | None = None,
+        skill_router_service: SkillRouterService | None = None,
+        skill_promotion_service: SkillPromotionService | None = None,
+        skill_gap_service: SkillGapService | None = None,
+        knowledge_claim_service: KnowledgeClaimService | None = None,
     ) -> None:
         self.repository = repository or TradeReviewRepository()
         self.journal_service = journal_service or JournalService()
         self.memory_service = memory_service or MemoryService()
         self.strategy_evolution_service = strategy_evolution_service or StrategyEvolutionService()
         self.event_log_service = event_log_service or EventLogService()
+        self.skill_router_service = skill_router_service or SkillRouterService()
+        self.skill_promotion_service = skill_promotion_service or SkillPromotionService()
+        self.skill_gap_service = skill_gap_service or SkillGapService()
+        self.knowledge_claim_service = knowledge_claim_service or KnowledgeClaimService()
 
     def create_review(self, session: Session, position_id: int, payload: TradeReviewCreate):
         review = self.repository.create(session, position_id, payload)
@@ -636,6 +753,43 @@ class TradeReviewService:
             },
         )
 
+        entry_context = dict(position.entry_context or {}) if isinstance(position.entry_context, dict) else {}
+        review_skill_context = self.skill_router_service.route_trade_review(
+            position=position,
+            review=review,
+            entry_context=entry_context,
+        )
+        skill_candidate = self.skill_promotion_service.build_candidate_from_trade_review(
+            position=position,
+            review=review,
+            review_skill_context=review_skill_context,
+            entry_context=entry_context,
+        )
+        skill_gaps = self.skill_gap_service.build_trade_review_gaps(
+            position=position,
+            review=review,
+            review_skill_context=review_skill_context,
+            entry_context=entry_context,
+            skill_candidate=skill_candidate,
+        )
+        knowledge_claim = self.knowledge_claim_service.record_trade_review_claim(
+            session,
+            position=position,
+            review=review,
+            skill_candidate=skill_candidate,
+        )
+        claim_summary = (
+            {
+                "id": knowledge_claim.id,
+                "scope": knowledge_claim.scope,
+                "key": knowledge_claim.key,
+                "status": knowledge_claim.status,
+                "claim_type": knowledge_claim.claim_type,
+            }
+            if knowledge_claim is not None
+            else None
+        )
+
         self.journal_service.create_entry(
             session,
             JournalEntryCreate(
@@ -650,6 +804,10 @@ class TradeReviewService:
                     "failure_mode": review.failure_mode,
                     "pnl_pct": position.pnl_pct,
                     "max_drawdown_pct": position.max_drawdown_pct,
+                    "skill_context": review_skill_context,
+                    "skill_candidate": skill_candidate,
+                    "skill_gaps": skill_gaps,
+                    "knowledge_claim": claim_summary,
                 },
                 reasoning=review.root_cause,
                 outcome=position.exit_reason,
@@ -671,10 +829,74 @@ class TradeReviewService:
                     "should_modify_strategy": review.should_modify_strategy,
                     "proposed_strategy_change": review.proposed_strategy_change,
                     "recommended_changes": review.recommended_changes,
+                    "skill_context": review_skill_context,
+                    "skill_candidate": skill_candidate,
+                    "skill_gaps": skill_gaps,
+                    "knowledge_claim": claim_summary,
                 },
                 importance=0.8 if review.outcome_label.lower() == "loss" else 0.6,
             ),
         )
+        if skill_candidate is not None:
+            self.memory_service.create_item(
+                session,
+                MemoryItemCreate(
+                    memory_type="skill_candidate",
+                    scope=f"strategy:{position.strategy_version_id or 'unknown'}",
+                    key=f"skill_candidate:{position.id}:{review.id}",
+                    content=str(skill_candidate.get("summary") or "Promote reviewed lesson into a candidate procedural skill."),
+                    meta=skill_candidate,
+                    importance=0.75,
+                ),
+            )
+            self.journal_service.create_entry(
+                session,
+                JournalEntryCreate(
+                    entry_type="skill_candidate_proposed",
+                    ticker=position.ticker,
+                    strategy_version_id=position.strategy_version_id,
+                    position_id=position.id,
+                    observations={
+                        "trade_review_id": review.id,
+                        "skill_context": review_skill_context,
+                        "skill_candidate": skill_candidate,
+                        "knowledge_claim": claim_summary,
+                    },
+                    reasoning=review.root_cause,
+                    decision="promote_to_candidate_skill",
+                    lessons=str(skill_candidate.get("summary") or ""),
+                ),
+            )
+        for gap in skill_gaps:
+            self.memory_service.create_item(
+                session,
+                MemoryItemCreate(
+                    memory_type="skill_gap",
+                    scope=str(gap.get("scope") or f"strategy:{position.strategy_version_id or 'unknown'}"),
+                    key=str(gap.get("key") or f"skill_gap:{position.id}:{review.id}"),
+                    content=str(gap.get("summary") or "Detected procedural gap."),
+                    meta=gap,
+                    importance=float(gap.get("importance") or 0.7),
+                ),
+            )
+            self.journal_service.create_entry(
+                session,
+                JournalEntryCreate(
+                    entry_type="skill_gap_detected",
+                    ticker=position.ticker,
+                    strategy_version_id=position.strategy_version_id,
+                    position_id=position.id,
+                    observations={
+                        "trade_review_id": review.id,
+                        "skill_gap": gap,
+                        "skill_context": review_skill_context,
+                        "skill_candidate": skill_candidate,
+                    },
+                    reasoning=review.root_cause,
+                    decision="record_skill_gap",
+                    lessons=str(gap.get("summary") or ""),
+                ),
+            )
         if review.needs_strategy_update and review.strategy_version_id is not None:
             self.strategy_evolution_service.evolve_from_trade_review(session, review)
         return review

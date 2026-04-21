@@ -13,9 +13,18 @@ os.environ["SCHEDULER_ENABLED"] = "false"
 os.environ["SCHEDULER_RUN_ON_STARTUP"] = "false"
 os.environ["SCHEDULER_MODE"] = "continuous"
 os.environ["SCHEDULER_CONTINUOUS_IDLE_SECONDS"] = "5"
+os.environ["SCHEDULER_MARKET_CLOSED_IDLE_SECONDS"] = "1800"
 os.environ["MARKET_DATA_PROVIDER"] = "stub"
+os.environ["IBKR_PROXY_BASE_URL"] = ""
+os.environ["ALPHA_VANTAGE_API_KEY"] = ""
 os.environ["TWELVE_DATA_API_KEY"] = ""
+os.environ["FINNHUB_API_KEY"] = ""
+os.environ["FRED_API_KEY"] = ""
+os.environ["MACRO_INDICATORS_ENABLED"] = "false"
+os.environ["ORCHESTRATOR_SCAN_WHEN_MARKET_CLOSED"] = "true"
+os.environ["OPPORTUNITY_DISCOVERY_RUN_WHEN_MARKET_CLOSED"] = "true"
 os.environ["AI_AGENT_ENABLED"] = "false"
+os.environ["AI_MARKET_CLOSED_ENABLED"] = "true"
 os.environ["AI_PRIMARY_PROVIDER"] = "gemini"
 os.environ["AI_PRIMARY_MODEL"] = "gemini-2.5-flash"
 os.environ["GEMINI_API_KEY"] = ""
@@ -88,15 +97,24 @@ def _reset_api_service_singletons() -> None:
     from app.domains.system import api as system_api
 
     learning_api.journal_service = JournalService()
+    learning_api.ticker_trace_service = learning_api.TickerDecisionTraceService()
     learning_api.memory_service = MemoryService()
     learning_api.failure_analysis_service = FailureAnalysisService()
     learning_api.auto_review_service = AutoReviewService()
     learning_api.pdca_service = PDCACycleService()
     learning_api.orchestrator_service = OrchestratorService()
     learning_api.bot_chat_service = learning_api.BotChatService()
+    learning_api.chat_conversation_service = learning_api.ChatConversationService()
     learning_api.macro_context_service = MacroContextService()
     learning_api.market_state_service = MarketStateService()
     learning_api.agent_tool_gateway_service = AgentToolGatewayService()
+    learning_api.skill_catalog_service = learning_api.SkillCatalogService()
+    learning_api.skill_lifecycle_service = learning_api.SkillLifecycleService(
+        catalog_service=learning_api.skill_catalog_service
+    )
+    learning_api.knowledge_claim_service = learning_api.KnowledgeClaimService()
+    learning_api.learning_workflow_service = learning_api.LearningWorkflowService()
+    learning_api.operator_disagreement_service = learning_api.OperatorDisagreementService()
 
     market_api.analysis_service = AnalysisService()
     market_api.market_data_service = MarketDataService()

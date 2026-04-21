@@ -1,9 +1,13 @@
 from app.db.models.decision_context import DecisionContextSnapshot, FeatureOutcomeStat, StrategyContextRule
 from app.db.models.candidate_validation_snapshot import CandidateValidationSnapshot
+from app.db.models.chat_conversation import ChatConversation
+from app.db.models.chat_message import ChatMessage
 from app.db.models.analysis import AnalysisRun
 from app.db.models.failure_pattern import FailurePattern
 from app.db.models.hypothesis import Hypothesis
 from app.db.models.journal import JournalEntry
+from app.db.models.knowledge_claim import KnowledgeClaim, KnowledgeClaimEvidence
+from app.db.models.learning_workflow import LearningWorkflow
 from app.db.models.market_state_snapshot import MarketStateSnapshotRecord
 from app.db.models.memory import MemoryItem
 from app.db.models.pdca import PDCACycle
@@ -17,5 +21,6 @@ from app.db.models.system_event import SystemEvent
 from app.db.models.strategy_evolution import StrategyActivationEvent, StrategyChangeEvent
 from app.db.models.strategy import Strategy, StrategyVersion
 from app.db.models.strategy_scorecard import StrategyScorecard
+from app.db.models.skill_validation import SkillValidationRecord
 from app.db.models.trade_review import TradeReview
 from app.db.models.watchlist import Watchlist, WatchlistItem

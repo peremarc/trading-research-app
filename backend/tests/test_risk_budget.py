@@ -5,6 +5,32 @@ from app.domains.learning import api as learning_api
 from app.domains.learning.decisioning import EntryScoringService, PositionSizingService
 
 
+class OpenMarketHoursService:
+    class Session:
+        is_regular_session_open = True
+        session_label = "regular"
+        next_regular_open = None
+        next_regular_close = None
+
+        def to_payload(self) -> dict:
+            return {
+                "market": "us_equities",
+                "timezone": "America/New_York",
+                "session_label": self.session_label,
+                "is_weekend": False,
+                "is_trading_day": True,
+                "is_regular_session_open": True,
+                "is_extended_hours": False,
+                "now_utc": "2026-04-21T14:30:00+00:00",
+                "now_local": "2026-04-21T10:30:00-04:00",
+                "next_regular_open": None,
+                "next_regular_close": None,
+            }
+
+    def get_session_state(self):
+        return self.Session()
+
+
 def test_position_sizing_produces_sized_trade_from_budget() -> None:
     service = PositionSizingService()
 
@@ -82,6 +108,47 @@ def test_position_sizing_applies_regime_policy_risk_multiplier() -> None:
     assert result["position_sizing"]["regime_policy_version"] == "2026-04-18-regime-policy-1"
 
 
+def test_position_sizing_reduces_risk_more_aggressively_on_quarterly_expiry_day() -> None:
+    service = PositionSizingService()
+
+    result = service.size_trade_candidate(
+        signal_payload={
+            "entry_price": 100.0,
+            "stop_price": 95.0,
+            "risk_reward": 2.5,
+            "decision_confidence": 0.82,
+            "quant_summary": {"atr_14": 2.0},
+        },
+        decision_context={
+            "strategy_rules": {"default_stop_atr_multiple": 1.5},
+            "portfolio": {
+                "same_ticker_open_positions": 0,
+                "same_sector_open_positions": 0,
+                "same_regime_open_positions": 0,
+            },
+            "risk_budget": {
+                "capital_base": 100000.0,
+                "per_trade_risk_amount": 1000.0,
+                "used_portfolio_risk_amount": 0.0,
+                "remaining_portfolio_risk_amount": 5000.0,
+                "max_notional_fraction_per_trade": 0.2,
+                "candidate_profile": {
+                    "event_risk_flags": ["quarterly_expiry_day"],
+                    "expiry_context": {
+                        "available": True,
+                        "phase": "expiry_day",
+                        "expiry_day": True,
+                    },
+                },
+            },
+        },
+    )
+
+    assert result["blocked"] is False
+    assert result["position_sizing"]["event_multiplier"] == 0.65
+    assert result["position_sizing"]["risk_amount"] == 650.0
+
+
 def test_entry_scoring_blocks_when_risk_budget_kill_switch_triggers() -> None:
     service = EntryScoringService()
 
@@ -155,6 +222,7 @@ def test_entry_scoring_blocks_when_regime_policy_disallows_playbook() -> None:
 def test_orchestrator_do_persists_risk_budget_and_position_sizing(client: TestClient) -> None:
     original_analyze_ticker = learning_api.orchestrator_service.signal_service.analyze_ticker
     original_discovery = learning_api.orchestrator_service.opportunity_discovery_service.refresh_active_watchlists
+    original_market_hours = learning_api.orchestrator_service.market_hours_service
     learning_api.orchestrator_service.signal_service.analyze_ticker = lambda ticker: {
         "quant_summary": {
             "price": 100.0,
@@ -191,6 +259,7 @@ def test_orchestrator_do_persists_risk_budget_and_position_sizing(client: TestCl
         "top_candidates": [],
         "benchmark_ticker": "SPY",
     }
+    learning_api.orchestrator_service.market_hours_service = OpenMarketHoursService()
     try:
         strategy = client.post(
             "/api/v1/strategies",
@@ -233,6 +302,7 @@ def test_orchestrator_do_persists_risk_budget_and_position_sizing(client: TestCl
     finally:
         learning_api.orchestrator_service.signal_service.analyze_ticker = original_analyze_ticker
         learning_api.orchestrator_service.opportunity_discovery_service.refresh_active_watchlists = original_discovery
+        learning_api.orchestrator_service.market_hours_service = original_market_hours
 
     assert response.status_code == 200
     assert response.json()["opened_positions"] == 1

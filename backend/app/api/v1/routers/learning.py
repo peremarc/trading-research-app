@@ -3,12 +3,16 @@ from fastapi import APIRouter
 from app.domains.learning.api import (
     auto_reviews_router,
     chat_router,
+    claims_router,
     failure_patterns_router,
+    feedback_router,
     journal_router,
+    workflows_router,
     macro_router,
     memory_router,
     orchestrator_router,
     pdca_router,
+    skills_router,
     tools_router,
 )
 
@@ -17,6 +21,10 @@ router.include_router(journal_router, prefix="/journal", tags=["journal"])
 router.include_router(chat_router, prefix="/chat", tags=["chat"])
 router.include_router(tools_router, prefix="/agent-tools", tags=["agent-tools"])
 router.include_router(memory_router, prefix="/memory", tags=["memory"])
+router.include_router(feedback_router, prefix="/operator-disagreements", tags=["operator-disagreements"])
+router.include_router(claims_router, prefix="/claims", tags=["claims"])
+router.include_router(workflows_router, prefix="/learning-workflows", tags=["learning-workflows"])
+router.include_router(skills_router, prefix="/skills", tags=["skills"])
 router.include_router(macro_router, prefix="/macro", tags=["macro"])
 router.include_router(failure_patterns_router, prefix="/failure-patterns", tags=["failure-patterns"])
 router.include_router(auto_reviews_router, prefix="/auto-reviews", tags=["auto-reviews"])

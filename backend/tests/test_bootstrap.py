@@ -15,7 +15,7 @@ def test_seed_bootstrap_is_idempotent(client: TestClient) -> None:
     assert first.json() == {
         "hypotheses": 3,
         "setups": 3,
-        "signal_definitions": 3,
+        "signal_definitions": 7,
         "strategies": 3,
         "screeners": 2,
         "watchlists": 2,
@@ -47,7 +47,7 @@ def test_startup_seed_only_runs_for_empty_catalog(session) -> None:
     assert created == {
         "hypotheses": 3,
         "setups": 3,
-        "signal_definitions": 3,
+        "signal_definitions": 7,
         "strategies": 3,
         "screeners": 2,
         "watchlists": 2,

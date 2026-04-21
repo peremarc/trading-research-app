@@ -89,6 +89,8 @@ class AIAgentRuntimeRead(BaseModel):
     last_decision_summary: str | None = None
     decision_count: int
     fallback_count: int = 0
+    calls_last_hour: int = 0
+    calls_today: int = 0
     last_error: str | None = None
     cooldown_until: str | None = None
 
@@ -109,10 +111,38 @@ class MarketMonitorRuntimeRead(BaseModel):
     last_event_summary: str | None = None
 
 
+class MarketDataRuntimeRead(BaseModel):
+    provider: str
+    probe_ticker: str
+    status: str
+    ready: bool
+    using_fallback: bool
+    source: str | None = None
+    last_price: float | None = None
+    provider_error: str | None = None
+    last_checked_at: str | None = None
+
+
+class LearningGovernanceRuntimeRead(BaseModel):
+    enabled: bool
+    status: str
+    interval_minutes: int
+    last_sync_started_at: str | None = None
+    last_sync_completed_at: str | None = None
+    sync_runs: int
+    last_summary: str | None = None
+    last_error: str | None = None
+    last_changed_workflows: int = 0
+    last_open_workflows: int = 0
+    last_open_items: int = 0
+
+
 class SchedulerStatusRead(BaseModel):
     enabled: bool
     running: bool
     jobs: list[SchedulerJobRead]
     bot: BotRuntimeRead
     ai: AIAgentRuntimeRead
+    learning_governance: LearningGovernanceRuntimeRead
+    market_data: MarketDataRuntimeRead
     monitor: MarketMonitorRuntimeRead

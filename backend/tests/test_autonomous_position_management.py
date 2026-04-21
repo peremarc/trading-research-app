@@ -2,7 +2,7 @@ from app.domains.learning.agent import AIDecisionError, AgentDecision, AgentTool
 from app.domains.execution import api as execution_api
 from app.domains.execution.services import ExitManagementService
 from app.domains.learning import api as learning_api
-from app.providers.market_data.base import MarketSnapshot
+from app.providers.market_data.base import MarketSnapshot, OHLCVCandle
 
 
 class FixedMarketDataService:
@@ -19,6 +19,31 @@ class FixedMarketDataService:
             week_performance=0.04,
             month_performance=0.1,
         )
+
+    def get_history(self, ticker: str, limit: int = 120) -> list[OHLCVCandle]:
+        del ticker
+        candles = [
+            OHLCVCandle(
+                timestamp=f"2026-03-{day:02d}",
+                open=101.2 + (idx % 2) * 0.1,
+                high=103.2 + (idx % 3) * 0.1,
+                low=100.0 + (idx % 2) * 0.2,
+                close=101.0 + (idx % 3) * 0.15,
+                volume=1_000 + idx * 25,
+            )
+            for idx, day in enumerate(range(1, 30), start=1)
+        ]
+        candles.append(
+            OHLCVCandle(
+                timestamp="2026-03-30",
+                open=100.8,
+                high=102.2,
+                low=99.2,
+                close=101.9,
+                volume=5_000,
+            )
+        )
+        return candles[-limit:]
 
 
 class StubManagementAgent:
@@ -73,9 +98,72 @@ class FailingManagementAgent:
         raise AssertionError("plan_open_position_management_execution should not be called when advise fails")
 
 
+class ExplodingManagementAgent:
+    def advise_open_position_management(self, session, *, position, market_snapshot):
+        raise AssertionError("AI management should not be called while the market is closed")
+
+    def plan_open_position_management_execution(self, *, position, market_snapshot, decision):
+        raise AssertionError("AI management should not be called while the market is closed")
+
+
+class ClosedMarketHoursService:
+    class Session:
+        is_regular_session_open = False
+        session_label = "weekend"
+
+    def get_session_state(self):
+        return self.Session()
+
+
+class OpenMarketHoursService:
+    class Session:
+        is_regular_session_open = True
+        session_label = "regular"
+        next_regular_open = None
+        next_regular_close = None
+
+        def to_payload(self) -> dict:
+            return {
+                "market": "us_equities",
+                "timezone": "America/New_York",
+                "session_label": self.session_label,
+                "is_weekend": False,
+                "is_trading_day": True,
+                "is_regular_session_open": True,
+                "is_extended_hours": False,
+                "now_utc": "2026-04-19T14:30:00+00:00",
+                "now_local": "2026-04-19T10:30:00-04:00",
+                "next_regular_open": None,
+                "next_regular_close": None,
+            }
+
+    def get_session_state(self):
+        return self.Session()
+
+
+class FixedExpiryCalendarService:
+    def get_quarterly_expiry_context(self, *, as_of=None) -> dict:
+        del as_of
+        return {
+            "available": True,
+            "source": "stub",
+            "quarterly_expiry_date": "2026-06-18",
+            "days_to_event": 1,
+            "expiration_week": True,
+            "pre_expiry_window": True,
+            "expiry_day": False,
+            "post_expiry_window": False,
+            "phase": "tight_pre_expiry_window",
+            "risk_penalty": 0.22,
+            "reason": "Quarterly expiry is one day away; tighten selectivity.",
+        }
+
+
 def test_auto_exit_evaluation_can_adjust_open_position_risk(client) -> None:
     original_market_data = execution_api.exit_management_service.market_data_service
+    original_calendar = execution_api.exit_management_service.calendar_service
     execution_api.exit_management_service.market_data_service = FixedMarketDataService()
+    execution_api.exit_management_service.calendar_service = FixedExpiryCalendarService()
     try:
         created = client.post(
             "/api/v1/positions",
@@ -93,6 +181,7 @@ def test_auto_exit_evaluation_can_adjust_open_position_risk(client) -> None:
         response = client.post("/api/v1/exits/evaluate")
     finally:
         execution_api.exit_management_service.market_data_service = original_market_data
+        execution_api.exit_management_service.calendar_service = original_calendar
 
     assert response.status_code == 200
     payload = response.json()
@@ -106,13 +195,22 @@ def test_auto_exit_evaluation_can_adjust_open_position_risk(client) -> None:
     assert positions[0]["stop_price"] == 103.0
     assert positions[0]["target_price"] == 108.0
     assert positions[0]["events"][-1]["event_type"] == "risk_update"
+    assert positions[0]["events"][-1]["payload"]["management_context"]["price_action_context"]["method"] == (
+        "ohlcv_price_action_proxies_v1"
+    )
+    assert positions[0]["events"][-1]["payload"]["management_context"]["expiry_context"]["phase"] == (
+        "tight_pre_expiry_window"
+    )
+    assert positions[0]["events"][-1]["payload"]["management_context"]["skill_context"]["catalog_version"] == "skills_v1"
 
 
 def test_auto_exit_evaluation_can_apply_agent_management_decision(client) -> None:
     original_market_data = execution_api.exit_management_service.market_data_service
     original_agent = execution_api.exit_management_service.trading_agent_service
+    original_market_hours = execution_api.exit_management_service.market_hours_service
     execution_api.exit_management_service.market_data_service = FixedMarketDataService()
     execution_api.exit_management_service.trading_agent_service = StubManagementAgent()
+    execution_api.exit_management_service.market_hours_service = OpenMarketHoursService()
     try:
         created = client.post(
             "/api/v1/positions",
@@ -131,6 +229,7 @@ def test_auto_exit_evaluation_can_apply_agent_management_decision(client) -> Non
     finally:
         execution_api.exit_management_service.market_data_service = original_market_data
         execution_api.exit_management_service.trading_agent_service = original_agent
+        execution_api.exit_management_service.market_hours_service = original_market_hours
 
     assert response.status_code == 200
     payload = response.json()
@@ -148,8 +247,10 @@ def test_auto_exit_evaluation_can_apply_agent_management_decision(client) -> Non
 def test_auto_exit_evaluation_falls_back_to_heuristics_when_ai_management_fails(client) -> None:
     original_market_data = execution_api.exit_management_service.market_data_service
     original_agent = execution_api.exit_management_service.trading_agent_service
+    original_market_hours = execution_api.exit_management_service.market_hours_service
     execution_api.exit_management_service.market_data_service = FixedMarketDataService()
     execution_api.exit_management_service.trading_agent_service = FailingManagementAgent()
+    execution_api.exit_management_service.market_hours_service = OpenMarketHoursService()
     try:
         created = client.post(
             "/api/v1/positions",
@@ -168,6 +269,7 @@ def test_auto_exit_evaluation_falls_back_to_heuristics_when_ai_management_fails(
     finally:
         execution_api.exit_management_service.market_data_service = original_market_data
         execution_api.exit_management_service.trading_agent_service = original_agent
+        execution_api.exit_management_service.market_hours_service = original_market_hours
 
     assert response.status_code == 200
     payload = response.json()
@@ -180,6 +282,41 @@ def test_auto_exit_evaluation_falls_back_to_heuristics_when_ai_management_fails(
     event_payload = positions[0]["events"][-1]["payload"]
     assert "AI unavailable" in event_payload["rationale"]
     assert event_payload["management_context"]["ai_error"] == "provider chain unavailable in test"
+
+
+def test_auto_exit_evaluation_skips_ai_management_while_market_is_closed(client) -> None:
+    original_market_data = execution_api.exit_management_service.market_data_service
+    original_agent = execution_api.exit_management_service.trading_agent_service
+    original_market_hours = execution_api.exit_management_service.market_hours_service
+    execution_api.exit_management_service.market_data_service = FixedMarketDataService()
+    execution_api.exit_management_service.trading_agent_service = ExplodingManagementAgent()
+    execution_api.exit_management_service.market_hours_service = ClosedMarketHoursService()
+    try:
+        created = client.post(
+            "/api/v1/positions",
+            json={
+                "ticker": "SHOP",
+                "entry_price": 100,
+                "stop_price": 95,
+                "target_price": 105,
+                "size": 1,
+                "thesis": "Weekend hold",
+            },
+        )
+        assert created.status_code == 201
+
+        response = client.post("/api/v1/exits/evaluate")
+    finally:
+        execution_api.exit_management_service.market_data_service = original_market_data
+        execution_api.exit_management_service.trading_agent_service = original_agent
+        execution_api.exit_management_service.market_hours_service = original_market_hours
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["adjusted_positions"] == 1
+    assert payload["results"][0]["adjusted"] is True
+    assert payload["results"][0]["stop_price"] == 103.0
+    assert payload["results"][0]["target_price"] == 108.0
 
 
 def test_realtime_market_event_can_close_open_position_immediately(client, session) -> None:
@@ -222,6 +359,7 @@ def test_do_phase_can_open_same_ticker_for_different_strategies(client) -> None:
     original_analyze_ticker = learning_api.orchestrator_service.signal_service.analyze_ticker
     original_discovery = learning_api.orchestrator_service.opportunity_discovery_service.refresh_active_watchlists
     original_capture_snapshot = learning_api.orchestrator_service.market_state_service.capture_snapshot
+    original_market_hours = learning_api.orchestrator_service.market_hours_service
     learning_api.orchestrator_service.signal_service.analyze_ticker = lambda ticker: {
         "quant_summary": {
             "price": 100.0,
@@ -252,6 +390,7 @@ def test_do_phase_can_open_same_ticker_for_different_strategies(client) -> None:
         "top_candidates": [],
         "benchmark_ticker": "SPY",
     }
+    learning_api.orchestrator_service.market_hours_service = OpenMarketHoursService()
 
     def capture_bullish_snapshot(session, *, trigger: str, pdca_phase: str | None = None, source_context: dict | None = None):
         from app.db.models.market_state_snapshot import MarketStateSnapshotRecord
@@ -407,6 +546,7 @@ def test_do_phase_can_open_same_ticker_for_different_strategies(client) -> None:
         learning_api.orchestrator_service.signal_service.analyze_ticker = original_analyze_ticker
         learning_api.orchestrator_service.opportunity_discovery_service.refresh_active_watchlists = original_discovery
         learning_api.orchestrator_service.market_state_service.capture_snapshot = original_capture_snapshot
+        learning_api.orchestrator_service.market_hours_service = original_market_hours
 
     assert response.status_code == 200
     positions = client.get("/api/v1/positions").json()

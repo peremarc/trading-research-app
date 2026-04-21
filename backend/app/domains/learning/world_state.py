@@ -119,6 +119,7 @@ class MarketStateService:
         benchmark_snapshot = asdict(self.market_data_service.get_snapshot(self.settings.benchmark_ticker))
         macro_context = self.macro_context_service.get_context(session, limit=6).model_dump(mode="json")
         calendar_events, calendar_error = self._get_macro_calendar_context()
+        expiry_context = self._get_quarterly_expiry_context()
         open_positions = self._build_open_positions(session)
         active_watchlists = self._build_active_watchlists(session)
         backlog = self._build_backlog_summary(session)
@@ -150,6 +151,7 @@ class MarketStateService:
                 "benchmark_snapshot": benchmark_snapshot,
                 "market_regime": regime,
                 "calendar_error": calendar_error,
+                "expiry_context": expiry_context,
                 "source_context": context,
                 "backlog": backlog,
             },
@@ -161,6 +163,8 @@ class MarketStateService:
             f"{backlog['active_watchlists_count']} active watchlists and "
             f"{backlog['open_research_tasks']} open research tasks."
         )
+        if expiry_context.get("available") and expiry_context.get("phase") not in {"normal", "unavailable", "error"}:
+            summary = f"{summary} Expiry context: {expiry_context.get('phase')} ({expiry_context.get('reason')})."
         return {
             "summary": summary,
             "market_state_snapshot": protocol_market_state,
@@ -169,6 +173,7 @@ class MarketStateService:
             "macro_context": macro_context,
             "calendar_events": calendar_events,
             "calendar_error": calendar_error,
+            "expiry_context": expiry_context,
             "backlog": backlog,
             "trigger": trigger,
             "pdca_phase": pdca_phase,
@@ -238,6 +243,30 @@ class MarketStateService:
         except CalendarProviderError as exc:
             return [], str(exc)
         return [event.__dict__ for event in events[:8]], None
+
+    def _get_quarterly_expiry_context(self) -> dict:
+        get_expiry_context = getattr(self.calendar_service, "get_quarterly_expiry_context", None)
+        if not callable(get_expiry_context):
+            return {
+                "available": False,
+                "source": "unavailable",
+                "phase": "unavailable",
+                "reason": "Quarterly expiry context is unavailable from the active calendar service.",
+            }
+        try:
+            payload = dict(get_expiry_context() or {})
+        except Exception as exc:
+            return {
+                "available": False,
+                "source": "error",
+                "phase": "error",
+                "reason": f"Quarterly expiry context failed: {exc}",
+            }
+        payload.setdefault("available", True)
+        payload.setdefault("source", "internal")
+        payload.setdefault("phase", "normal")
+        payload.setdefault("reason", "No quarterly expiry context available.")
+        return payload
 
     @staticmethod
     def _infer_global_regime(

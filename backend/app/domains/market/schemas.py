@@ -172,6 +172,25 @@ class CalendarEventRead(BaseModel):
     raw: dict | None = None
 
 
+class CalendarCacheStatusRead(BaseModel):
+    provider: str | None = None
+    available: bool = False
+    cached_at: str | None = None
+    age_seconds: int | None = None
+    ttl_seconds: int | None = None
+    stale: bool = False
+
+
+class CorporateCalendarContextRead(BaseModel):
+    ticker: str
+    source: str
+    used_fallback: bool = False
+    provider_error: str | None = None
+    fallback_reason: str | None = None
+    events: list[CalendarEventRead]
+    cache: CalendarCacheStatusRead | None = None
+
+
 class WorkItemRead(BaseModel):
     priority: str
     item_type: str
@@ -180,6 +199,35 @@ class WorkItemRead(BaseModel):
     context: dict = Field(default_factory=dict)
 
 
+class ProviderRuntimeStatusRead(BaseModel):
+    provider: str
+    configured: bool = False
+    cooling_down: bool = False
+    cooldown_remaining_seconds: float = 0.0
+    concurrency_limit: int = 0
+
+
+class WorkQueueSummaryRead(BaseModel):
+    due_reanalysis_items: int = 0
+    deferred_reanalysis_items: int = 0
+    runtime_aware_watchlist_items: int = 0
+    next_reanalysis_at: str | None = None
+    next_reanalysis_ticker: str | None = None
+    timing_samples: int = 0
+    timing_last_signal_at: str | None = None
+    avg_total_ms: float | None = None
+    avg_decision_context_ms: float | None = None
+    avg_reanalysis_gate_ms: float | None = None
+    dominant_stage: str | None = None
+    dominant_stage_avg_ms: float | None = None
+    dominant_decision_context_stage: str | None = None
+    dominant_decision_context_stage_avg_ms: float | None = None
+    market_data_provider_status: dict[str, ProviderRuntimeStatusRead] = Field(default_factory=dict)
+    calendar_provider_status: dict[str, ProviderRuntimeStatusRead] = Field(default_factory=dict)
+    news_provider_status: dict[str, ProviderRuntimeStatusRead] = Field(default_factory=dict)
+
+
 class WorkQueueRead(BaseModel):
     total_items: int
     items: list[WorkItemRead]
+    summary: WorkQueueSummaryRead = Field(default_factory=WorkQueueSummaryRead)

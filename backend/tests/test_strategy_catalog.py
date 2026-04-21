@@ -188,7 +188,14 @@ def test_seed_exposes_hypotheses_setups_and_signal_definitions_catalog(client: T
     assert signal_definitions_response.status_code == 200
     assert len(hypotheses_response.json()) == 3
     assert len(setups_response.json()) == 3
-    assert len(signal_definitions_response.json()) == 3
+    assert len(signal_definitions_response.json()) == 8
+    assert {
+        "failed_breakdown_reversal",
+        "support_reclaim_confirmation",
+        "rejection_wick_at_support",
+        "high_relative_volume_reversal",
+        "breakout_failure_reclaim",
+    } <= {item["code"] for item in signal_definitions_response.json()}
 
 
 def test_watchlist_creation_accepts_initial_items_and_records_catalog_events(client: TestClient) -> None:

@@ -28,19 +28,19 @@ async def seed_initial_data(session: Session = Depends(get_db_session)) -> SeedR
 
 
 @scheduler_router.get("/status", response_model=SchedulerStatusRead)
-async def get_scheduler_status() -> SchedulerStatusRead:
+async def get_scheduler_status(session: Session = Depends(get_db_session)) -> SchedulerStatusRead:
     scheduler_service.configure()
-    return SchedulerStatusRead.model_validate(scheduler_service.get_status_payload())
+    return SchedulerStatusRead.model_validate(scheduler_service.get_status_payload(session=session))
 
 
 @scheduler_router.post("/start", response_model=SchedulerStatusRead, status_code=status.HTTP_200_OK)
-async def start_scheduler_bot() -> SchedulerStatusRead:
-    return SchedulerStatusRead.model_validate(scheduler_service.start_bot())
+async def start_scheduler_bot(session: Session = Depends(get_db_session)) -> SchedulerStatusRead:
+    return SchedulerStatusRead.model_validate(scheduler_service.start_bot(session=session))
 
 
 @scheduler_router.post("/pause", response_model=SchedulerStatusRead, status_code=status.HTTP_200_OK)
-async def pause_scheduler_bot() -> SchedulerStatusRead:
-    return SchedulerStatusRead.model_validate(scheduler_service.pause_bot())
+async def pause_scheduler_bot(session: Session = Depends(get_db_session)) -> SchedulerStatusRead:
+    return SchedulerStatusRead.model_validate(scheduler_service.pause_bot(session=session))
 
 
 @events_router.get("", response_model=list[SystemEventRead], status_code=status.HTTP_200_OK)

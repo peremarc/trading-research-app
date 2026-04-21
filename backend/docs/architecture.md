@@ -49,6 +49,7 @@ This backend is the initial modular monolith for the single-agent trading resear
 2. Expand integration coverage around orchestrator flows and candidate lifecycle transitions.
 3. Add more market data provider adapters and execution-path realism.
 4. Keep consolidating domain boundaries where orchestration and strategy lifecycle still intersect too much.
+5. Keep backtesting as an external service boundary; see `backend/docs/backtesting_service.md`.
 
 ## MVP bootstrap
 

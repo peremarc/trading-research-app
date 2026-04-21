@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import date
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -39,6 +40,7 @@ class AgentToolGatewayService:
     }
     DUPLICATE_LIMITS = {
         "market.get_snapshot": 1,
+        "market.get_overview": 1,
         "market.get_chart": 1,
         "market.get_multitimeframe_context": 1,
         "news.get_ticker_news": 1,
@@ -140,6 +142,12 @@ class AgentToolGatewayService:
                 "category": "market",
                 "description": "Get the current market snapshot and basic technical context for a ticker.",
                 "input_schema": {"ticker": "str"},
+            },
+            {
+                "name": "market.get_overview",
+                "category": "market",
+                "description": "Get a combined ticker overview with market signals, options sentiment and corporate events.",
+                "input_schema": {"ticker": "str", "sec_type": "str?"},
             },
             {
                 "name": "market.get_chart",
@@ -264,6 +272,18 @@ class AgentToolGatewayService:
         if tool_name == "market.get_snapshot":
             ticker = self._require_str(arguments, "ticker")
             result = asdict(self.market_data_service.get_snapshot(ticker))
+            self._record_tool_call(session, tool_name, arguments, result, ticker=ticker)
+            return result
+
+        if tool_name == "market.get_overview":
+            ticker = self._require_str(arguments, "ticker")
+            sec_type = arguments.get("sec_type")
+            if sec_type is not None and (not isinstance(sec_type, str) or not sec_type.strip()):
+                raise AgentToolError("Argument 'sec_type' must be a non-empty string")
+            result = self.market_data_service.get_market_overview(
+                ticker,
+                sec_type=sec_type if isinstance(sec_type, str) else "STK",
+            )
             self._record_tool_call(session, tool_name, arguments, result, ticker=ticker)
             return result
 
@@ -483,6 +503,7 @@ class AgentToolGatewayService:
                 if enriched_context != entry_context:
                     step_arguments["entry_context"] = enriched_context
             try:
+                step_started_at = perf_counter()
                 if step.tool_name == "web.fetch_article":
                     step_arguments = self._resolve_fetch_article_arguments(results, step_arguments)
                 result = self.execute(session, step.tool_name, step_arguments)
@@ -504,12 +525,14 @@ class AgentToolGatewayService:
                     reasoning=f"Tool {step.tool_name} failed: {exc}",
                     ticker=step_arguments.get("ticker"),
                 )
+            elapsed_ms = round((perf_counter() - step_started_at) * 1000, 2)
             results.append(
                 {
                     "index": index,
                     "tool_name": step.tool_name,
                     "purpose": step.purpose,
                     "status": status,
+                    "elapsed_ms": elapsed_ms,
                     "result": result,
                 }
             )
@@ -565,6 +588,13 @@ class AgentToolGatewayService:
 
         if tool_name == "market.get_snapshot":
             self._require_str(arguments, "ticker")
+            return
+
+        if tool_name == "market.get_overview":
+            self._require_str(arguments, "ticker")
+            sec_type = arguments.get("sec_type")
+            if sec_type is not None and (not isinstance(sec_type, str) or not sec_type.strip()):
+                raise AgentToolError("Argument 'sec_type' must be a non-empty string")
             return
 
         if tool_name == "market.get_chart":
@@ -1026,6 +1056,8 @@ class AgentToolGatewayService:
         evidence_discarded: list[dict] = []
         successful_tools: list[str] = []
         errored_tools: list[str] = []
+        total_elapsed_ms = 0.0
+        slowest_tool: tuple[str, float] | None = None
 
         for step in prior_results:
             tool_name = step.get("tool_name")
@@ -1033,18 +1065,24 @@ class AgentToolGatewayService:
                 continue
             status = str(step.get("status") or "completed")
             result = step.get("result") if isinstance(step.get("result"), dict) else {}
+            elapsed_ms = float(step.get("elapsed_ms")) if isinstance(step.get("elapsed_ms"), (int, float)) else None
             summary, used = AgentToolGatewayService._summarize_research_tool_result(tool_name, status, result)
             outcome = {
                 "tool_name": tool_name,
                 "status": status,
                 "used": used,
                 "summary": summary,
+                "elapsed_ms": elapsed_ms,
             }
             tool_outcomes.append(outcome)
             if status == "error":
                 errored_tools.append(tool_name)
             else:
                 successful_tools.append(tool_name)
+            if elapsed_ms is not None:
+                total_elapsed_ms += elapsed_ms
+                if slowest_tool is None or elapsed_ms > slowest_tool[1]:
+                    slowest_tool = (tool_name, elapsed_ms)
             if used:
                 evidence_used.append({"source": tool_name, "summary": summary})
             else:
@@ -1058,6 +1096,9 @@ class AgentToolGatewayService:
             "errored_tools": errored_tools,
             "evidence_used": evidence_used,
             "evidence_discarded": evidence_discarded,
+            "total_elapsed_ms": round(total_elapsed_ms, 2),
+            "slowest_tool": slowest_tool[0] if slowest_tool is not None else None,
+            "slowest_tool_ms": slowest_tool[1] if slowest_tool is not None else None,
         }
 
     @staticmethod
