@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     ibkr_proxy_base_url: str = "http://127.0.0.1:15177"
     ibkr_proxy_api_key: str | None = None
     ibkr_proxy_timeout_seconds: int = 15
+    backtesting_enabled: bool = True
+    backtesting_provider: str = "remote_service"
+    backtesting_base_url: str = "http://127.0.0.1:15181"
+    backtesting_api_key: str | None = None
+    backtesting_timeout_seconds: int = 30
+    backtesting_source_app: str = "trading-research-app"
+    backtesting_reconcile_enabled: bool = True
+    backtesting_reconcile_interval_seconds: int = 30
+    backtesting_reconcile_batch_size: int = 10
     market_data_max_concurrent_requests: int = 2
     ibkr_market_monitor_enabled: bool = True
     ibkr_market_monitor_transport: str = "sse"

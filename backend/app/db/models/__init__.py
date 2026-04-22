@@ -3,6 +3,7 @@ from app.db.models.candidate_validation_snapshot import CandidateValidationSnaps
 from app.db.models.chat_conversation import ChatConversation
 from app.db.models.chat_message import ChatMessage
 from app.db.models.analysis import AnalysisRun
+from app.db.models.external_backtest_run import ExternalBacktestRun
 from app.db.models.failure_pattern import FailurePattern
 from app.db.models.hypothesis import Hypothesis
 from app.db.models.journal import JournalEntry

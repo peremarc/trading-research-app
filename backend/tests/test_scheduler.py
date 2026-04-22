@@ -108,6 +108,8 @@ def test_scheduler_status_exposes_autonomous_job_and_paused_bot(client) -> None:
     assert payload["learning_governance"]["enabled"] is True
     assert payload["learning_governance"]["status"] == "idle"
     assert payload["learning_governance"]["sync_runs"] == 0
+    assert payload["backtesting_reconciliation"]["enabled"] is False
+    assert payload["backtesting_reconciliation"]["status"] == "idle"
     assert payload["market_data"]["provider"] == "stub"
     assert payload["market_data"]["probe_ticker"] == "SPY"
     assert payload["monitor"]["enabled"] is False

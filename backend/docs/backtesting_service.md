@@ -6,6 +6,31 @@ This document defines the preferred architecture for a dedicated
 `research/backtesting` service that lives outside the main trading bot
 repository.
 
+## Current canonical v1
+
+Important:
+
+- the **executable** source of truth now lives in the external `backtesting`
+  repository
+- this file still captures architectural intent and future shape
+- do **not** treat every field below as if it already existed in the live
+  service contract
+
+For the exact current wire contract and the field-by-field diff against this
+repo's earlier aspirational naming, use:
+
+- `backend/docs/backtesting_contract_alignment.md`
+
+In particular, the current executable service uses a narrower v1 contract:
+
+- `spec_version: backtest_spec.v1`
+- `universe.symbols`
+- `data.source_type`
+- `validation_plan.split_mode`
+- run status `completed` instead of `succeeded`
+- no app-level auth contract should be assumed until the service actually
+  implements it
+
 The bot in this repo should remain the `trading brain`:
 
 - hypothesis generation
@@ -356,7 +381,7 @@ See [backtest_spec.example.json](/workspaces/trading-research-app/backend/docs/e
 
 ## Integration back into this bot
 
-This repository should later add a small provider layer, for example:
+This repository now has the first concrete integration slice:
 
 ```text
 backend/app/providers/backtesting/
@@ -364,7 +389,19 @@ backend/app/providers/backtesting/
   remote_service.py
 ```
 
-Suggested contract:
+Current local integration points:
+
+- `backend/app/providers/backtesting/`
+- `backend/app/db/models/external_backtest_run.py`
+- `backend/app/domains/market/backtesting.py`
+- `POST /api/v1/research/backtests`
+- `GET /api/v1/research/backtests`
+- `POST /api/v1/research/backtests/sync-pending`
+- `POST /api/v1/research/backtests/{id}/sync`
+- `GET /api/v1/research/backtests/provider/context`
+- scheduler-driven reconciliation of non-terminal runs
+
+Provider contract:
 
 - `submit_backtest(spec: dict) -> dict`
 - `get_backtest_run(run_id: str) -> dict`
@@ -423,11 +460,10 @@ It only needs enough local traceability:
 
 ## Next implementation slice in this repo
 
-When this design moves from documentation to code here, the first slice should
-be:
+After the current provider + persistence + API slice, the next useful steps are:
 
-1. add a backtesting provider contract
-2. add a remote-service adapter
-3. persist lightweight remote run references
-4. expose a minimal API/UI to launch and inspect runs
-5. link runs to `research_task` and `skill_candidate`
+1. link runs automatically to richer entities like `skill_candidate`
+2. add scheduled polling/reconciliation for non-terminal remote runs
+3. derive bot-native evaluation summaries from remote metrics
+4. expose comparison and rerun flows through the local API/UI
+5. feed completed run outcomes into CHECK/ACT promotion logic
