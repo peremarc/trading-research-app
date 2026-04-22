@@ -3,8 +3,9 @@ from datetime import datetime, timedelta, timezone
 from app.db.models.chat_conversation import ChatConversation
 from app.db.models.chat_message import ChatMessage
 from app.db.models.journal import JournalEntry
+from app.db.models.learning_workflow import LearningWorkflowRun
 from app.core.config import Settings
-from app.domains.learning.workflows import LearningWorkflowSyncReport
+from app.domains.learning.workflows import LearningWorkflowService, LearningWorkflowSyncReport
 from app.domains.market.services import MarketDataUnavailableError
 from app.domains.system import services as system_services
 from app.domains.system.services import SchedulerService
@@ -612,3 +613,30 @@ def test_scheduler_learning_governance_failure_does_not_pause_bot(monkeypatch, s
 
     journal_entry = session.query(JournalEntry).filter(JournalEntry.entry_type == "learning_workflow_sync_failed").one()
     assert "learning workflow sync failed" in (journal_entry.outcome or "")
+
+
+def test_scheduler_learning_governance_records_workflow_runs(monkeypatch, session) -> None:
+    class _SessionContext:
+        def __enter__(self):
+            return session
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    monkeypatch.setattr(system_services, "SessionLocal", lambda: _SessionContext())
+    scheduler = SchedulerService(
+        Settings(
+            scheduler_mode="continuous",
+            scheduler_continuous_idle_seconds=1,
+            learning_workflow_governance_enabled=True,
+            learning_workflow_governance_interval_minutes=15,
+        ),
+        learning_workflow_service=LearningWorkflowService(),
+    )
+
+    scheduler._run_learning_governance_job()
+
+    runs = session.query(LearningWorkflowRun).all()
+    assert len(runs) == 5
+    assert {run.run_kind for run in runs} == {"sync"}
+    assert {run.trigger_source for run in runs} == {"scheduler_governance"}

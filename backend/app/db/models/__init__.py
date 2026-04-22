@@ -7,7 +7,7 @@ from app.db.models.failure_pattern import FailurePattern
 from app.db.models.hypothesis import Hypothesis
 from app.db.models.journal import JournalEntry
 from app.db.models.knowledge_claim import KnowledgeClaim, KnowledgeClaimEvidence
-from app.db.models.learning_workflow import LearningWorkflow
+from app.db.models.learning_workflow import LearningWorkflow, LearningWorkflowArtifact, LearningWorkflowRun
 from app.db.models.market_state_snapshot import MarketStateSnapshotRecord
 from app.db.models.memory import MemoryItem
 from app.db.models.pdca import PDCACycle

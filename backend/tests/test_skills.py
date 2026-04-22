@@ -1,6 +1,42 @@
+from datetime import datetime, timezone
+
 from app.db.models.journal import JournalEntry
+from app.db.models.knowledge_claim import KnowledgeClaim
+from app.db.models.market_state_snapshot import MarketStateSnapshotRecord
 from app.db.models.memory import MemoryItem
+from app.domains.learning import api as learning_api
 from app.domains.learning.skills import SkillLifecycleService, SkillRouterService
+from app.domains.system.market_hours import MarketSessionState
+
+
+class _FakeMarketHoursService:
+    def __init__(self, session_label: str, *, review_date: str = "2026-04-22") -> None:
+        self.session_label = session_label
+        self.review_date = review_date
+
+    def get_session_state(self, *, now=None) -> MarketSessionState:
+        local_clock = {
+            "pre_market": "08:15:00-04:00",
+            "regular": "11:00:00-04:00",
+            "after_hours": "17:10:00-04:00",
+            "weekend": "12:00:00-04:00",
+        }.get(self.session_label, "11:00:00-04:00")
+        is_weekend = self.session_label == "weekend"
+        is_regular_session_open = self.session_label == "regular"
+        is_extended_hours = self.session_label in {"pre_market", "after_hours"}
+        return MarketSessionState(
+            market="us_equities",
+            timezone="America/New_York",
+            session_label=self.session_label,
+            is_weekend=is_weekend,
+            is_trading_day=not is_weekend,
+            is_regular_session_open=is_regular_session_open,
+            is_extended_hours=is_extended_hours,
+            now_utc=f"{self.review_date}T12:15:00+00:00",
+            now_local=f"{self.review_date}T{local_clock}",
+            next_regular_open=f"{self.review_date}T13:30:00+00:00",
+            next_regular_close=f"{self.review_date}T20:00:00+00:00",
+        )
 
 
 def test_skill_catalog_endpoint_lists_initial_skills(client) -> None:
@@ -195,6 +231,76 @@ def test_skill_runtime_packets_build_compact_on_demand_instructions(client, sess
     prompt = lifecycle.render_runtime_skill_prompt(packets)
     assert "Skill `detect_risk_off_conditions`" in prompt
     assert "Validated tighter execution caution around expiry and event-risk windows." in prompt
+
+
+def test_skill_dashboard_includes_learning_distillation_digests(client) -> None:
+    first_gap = client.post(
+        "/api/v1/memory",
+        json={
+            "memory_type": "skill_gap",
+            "scope": "strategy:88",
+            "key": "skill_gap:test:distill-dashboard:1",
+            "content": "Repeated breakout review gap still unresolved.",
+            "meta": {
+                "summary": "Repeated breakout review gap still unresolved.",
+                "gap_type": "missing_catalog_skill",
+                "status": "open",
+                "ticker": "AAPL",
+                "strategy_version_id": 88,
+                "source_type": "trade_review",
+                "target_skill_code": "breakout_review",
+                "candidate_action": "draft_candidate_skill",
+            },
+            "importance": 0.77,
+        },
+    )
+    assert first_gap.status_code == 201
+
+    second_gap = client.post(
+        "/api/v1/memory",
+        json={
+            "memory_type": "skill_gap",
+            "scope": "strategy:88",
+            "key": "skill_gap:test:distill-dashboard:2",
+            "content": "Another breakout review gap confirms the same backlog cluster.",
+            "meta": {
+                "summary": "Another breakout review gap confirms the same backlog cluster.",
+                "gap_type": "repeated_operator_disagreement",
+                "status": "open",
+                "ticker": "AAPL",
+                "strategy_version_id": 88,
+                "source_type": "operator_disagreement_cluster",
+                "target_skill_code": "breakout_review",
+                "candidate_action": "update_existing_skill",
+            },
+            "importance": 0.81,
+        },
+    )
+    assert second_gap.status_code == 201
+
+    distilled = client.post(
+        "/api/v1/memory/maintenance/distill",
+        json={
+            "dry_run": False,
+            "include_claim_reviews": False,
+            "include_operator_feedback": False,
+            "include_skill_gaps": True,
+            "include_skill_candidates": False,
+            "skill_gap_limit": 50,
+            "min_group_size": 2,
+        },
+    )
+    assert distilled.status_code == 200
+
+    dashboard = client.get("/api/v1/skills/dashboard")
+    assert dashboard.status_code == 200
+    payload = dashboard.json()
+    distillations = payload["distillations"]
+    assert any(
+        item["meta"].get("distillation_type") == "skill_gap_digest"
+        and item["meta"].get("target_skill_code") == "breakout_review"
+        for item in distillations
+    )
 
 
 def test_skill_gaps_endpoint_lists_persisted_gap_items(client) -> None:
@@ -410,6 +516,244 @@ def test_skill_gap_can_be_promoted_to_skill_candidate(client, session) -> None:
     assert gap_item.meta["promotion_status"] == "candidate_created"
 
 
+def test_skill_workshop_syncs_claim_proposal_and_review_promotes_candidate(client, session) -> None:
+    claim = client.post(
+        "/api/v1/claims",
+        json={
+            "scope": "strategy:64",
+            "key": "claim:test:skill-workshop",
+            "claim_type": "review_improvement",
+            "claim_text": "Breakout confirmation needs a clearer procedural filter.",
+            "linked_ticker": "AAPL",
+            "strategy_version_id": 64,
+            "status": "validated",
+            "freshness_state": "current",
+            "meta": {
+                "source": "test",
+                "target_skill_code": "evaluate_daily_breakout",
+            },
+        },
+    )
+    assert claim.status_code == 201
+    claim_id = claim.json()["id"]
+
+    synced = client.post("/api/v1/skills/proposals/sync", params={"limit_per_source": 10})
+    assert synced.status_code == 200
+    proposals = synced.json()
+    proposal = next(item for item in proposals if item["source_claim_id"] == claim_id)
+    assert proposal["source_type"] == "knowledge_claim"
+    assert proposal["proposal_status"] == "pending"
+    assert proposal["target_skill_code"] == "evaluate_daily_breakout"
+
+    dashboard = client.get("/api/v1/skills/dashboard")
+    assert dashboard.status_code == 200
+    assert any(item["id"] == proposal["id"] for item in dashboard.json()["proposals"])
+
+    reviewed = client.post(
+        f"/api/v1/skills/proposals/{proposal['id']}/review",
+        json={
+            "outcome": "approve",
+            "summary": "Promote this reviewed claim into a draft candidate before validation.",
+        },
+    )
+    assert reviewed.status_code == 200
+    reviewed_payload = reviewed.json()
+    assert reviewed_payload["proposal"]["proposal_status"] == "applied"
+    assert reviewed_payload["candidate"]["meta"]["source_claim_id"] == claim_id
+
+    stored_claim = session.get(KnowledgeClaim, claim_id)
+    assert stored_claim is not None
+    assert stored_claim.meta["linked_skill_candidate_id"] == reviewed_payload["candidate"]["id"]
+
+
+def test_skill_workshop_syncs_gap_proposal_and_review_promotes_candidate(client, session) -> None:
+    gap = client.post(
+        "/api/v1/memory",
+        json={
+            "memory_type": "skill_gap",
+            "scope": "strategy:77",
+            "key": "skill_gap:test:workshop",
+            "content": "Gap ready for workshop promotion.",
+            "meta": {
+                "summary": "A repeated review pattern should become a candidate skill through the workshop.",
+                "gap_type": "missing_catalog_skill",
+                "status": "open",
+                "ticker": "MSFT",
+                "strategy_version_id": 77,
+                "target_skill_code": "detect_risk_off_conditions",
+                "candidate_action": "update_existing_skill",
+            },
+            "importance": 0.8,
+        },
+    )
+    assert gap.status_code == 201
+    gap_id = gap.json()["id"]
+
+    synced = client.post("/api/v1/skills/proposals/sync", params={"limit_per_source": 10})
+    assert synced.status_code == 200
+    proposal = next(item for item in synced.json() if item["source_gap_id"] == gap_id)
+    assert proposal["source_type"] == "skill_gap"
+    assert proposal["proposal_status"] == "pending"
+    assert proposal["target_skill_code"] == "detect_risk_off_conditions"
+
+    reviewed = client.post(
+        f"/api/v1/skills/proposals/{proposal['id']}/review",
+        json={
+            "outcome": "approve",
+            "summary": "Promote the workshop gap proposal into a draft candidate.",
+        },
+    )
+    assert reviewed.status_code == 200
+    reviewed_payload = reviewed.json()
+    assert reviewed_payload["proposal"]["proposal_status"] == "applied"
+    assert reviewed_payload["candidate"]["meta"]["source_gap_id"] == gap_id
+
+    gap_item = session.get(MemoryItem, gap_id)
+    assert gap_item is not None
+    assert gap_item.meta["linked_skill_candidate_id"] == reviewed_payload["candidate"]["id"]
+
+
+def test_skill_workshop_syncs_operator_disagreement_cluster_proposal(client, session) -> None:
+    claim = client.post(
+        "/api/v1/claims",
+        json={
+            "scope": "strategy:91",
+            "key": "claim:test:workshop-cluster",
+            "claim_type": "review_improvement",
+            "claim_text": "Operator keeps disagreeing with this breakout rule.",
+            "linked_ticker": "AAPL",
+            "strategy_version_id": 91,
+            "freshness_state": "current",
+            "meta": {"source": "test", "target_skill_code": "evaluate_daily_breakout"},
+        },
+    )
+    assert claim.status_code == 201
+    claim_id = claim.json()["id"]
+
+    assert client.post(
+        f"/api/v1/claims/{claim_id}/evidence",
+        json={
+            "source_type": "trade_review",
+            "source_key": "trade_review:workshop-cluster:1",
+            "stance": "support",
+            "summary": "Initial support evidence.",
+            "evidence_payload": {},
+            "strength": 0.7,
+        },
+    ).status_code == 200
+
+    for suffix in ("a", "b"):
+        reviewed = client.post(
+            f"/api/v1/claims/{claim_id}/review",
+            json={
+                "outcome": "contradict",
+                "summary": f"Operator disagreement event {suffix}.",
+                "source_key": f"claim_review:workshop-cluster:{suffix}",
+                "strength": 0.72,
+                "evidence_payload": {"suffix": suffix},
+            },
+        )
+        assert reviewed.status_code == 200
+
+    synced = client.post("/api/v1/skills/proposals/sync", params={"limit_per_source": 10})
+    assert synced.status_code == 200
+    proposal = next(
+        item
+        for item in synced.json()
+        if item["source_type"] == "operator_disagreement_cluster"
+    )
+    assert proposal["proposal_status"] == "pending"
+    assert proposal["source_operator_disagreement_cluster_id"] is not None
+
+    reviewed = client.post(
+        f"/api/v1/skills/proposals/{proposal['id']}/review",
+        json={
+            "outcome": "approve",
+            "summary": "Promote the repeated operator disagreement into a draft candidate.",
+        },
+    )
+    assert reviewed.status_code == 200
+    reviewed_payload = reviewed.json()
+    assert reviewed_payload["proposal"]["proposal_status"] == "applied"
+    assert (
+        reviewed_payload["candidate"]["meta"]["source_operator_disagreement_cluster_id"]
+        == proposal["source_operator_disagreement_cluster_id"]
+    )
+
+
+def test_skill_workshop_syncs_regime_workflow_artifact_proposal(client, session) -> None:
+    learning_api.learning_workflow_service.market_hours_service = _FakeMarketHoursService("regular")
+
+    previous = MarketStateSnapshotRecord(
+        trigger="plan",
+        pdca_phase="plan",
+        execution_mode="global",
+        benchmark_ticker="SPY",
+        regime_label="bullish_trend",
+        regime_confidence=0.84,
+        summary="Bullish trend backdrop.",
+        snapshot_payload={"macro_context": {"active_regimes": ["bullish_trend"]}},
+        source_context={"source": "test"},
+        created_at=datetime(2026, 4, 22, 12, 0, tzinfo=timezone.utc),
+    )
+    current = MarketStateSnapshotRecord(
+        trigger="do",
+        pdca_phase="do",
+        execution_mode="global",
+        benchmark_ticker="SPY",
+        regime_label="macro_uncertainty",
+        regime_confidence=0.41,
+        summary="Macro uncertainty is dominating the tape.",
+        snapshot_payload={"macro_context": {"active_regimes": ["macro_uncertainty"]}},
+        source_context={"source": "test"},
+        created_at=datetime(2026, 4, 22, 16, 5, tzinfo=timezone.utc),
+    )
+    session.add_all([previous, current])
+    session.commit()
+
+    workflows = client.get("/api/v1/learning-workflows", params={"sync": "true"}).json()
+    regime_review = next(item for item in workflows if item["workflow_type"] == "regime_shift_review")
+    action = client.post(
+        f"/api/v1/learning-workflows/{regime_review['id']}/actions",
+        json={
+            "item_type": "regime_shift",
+            "entity_id": regime_review["items"][0]["entity_id"],
+            "action": "complete",
+            "summary": "Acknowledged the regime transition and reviewed risk posture.",
+        },
+    )
+    assert action.status_code == 200
+    action_payload = action.json()
+    artifact_id = next(
+        item["id"]
+        for item in action_payload["workflow"]["recent_runs"][0]["artifacts"]
+        if item["artifact_type"] == "regime_shift_review_completion"
+    )
+
+    synced = client.post("/api/v1/skills/proposals/sync", params={"limit_per_source": 10})
+    assert synced.status_code == 200
+    proposal = next(
+        item
+        for item in synced.json()
+        if item["source_workflow_artifact_id"] == artifact_id
+    )
+    assert proposal["source_type"] == "learning_workflow_artifact"
+    assert proposal["target_skill_code"] == "detect_risk_off_conditions"
+    assert proposal["proposal_status"] == "pending"
+
+    reviewed = client.post(
+        f"/api/v1/skills/proposals/{proposal['id']}/review",
+        json={
+            "outcome": "approve",
+            "summary": "Promote the regime-review proposal into a draft skill candidate.",
+        },
+    )
+    assert reviewed.status_code == 200
+    reviewed_payload = reviewed.json()
+    assert reviewed_payload["proposal"]["proposal_status"] == "applied"
+    assert reviewed_payload["candidate"]["meta"]["source_workflow_artifact_id"] == artifact_id
+
+
 def test_skill_revision_detail_endpoint_returns_validated_revision(client) -> None:
     created = client.post(
         "/api/v1/memory",
@@ -464,6 +808,236 @@ def test_skill_revision_detail_endpoint_returns_validated_revision(client) -> No
     assert payload["skill_code"] == "detect_risk_off_conditions"
     assert isinstance(payload["validation_record_id"], int)
     assert payload["meta"]["evidence"]["run_id"] == "paper-55"
+
+
+def test_skill_revision_portable_export_endpoint_returns_yaml_and_skill_markdown(client) -> None:
+    created = client.post(
+        "/api/v1/memory",
+        json={
+            "memory_type": "skill_candidate",
+            "scope": "strategy:72",
+            "key": "skill_candidate:test:portable-export",
+            "content": "Candidate for portable export endpoint.",
+            "meta": {
+                "summary": "Candidate for portable export endpoint.",
+                "target_skill_code": "detect_risk_off_conditions",
+                "candidate_action": "update_existing_skill",
+                "candidate_status": "draft",
+                "validation_required": True,
+                "source_type": "trade_review",
+                "source_trade_review_id": 31,
+                "ticker": "SPY",
+                "strategy_version_id": 72,
+            },
+            "importance": 0.8,
+        },
+    )
+    assert created.status_code == 201
+    candidate_id = created.json()["id"]
+
+    validated = client.post(
+        f"/api/v1/skills/candidates/{candidate_id}/validate",
+        json={
+            "validation_mode": "replay",
+            "validation_outcome": "approve",
+            "summary": "Portable export validation payload.",
+            "sample_size": 27,
+            "win_rate": 63.2,
+            "avg_pnl_pct": 1.7,
+            "max_drawdown_pct": -2.1,
+            "evidence": {
+                "source": "replay_batch",
+                "run_id": "replay-72",
+                "artifact_url": "https://example.test/artifacts/replay-72",
+                "note": "portable export batch",
+            },
+            "activate": True,
+        },
+    )
+    assert validated.status_code == 200
+    revision_id = validated.json()["revision"]["id"]
+
+    response = client.get(f"/api/v1/skills/revisions/{revision_id}/portable")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["artifact_version"] == "skill_portable_v1"
+    assert payload["artifact_type"] == "validated_skill_revision_export"
+    assert payload["skill_code"] == "detect_risk_off_conditions"
+    assert payload["document"]["origin"]["revision_id"] == revision_id
+    assert payload["document"]["validation"]["run_id"] == "replay-72"
+    assert "artifact_version: skill_portable_v1" in payload["yaml_text"]
+    assert "# Detect Risk-Off Conditions" in payload["skill_md"]
+    assert "## Validated Revision" in payload["skill_md"]
+    assert "Portable export validation payload." in payload["skill_md"]
+
+
+def test_portable_skill_yaml_import_creates_draft_candidate(client, session) -> None:
+    source_candidate = client.post(
+        "/api/v1/memory",
+        json={
+            "memory_type": "skill_candidate",
+            "scope": "strategy:73",
+            "key": "skill_candidate:test:portable-import-source",
+            "content": "Source candidate for YAML import round-trip.",
+            "meta": {
+                "summary": "Source candidate for YAML import round-trip.",
+                "target_skill_code": "detect_risk_off_conditions",
+                "candidate_action": "update_existing_skill",
+                "candidate_status": "draft",
+                "validation_required": True,
+                "source_type": "trade_review",
+                "ticker": "QQQ",
+                "strategy_version_id": 73,
+            },
+            "importance": 0.79,
+        },
+    )
+    assert source_candidate.status_code == 201
+    source_candidate_id = source_candidate.json()["id"]
+
+    validated = client.post(
+        f"/api/v1/skills/candidates/{source_candidate_id}/validate",
+        json={
+            "validation_mode": "paper",
+            "validation_outcome": "approve",
+            "summary": "YAML import source validation payload.",
+            "sample_size": 19,
+            "win_rate": 59.8,
+            "avg_pnl_pct": 1.3,
+            "max_drawdown_pct": -2.0,
+            "evidence": {"run_id": "paper-73"},
+            "activate": True,
+        },
+    )
+    assert validated.status_code == 200
+    revision_id = validated.json()["revision"]["id"]
+
+    exported = client.get(f"/api/v1/skills/revisions/{revision_id}/portable")
+    assert exported.status_code == 200
+
+    imported = client.post(
+        "/api/v1/skills/portable/import",
+        json={
+            "format": "yaml",
+            "import_as": "candidate",
+            "content": exported.json()["yaml_text"],
+            "scope": "strategy:173",
+            "key": "skill_candidate:test:portable-imported",
+        },
+    )
+    assert imported.status_code == 200
+    payload = imported.json()
+    assert payload["import_as"] == "candidate"
+    assert payload["candidate"]["candidate_status"] == "draft"
+    assert payload["candidate"]["target_skill_code"] == "detect_risk_off_conditions"
+    assert payload["candidate"]["source_type"] == "portable_skill_artifact"
+    assert isinstance(payload["journal_entry_id"], int)
+
+    stored_candidate = session.query(MemoryItem).filter(
+        MemoryItem.memory_type == "skill_candidate",
+        MemoryItem.key == "skill_candidate:test:portable-imported",
+    ).one()
+    portable_meta = stored_candidate.meta["portable_skill_artifact"]
+    assert portable_meta["format"] == "yaml"
+    assert portable_meta["origin"]["revision_id"] == revision_id
+
+    journal_entry = session.get(JournalEntry, payload["journal_entry_id"])
+    assert journal_entry is not None
+    assert journal_entry.entry_type == "skill_portable_candidate_imported"
+
+
+def test_portable_skill_markdown_import_can_create_inactive_revision(client) -> None:
+    source_candidate = client.post(
+        "/api/v1/memory",
+        json={
+            "memory_type": "skill_candidate",
+            "scope": "strategy:74",
+            "key": "skill_candidate:test:portable-md-source",
+            "content": "Source candidate for SKILL.md import round-trip.",
+            "meta": {
+                "summary": "Source candidate for SKILL.md import round-trip.",
+                "target_skill_code": "evaluate_daily_breakout",
+                "candidate_action": "update_existing_skill",
+                "candidate_status": "draft",
+                "validation_required": True,
+                "source_type": "trade_review",
+                "ticker": "IWM",
+                "strategy_version_id": 74,
+            },
+            "importance": 0.77,
+        },
+    )
+    assert source_candidate.status_code == 201
+    source_candidate_id = source_candidate.json()["id"]
+
+    validated = client.post(
+        f"/api/v1/skills/candidates/{source_candidate_id}/validate",
+        json={
+            "validation_mode": "paper",
+            "validation_outcome": "approve",
+            "summary": "SKILL.md import source validation payload.",
+            "sample_size": 16,
+            "win_rate": 57.5,
+            "avg_pnl_pct": 0.9,
+            "max_drawdown_pct": -1.7,
+            "evidence": {"run_id": "paper-74"},
+            "activate": True,
+        },
+    )
+    assert validated.status_code == 200
+    source_revision_id = validated.json()["revision"]["id"]
+
+    exported = client.get(f"/api/v1/skills/revisions/{source_revision_id}/portable")
+    assert exported.status_code == 200
+
+    local_candidate = client.post(
+        "/api/v1/memory",
+        json={
+            "memory_type": "skill_candidate",
+            "scope": "strategy:174",
+            "key": "skill_candidate:test:portable-md-linked",
+            "content": "Local candidate linked to imported revision.",
+            "meta": {
+                "summary": "Local candidate linked to imported revision.",
+                "target_skill_code": "evaluate_daily_breakout",
+                "candidate_action": "update_existing_skill",
+                "candidate_status": "draft",
+                "validation_required": True,
+                "source_type": "portable_skill_artifact",
+                "ticker": "IWM",
+                "strategy_version_id": 174,
+            },
+            "importance": 0.71,
+        },
+    )
+    assert local_candidate.status_code == 201
+    local_candidate_id = local_candidate.json()["id"]
+
+    imported = client.post(
+        "/api/v1/skills/portable/import",
+        json={
+            "format": "skill_md",
+            "import_as": "revision",
+            "content": exported.json()["skill_md"],
+            "key": "skill_revision:test:portable-md-imported",
+            "candidate_id": local_candidate_id,
+        },
+    )
+    assert imported.status_code == 200
+    payload = imported.json()
+    assert payload["import_as"] == "revision"
+    assert payload["revision"]["activation_status"] == "imported_inactive"
+    assert payload["revision"]["candidate_id"] == local_candidate_id
+    assert payload["revision"]["skill_code"] == "evaluate_daily_breakout"
+    assert payload["revision"]["validation_record_id"] is None
+
+    active_revisions = client.get("/api/v1/skills/revisions")
+    assert active_revisions.status_code == 200
+    assert payload["revision"]["id"] not in {item["id"] for item in active_revisions.json()}
+
+    all_revisions = client.get("/api/v1/skills/revisions", params={"include_inactive": "true"})
+    assert all_revisions.status_code == 200
+    assert payload["revision"]["id"] in {item["id"] for item in all_revisions.json()}
 
 
 def test_skill_validation_record_detail_endpoint_returns_structured_validation_entity(client) -> None:

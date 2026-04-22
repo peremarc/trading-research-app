@@ -22,8 +22,8 @@ Update this file after every meaningful implementation step.
 ## Current Focus
 
 Run the doctrine-driven paper-trading stack on the internal IBKR proxy with a
-live `MONITOR` loop, while continuing to turn the agent protocol into
-enforceable execution policy.
+live `MONITOR` loop, while continuing to harden execution policy and turn the
+learning layer into a reusable, auditable runtime subsystem.
 
 Current gap under review:
 
@@ -62,16 +62,36 @@ Current gap under review:
   input, including new IBKR proxy options-sentiment endpoints, while keeping
   intraday-only concepts (`VWAP`, sweeps, gap fades) out of the current
   daily-bar stack
-- deciding how validated `skills` revisions should influence the agent/runtime
-  beyond backend metadata now that catalog, routing, operator visibility and a
-  paper/replay validation gate already exist
-- turning the new curated `KnowledgeClaim / KnowledgeClaimEvidence` layer from
-  simple persisted storage into durable knowledge the agent can actually use,
-  with contradictions, freshness review and controlled runtime retrieval
-- turning the current `skills + claims` foundation into explicit learning
-  workflows, especially deeper operator drill-down and cross-surface
-  visibility now that richer resolution classes, history and a scheduled
-  governance lane exist for `stale_claim_review` and `weekly_skill_audit`
+- turning the current `skills + claims + workflows` foundation into the next
+  reusable runtime layer inspired by `OpenClaw/Hermes`; `workflow_run` /
+  `workflow_artifact` plus the first internal proposal-based
+  `skill_workshop` are now in place, session/regime workflow actions can now
+  also emit structured `claim/research_task/skill_gap/skill_candidate`
+  outputs directly into persisted entities and artifacts, portable
+  `SKILL.md` / YAML export-import for validated revisions is now in place, and
+  the first `memory distillation` slice is now also in place with persisted
+  digests for stale/contested claim-review groups and repeated
+  operator-disagreement patterns; the second distillation slice now also
+  covers open `skill_gap` backlog and accumulated `skill_candidate` backlog
+  with collapse/retirement recommendations in digest metadata; reviewable
+  collapse/retire actions over those groups are now in place too, and the
+  digest/review layer is now also wired into both the operator surface
+  (`skills/dashboard` plus frontend detail/review actions) and bounded agent
+  runtime retrieval as `runtime_distillations`; a shared
+  `LearningRuntimeMemoryService` now also centralizes bounded
+  `skills + claims + distillations` loading for the agent, and ticker-trace /
+  budget surfaces now expose runtime distillation counts too; a dedicated
+  `/api/v1/memory/runtime-inspect` endpoint and operator-facing `Runtime Memory
+  Inspector` panel now also expose the exact bounded runtime selection for a
+  ticker / strategy / skill override request; `ai_trade_decision` and
+  `ai_position_management` now also persist `runtime_skills` alongside claims
+  and distillations, and ticker-trace / journal drilldowns now reuse the same
+  runtime-memory payload shape instead of showing only budget counters; the
+  next slice is extending that shared retrieval layer into more operational
+  surfaces beyond the dedicated inspector and trace/journal drilldowns
+- keeping that learning layer reviewable and bounded: no live auto-activation
+  of new rules, no arbitrary `execute_code` path, and no weakening of runtime
+  risk governance
 - defining a dedicated position-management regime policy surface:
   allowed actions, tighten/extend permissions, forced reduce/exit rules and
   cooldown behavior by regime
@@ -178,17 +198,19 @@ Main structural gaps versus `PLAN.md`:
   consistently routed through the internal IBKR layer where available
 - learning can record and propose improvements, but there is still no explicit
   replay/backtest promotion gate before a policy or playbook change is adopted
-- the skills layer is now routed, persisted, inspectable and promotable via a
-  bounded paper/replay gate, and validated revisions now load on demand into
-  the agent runtime as compact procedural packets; the surrounding memory
-  layer now also supports bounded runtime claim retrieval plus explicit
-  contradiction/freshness review, plus a scheduled governance lane that keeps
-  stale-claim and weekly-skill workflows fresh without dashboard-triggered
-  syncs; workflow history is now typed and surfaced in the operator dashboard,
-  journal feed and ticker trace when an affected ticker exists, and the UI now
-  supports linked detail drill-down for workflow/claim/gap/candidate entities,
-  but it still lacks richer drawers/detail screens and more opinionated
-  dismissal/review taxonomies
+- the skills/claims/workflow base is now routed, persisted, inspectable and
+  promotable via a bounded paper/replay gate, and validated revisions now load
+  on demand into the runtime as compact procedural packets; bounded claim
+  retrieval, contradiction/freshness review and scheduled governance workflows
+  already exist; per-run `workflow_run` / `workflow_artifact` ledgers are now
+  persisted and exposed through the learning workflow API, including scheduler
+  governance syncs and operator actions, and an initial proposal-based
+  `skill_workshop` now syncs reviewable `skill_proposal` items from claims,
+  gaps, workflow artifacts and repeated operator disagreement clusters.
+  Portable skill export/import and memory distillation/compaction are now also
+  in place, including reviewed digest retrieval in runtime. The next missing
+  layer is still deeper procedural reuse across operator surfaces and later
+  bounded delegation for research lanes
 - `TradeSignal` naming now exists in the market/API layer, but persistence and
   downstream references still use older names such as `signals`, `signal_id`
   and `SignalService`
@@ -252,19 +274,21 @@ Files reviewed during the latest architecture and policy pass:
 
 ## Next Step
 
-Use the new OpenClaw/Hermes-style `skills + claims + workflows` base to
-implement the next real learning-loop slice:
+Use the existing OpenClaw/Hermes-style `skills + claims + workflows` base to
+continue the reusable runtime slice now that distillation and review actions
+exist:
 
-1. enrich workflow resolution semantics beyond `open/in_progress/resolved`,
-   including more opinionated dismissal/review taxonomies and clearer
-   cross-links between workflow history, journal entries and the affected
-   claims/gaps/candidates
-2. surface the scheduled governance lane more deeply in operator views
-   (richer workflow detail, journal drill-down, eventual drawers from
-   trace/feed into affected entities) so the cadence and outcomes are visible
-   outside the main dashboard cards
-3. keep runtime risk/execution behavior unchanged while workflow governance and
-   auditability are hardened
+1. reuse `LearningRuntimeMemoryService` outside the agent with a dedicated
+   inspection/debug surface so the operator can see exactly what the bounded
+   runtime loader would inject for a given ticker / strategy context
+   status: done via `/api/v1/memory/runtime-inspect` and the new operator
+   `Runtime Memory Inspector` panel
+2. extend reviewed distillation visibility beyond budget counts into richer
+   operator/ticker-trace drilldowns and reuse the same inspector payload shape
+   in more operational surfaces without changing execution or risk semantics
+   status: partially done via persisted `runtime_skills` plus runtime snapshot
+   drilldowns in `Ticker Trace` and `Decision Journal`
+3. only after retrieval is stable, add bounded delegation for research lanes
 
 ## Resume Checklist
 
@@ -308,6 +332,19 @@ Before continuing implementation:
 - review `learning/tools.py`, `learning/relevance.py` and
   `execution/services.py` before introducing any new skill-routing or
   lesson-promotion path
+- review `learning/workflows.py`, `learning/skills.py`,
+  `learning/operator_feedback.py` and `system/services.py` together before
+  adding `skill_workshop`, workflow-produced artifacts or portable
+  skill-export paths
+- review `learning/services.py`, `learning/agent.py`, `learning/api.py` and
+  `frontend/app.js` together before changing distillation review UX or bounded
+  runtime retrieval
+- review `learning/runtime_memory.py`, `learning/agent.py`,
+  `learning/services.py` and `tests/test_ai_agent.py` together before changing
+  runtime memory source registration, packet budgets or inspection endpoints
+- review `db/models/learning_workflow.py`, `learning/schemas.py` and
+  `tests/test_learning_workflows.py` together before changing run/artifact
+  payload shapes or API exposure
 - rerun targeted pytest coverage for policy and orchestrator paths after
   touching doctrine or execution guards
 - continue from the latest entry in `Session Log`
@@ -414,6 +451,70 @@ Backend work continues under this file's existing focus items.
   none
 - verification:
   `pytest tests` passed in the backend environment after this change
+
+### 2026-04-22 14:55 UTC
+
+- changed:
+  exposed `LearningRuntimeMemoryService.inspect_selection(...)` through
+  `/api/v1/memory/runtime-inspect`, added typed response schemas plus test
+  singleton reset wiring, and added a new operator-facing `Runtime Memory
+  Inspector` panel that can inspect bounded runtime `skills + claims +
+  distillations` by ticker, strategy version or explicit skill-code overrides;
+  the ticker-trace flow now also keeps that inspector in sync on refresh/manual
+  trace loads
+- reason:
+  make the reusable OpenClaw/Hermes-style runtime memory layer observable
+  outside the agent so the operator can inspect exactly what context would be
+  injected before changing retrieval or delegation behavior
+- pending:
+  the inspector currently exists as its own dedicated panel; richer inline
+  drilldowns in ticker-trace and other operational views still need to reuse
+  the same payload and summary shape
+- next:
+  reuse the inspector payload in more operator surfaces, especially deeper
+  distillation/ticker-trace drilldowns, before adding any bounded delegation
+- blockers:
+  none
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/runtime_memory.py backend/app/domains/learning/api.py backend/app/domains/learning/schemas.py backend/tests/conftest.py backend/tests/test_ai_agent.py`,
+  `node --check backend/app/frontend/app.js`, and
+  `backend/.venv/bin/pytest -q backend/tests/test_ai_agent.py backend/tests/test_ticker_trace.py backend/tests/test_skills.py backend/tests/test_learning_history_retention.py`
+  all passed during this slice
+
+### 2026-04-22 19:25 UTC
+
+- changed:
+  persisted `runtime_skills` alongside `runtime_claims` and
+  `runtime_distillations` in agent decision journal/memory artifacts, exposed
+  that payload on ticker-trace journal events, and reused the same runtime
+  packet renderers inside `Ticker Trace` and `Decision Journal` so operator
+  drilldowns now show the actual bounded runtime packets instead of only budget
+  counters; ticker-trace summary now also embeds a `Runtime Snapshot` block
+  backed by the inspector payload when the selected ticker matches
+- reason:
+  the previous slice exposed runtime memory in a dedicated inspector, but the
+  core operational views still forced the operator to hop away from the trace
+  to understand what procedural/runtime context had actually been loaded
+- pending:
+  runtime-memory reuse is now present in the inspector, ticker-trace and
+  journal, but still missing in deeper linked surfaces such as learning detail
+  comparisons or other operator drilldowns that could benefit from showing
+  live-vs-persisted runtime context side by side
+- next:
+  keep reusing the shared runtime-memory payload shape in more operator
+  surfaces, especially richer trace/detail comparisons, before considering any
+  bounded delegation lane
+- blockers:
+  none
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/agent.py backend/app/domains/learning/services.py backend/tests/test_ai_agent.py backend/tests/test_ticker_trace.py`,
+  `node --check backend/app/frontend/app.js`, and
+  `backend/.venv/bin/pytest -q backend/tests/test_ai_agent.py backend/tests/test_ticker_trace.py backend/tests/test_skills.py backend/tests/test_learning_history_retention.py`
+  passed; host smoke via `POST /api/v1/journal` + `GET /api/v1/journal/ticker-trace/SMKRTM?limit=6`
+  confirmed `runtime_skills`, `runtime_claims` and `runtime_distillations`
+  appeared together in ticker-trace event details, and the temporary runtime
+  row was removed again so `GET /api/v1/journal/ticker-trace/SMKRTM?limit=3`
+  returned `total_journal_entries = 0`
 
 ### 2026-04-18 08:31 UTC
 
@@ -4105,3 +4206,485 @@ Use this format for the next updates:
   issue appears first.
 - blockers:
   none.
+
+### 2026-04-22 10:16 UTC
+
+- changed:
+  refreshed `PLAN.md` and this journal after comparing the current repo state
+  against the most reusable parts of `OpenClaw/Hermes`.
+  The implementation order is now explicitly re-centered on:
+  `workflow_run` / `workflow_artifact`,
+  an internal proposal-based `skill_workshop`,
+  workflow outputs that land as structured artifacts,
+  portable skill exports,
+  and later memory distillation / pluggable retrieval.
+  No backend runtime behavior changed in this slice.
+- reason:
+  the repo already has more learning primitives than the old plan implied:
+  explicit review workflows, runtime skill packets, bounded claim retrieval,
+  disagreement -> gap -> candidate bridges and scheduled governance are
+  already implemented.
+  The next highest-value work is not more isolated entities or UI taxonomy,
+  but a reusable runtime layer that records what each workflow produced and
+  turns stable evidence into reviewable procedural artifacts.
+- pending:
+  still missing:
+  persisted workflow run/artifact ledgers,
+  internal `skill_workshop` proposals,
+  structured workflow artifact outputs,
+  portable `SKILL.md` / YAML skill artifacts,
+  and memory distillation / compaction.
+- next:
+  start with `workflow_run` and `workflow_artifact`, then wire
+  `premarket_review`, `postmarket_review` and `regime_shift_review` to produce
+  structured outputs consumable by the later `skill_workshop`.
+- blockers:
+  none.
+- verification:
+  documentation-only update; no code/runtime changes and no tests required.
+
+### 2026-04-22 10:30 UTC
+
+- changed:
+  implemented slice 1 of the updated OpenClaw/Hermes-inspired roadmap.
+  Added persisted `learning_workflow_runs` and
+  `learning_workflow_artifacts` tables plus ORM models and migration
+  `20260422_0020_learning_workflow_runs_and_artifacts.py`.
+  `LearningWorkflowService` now records explicit `sync` runs for every
+  scheduled/manual workflow refresh and explicit `action` runs for workflow
+  actions, including linked artifact payloads for item deltas, action effects,
+  claim evidence, promoted candidates and the journal entry created by the
+  action.
+  The learning workflow API now exposes `recent_runs` with nested artifacts,
+  and the scheduler governance lane records runs with
+  `trigger_source=scheduler_governance`.
+- reason:
+  the workflow aggregate already exposed current state and embedded history,
+  but it could not answer the more useful runtime question:
+  which exact execution produced which output.
+  This slice creates the auditable run ledger required before a real
+  `skill_workshop` or later memory distillation can be trusted.
+- pending:
+  still missing:
+  internal `skill_workshop` proposals,
+  richer workflow-produced artifacts for `premarket/postmarket/regime`
+  reviews,
+  portable `SKILL.md` / YAML skill artifacts,
+  and memory distillation / compaction.
+- next:
+  start slice 2 by defining `skill_workshop` proposal entities and by wiring
+  the session/regime review workflows to emit more opinionated structured
+  artifacts that the workshop can review.
+- blockers:
+  none.
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/db/models/learning_workflow.py backend/app/domains/learning/workflows.py backend/app/domains/learning/api.py backend/app/domains/learning/schemas.py backend/tests/test_learning_workflows.py backend/tests/test_scheduler.py`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_workflows.py` -> `7 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_scheduler.py -k learning_governance` -> `3 passed, 13 deselected`
+  `backend/.venv/bin/pytest -q backend/tests/test_ticker_trace.py -k learning_workflow` -> `1 passed, 1 deselected`
+  `curl -sS "http://127.0.0.1:15180/api/v1/learning-workflows?limit=2&history_limit=1&run_limit=1&artifact_limit=2"` returned `recent_runs` from the real host runtime, including scheduler-governance sync runs.
+
+### 2026-04-22 10:52 UTC
+
+- changed:
+  implemented slice 2 in a bounded form by adding an internal
+  `skill_workshop` over `memory_items` rather than a new table family.
+  `backend/app/domains/learning/skills.py` now defines
+  `memory_type=skill_proposal` plus `SkillWorkshopService`, which:
+  syncs reviewable proposals from
+  eligible `knowledge_claim`s,
+  open `skill_gap`s,
+  repeated operator-disagreement clusters,
+  and the new workflow completion artifacts for
+  `premarket_review`, `postmarket_review` and `regime_shift_review`.
+  Proposals are exposed through new API routes in
+  `backend/app/domains/learning/api.py` and schemas in
+  `backend/app/domains/learning/schemas.py`,
+  are included in the skill dashboard,
+  and can be reviewed with `approve/reject`; approval creates or reuses a
+  draft `skill_candidate` without activating it live.
+  `backend/app/domains/learning/workflows.py` now also emits richer
+  workflow-completion artifacts
+  (`premarket_review_completion`, `postmarket_review_completion`,
+  `regime_shift_review_completion`)
+  so the workshop can consume session/regime reviews directly.
+- reason:
+  after adding `workflow_run` / `workflow_artifact`, the next missing layer was
+  not more passive storage but a reviewable procedural funnel.
+  This slice creates that funnel without weakening live controls:
+  evidence can now become a proposal first, then a candidate, and only later a
+  validated revision.
+- pending:
+  still missing:
+  richer workflow outputs that land directly as structured
+  `claim/research_task/skill_gap/skill_candidate` artifacts,
+  portable `SKILL.md` / YAML export/import,
+  and later memory distillation / compaction.
+- next:
+  continue by making the session/regime review workflows produce more
+  explicit structured outputs that the workshop can consume without relying
+  only on completion summaries, then layer portable skill artifacts on top.
+- blockers:
+  none.
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/skills.py backend/app/domains/learning/api.py backend/app/domains/learning/schemas.py backend/app/domains/learning/workflows.py backend/app/domains/learning/services.py backend/tests/conftest.py backend/tests/test_skills.py`
+  `backend/.venv/bin/pytest -q backend/tests/test_skills.py -k 'workshop or gap_can_be_promoted or skill_candidate_validation_creates_active_revision'` -> `6 passed, 11 deselected`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_workflows.py` -> `7 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_knowledge_claims.py -k 'operator_disagreement_clusters or claim_can_be_promoted_manually_to_skill_candidate'` -> `3 passed, 4 deselected`
+  `project-check trading-research-app` -> health `ok`
+  `curl -sS "http://127.0.0.1:15180/api/v1/skills/proposals?sync=true&limit=10"` returned `[]` on the real host runtime without errors
+  `curl -sS "http://127.0.0.1:15180/api/v1/skills/dashboard"` returned the new `proposals` field in the real host runtime.
+
+### 2026-04-22 11:18 UTC
+
+- changed:
+  implemented slice 3 of the OpenClaw/Hermes-inspired learning roadmap in a
+  bounded operator-driven form.
+  `LearningWorkflowActionRequest` now accepts optional structured outputs for
+  `claims`, `research_tasks`, `skill_gaps` and `skill_candidates`.
+  `LearningWorkflowService` materializes those outputs during the workflow
+  action itself by reusing the existing claim, research-task and memory-based
+  skill services, then records the resulting entities as explicit artifacts in
+  the same `workflow_run`.
+  This means `premarket_review`, `postmarket_review` and
+  `regime_shift_review` can now close with both the normal completion artifact
+  and concrete persisted work products instead of only a free-text summary.
+- reason:
+  the previous slice could only turn workflow completions into proposals
+  indirectly through completion artifacts.
+  The missing runtime surface was the direct operator path:
+  when a review finishes, the operator should be able to emit a claim,
+  follow-up research task, detected gap or candidate immediately and still get
+  one auditable run ledger covering the whole action.
+- pending:
+  still missing:
+  portable `SKILL.md` / YAML export/import,
+  memory distillation / compaction,
+  and only later pluggable retrieval / delegation.
+- next:
+  start slice 4 by exporting validated skill revisions into portable
+  `SKILL.md` / YAML artifacts and defining the inverse controlled import path
+  back into draft candidates or revisions.
+- blockers:
+  none.
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/schemas.py backend/app/domains/learning/api.py backend/app/domains/learning/workflows.py backend/tests/test_learning_workflows.py`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_workflows.py` -> `9 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_scheduler.py -k learning_governance` -> `3 passed, 13 deselected`
+  `project-check trading-research-app` -> health `ok`
+  `curl -sS "http://127.0.0.1:15180/api/v1/learning-workflows?sync=true&limit=5"` returned workflow payloads from the real host runtime after reload.
+
+### 2026-04-22 11:20 UTC
+
+- changed:
+  implemented slice 4 of the OpenClaw/Hermes-inspired learning roadmap.
+  Added a dedicated portable-artifact service in
+  `backend/app/domains/learning/portable_skills.py` plus API routes in
+  `backend/app/domains/learning/api.py` and schemas in
+  `backend/app/domains/learning/schemas.py`.
+  `GET /api/v1/skills/revisions/{revision_id}/portable` now exports a
+  `validated_skill_revision` as a portable document with both `yaml_text` and
+  `skill_md`.
+  `POST /api/v1/skills/portable/import` now imports that artifact back as a
+  draft `skill_candidate` or as an inactive `validated_skill_revision`,
+  preserving provenance in metadata and writing a journal entry for the import.
+  `backend/tests/test_skills.py` now covers export, YAML->candidate import and
+  `SKILL.md`->inactive-revision import round-trips.
+- reason:
+  after `workflow_run`, `skill_workshop` and structured workflow outputs, the
+  next missing reusable layer was portability:
+  getting validated procedural knowledge out of the relational runtime in a
+  reviewable form and being able to rehydrate it without any live activation.
+- pending:
+  still missing:
+  memory distillation / compaction,
+  then later pluggable retrieval and bounded research delegation.
+- next:
+  start the distillation slice by targeting the noisiest accumulators first:
+  duplicate or aging claims,
+  repeated operator-disagreement clusters,
+  and candidate/gap growth that should collapse into summaries or retirements.
+- blockers:
+  none.
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/schemas.py backend/app/domains/learning/api.py backend/app/domains/learning/portable_skills.py backend/tests/conftest.py backend/tests/test_skills.py`
+  `backend/.venv/bin/pytest -q backend/tests/test_skills.py` -> `20 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_workflows.py` -> `9 passed`
+  `cd backend && .venv/bin/pip install -e '.[dev]'`
+  runtime host smoke test:
+  exported a real revision through `/api/v1/skills/revisions/{revision_id}/portable`
+  and imported it back through `/api/v1/skills/portable/import`,
+  then removed the temporary runtime rows created only for that check
+  (`memory_items` 11/12/13, `skill_validation_records` 1, `journal_entries` 76/77)
+  so the host DB was left clean.
+  `project-check trading-research-app` -> health `ok`
+  `curl -sS "http://127.0.0.1:15180/api/v1/skills/dashboard"` returned a valid payload from the real host runtime after cleanup.
+
+### 2026-04-22 12:35 UTC
+
+- scope:
+  implemented the first explicit `memory distillation / compaction` slice for
+  the learning layer.
+- changes:
+  added `LearningMemoryDistillationService` in
+  `backend/app/domains/learning/services.py`.
+  It now builds reviewable persisted digests with `dry_run/apply` semantics
+  for:
+  grouped stale/contested claim-review queues
+  and repeated operator-disagreement patterns.
+  Added API contracts in `backend/app/domains/learning/schemas.py` and a new
+  endpoint:
+  `POST /api/v1/memory/maintenance/distill`
+  in `backend/app/domains/learning/api.py`.
+  Added an operational CLI:
+  `backend/scripts/distill_learning_memory.py`
+  and taught it to resolve the backend working directory correctly before
+  opening the SQLite runtime.
+  Extended `backend/tests/test_learning_history_retention.py` to cover
+  preview/apply/update behavior and the HTTP flow.
+- reason:
+  after portable skills, the next missing OpenClaw/Hermes-like runtime piece
+  was not more storage but compaction:
+  converting noisy long-horizon review/disagreement accumulators into compact,
+  inspectable digests without auto-activating anything live.
+- pending:
+  still missing:
+  deeper compaction for skill-gap / skill-candidate growth,
+  longer-horizon retirement/collapse rules,
+  and later pluggable retrieval / bounded delegation.
+- blockers:
+  none.
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/services.py backend/app/domains/learning/schemas.py backend/app/domains/learning/api.py backend/tests/test_learning_history_retention.py backend/scripts/distill_learning_memory.py`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_history_retention.py` -> `5 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_knowledge_claims.py` -> `7 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_workflows.py` -> `9 passed`
+  `backend/.venv/bin/python backend/scripts/distill_learning_memory.py`
+  `project-check trading-research-app` -> health `ok`
+  `curl -sS -X POST http://127.0.0.1:15180/api/v1/memory/maintenance/distill -H 'Content-Type: application/json' -d '{"dry_run":true,"include_claim_reviews":true,"include_operator_feedback":false,"min_group_size":2}'`
+  returned a valid `dry_run` payload from the real host runtime.
+
+### 2026-04-22 13:05 UTC
+
+- scope:
+  extended the second `memory distillation / compaction` pass to cover
+  grouped `skill_gap` and `skill_candidate` backlog growth.
+- changes:
+  expanded `LearningMemoryDistillationService` in
+  `backend/app/domains/learning/services.py` with:
+  `skill_gap_digest`
+  and `skill_candidate_digest`.
+  The service now groups open gaps and accumulated candidates by
+  `scope + ticker + target_skill_code/anchor`, emits compact persisted
+  digests, and annotates candidate/gap backlog with
+  `collapse_backlog_recommended`,
+  `collapse_to_candidate_recommended`
+  and `retirement_recommended` metadata instead of mutating source rows.
+  Extended the API and request schema in
+  `backend/app/domains/learning/api.py`
+  and `backend/app/domains/learning/schemas.py`
+  with `include_skill_gaps`, `include_skill_candidates`,
+  `skill_gap_limit` and `skill_candidate_limit`.
+  Extended the CLI in `backend/scripts/distill_learning_memory.py` with
+  matching include/skip flags and limits.
+  Expanded `backend/tests/test_learning_history_retention.py` so the
+  distillation tests now cover preview/apply/update for all four digest types
+  and keep the claim-only HTTP path isolated through flags.
+- reason:
+  the first distillation pass only compacted claims and disagreement history.
+  The next noisy accumulators were repeated open gaps and stacked candidate
+  drafts/validations around the same skill targets, which is exactly where the
+  learning layer starts growing without becoming more reusable.
+- pending:
+  still missing:
+  reviewable collapse / retire actions over grouped gap/candidate backlog,
+  then later pluggable retrieval and bounded delegation.
+- blockers:
+  none.
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/services.py backend/app/domains/learning/schemas.py backend/app/domains/learning/api.py backend/tests/test_learning_history_retention.py backend/scripts/distill_learning_memory.py`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_history_retention.py` -> `5 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_knowledge_claims.py` -> `7 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_workflows.py` -> `9 passed`
+  `backend/.venv/bin/python backend/scripts/distill_learning_memory.py --skip-claims --skip-operator-feedback`
+  `project-check trading-research-app` -> health `ok`
+  `curl -sS -X POST http://127.0.0.1:15180/api/v1/memory/maintenance/distill -H 'Content-Type: application/json' -d '{"dry_run":true,"include_claim_reviews":false,"include_operator_feedback":false,"include_skill_gaps":true,"include_skill_candidates":true,"min_group_size":2}'`
+  returned a valid `dry_run` payload from the real host runtime.
+
+### 2026-04-22 13:40 UTC
+
+- scope:
+  added reviewable `collapse / retire` actions on top of the new distilled
+  `skill_gap` / `skill_candidate` backlog groups.
+- changes:
+  extended `LearningMemoryDistillationService` in
+  `backend/app/domains/learning/services.py` with:
+  digest listing/get helpers,
+  review metadata preservation across re-distillation,
+  and actionable review handlers for:
+  `skill_gap_digest`
+  and `skill_candidate_digest`.
+  Added API surface in `backend/app/domains/learning/api.py`:
+  `GET /api/v1/memory/maintenance/digests`
+  `GET /api/v1/memory/maintenance/digests/{digest_id}`
+  `POST /api/v1/memory/maintenance/digests/{digest_id}/review`
+  plus request/result schemas in
+  `backend/app/domains/learning/schemas.py`.
+  `collapse` now:
+  collapses grouped open gaps into a single candidate (creating one if needed)
+  or retires redundant candidate backlog in favor of a kept survivor.
+  `retire` now:
+  retires grouped gaps directly,
+  or retires candidate backlog only when no validated/active candidate remains
+  in that digest.
+  Extended `backend/tests/test_learning_history_retention.py` with API-level
+  coverage for:
+  gap-digest collapse,
+  candidate-digest collapse,
+  and candidate-digest retire.
+- reason:
+  the previous slice could summarize backlog but could not reduce it. That left
+  the learning layer more observable but not yet operationally compact.
+- pending:
+  still missing:
+  wiring digests and review outputs into operator/dashboard surface or bounded
+  retrieval,
+  then later pluggable retrieval and bounded delegation.
+- blockers:
+  none.
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/services.py backend/app/domains/learning/schemas.py backend/app/domains/learning/api.py backend/tests/test_learning_history_retention.py backend/scripts/distill_learning_memory.py`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_history_retention.py` -> `7 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_knowledge_claims.py` -> `7 passed`
+  `backend/.venv/bin/pytest -q backend/tests/test_learning_workflows.py` -> `9 passed`
+  runtime host smoke test:
+  created two temporary host `skill_gap` rows under a dedicated scope,
+  distilled them,
+  reviewed the resulting digest with `collapse`,
+  verified a candidate was created and the grouped gaps were collapsed,
+  then removed the temporary `memory_items` and `journal_entries` rows from the
+  host SQLite so the runtime DB was left clean.
+  `project-check trading-research-app` -> health `ok`
+  `curl -sS http://127.0.0.1:15180/api/v1/memory/maintenance/digests?limit=5`
+  returned a valid payload from the real host runtime after cleanup.
+
+### 2026-04-22 14:00 UTC
+
+- scope:
+  wired reviewed learning-distillation digests into both the operator surface
+  and bounded agent runtime retrieval.
+- changes:
+  extended `SkillDashboardRead` in
+  `backend/app/domains/learning/schemas.py`
+  and `SkillLifecycleService.build_dashboard` in
+  `backend/app/domains/learning/skills.py`
+  so `/api/v1/skills/dashboard` now returns recent `distillations`.
+  Extended `LearningMemoryDistillationService` in
+  `backend/app/domains/learning/services.py`
+  with bounded runtime selection, runtime packet rendering and filtering that
+  only loads reviewed/collapsed `skill_gap_digest` and
+  `skill_candidate_digest` items relevant to the current `ticker` or
+  `strategy_version_id`.
+  Extended `AutonomousTradingAgentService` in
+  `backend/app/domains/learning/agent.py`
+  so `agent_protocol` now carries `runtime_distillations`,
+  `context_budget` includes distillation counts,
+  decision/management journals persist loaded distillation packets,
+  and the system prompt appends a dedicated reviewed-distillation guidance
+  block alongside runtime skills and claims.
+  Extended the operator console in
+  `backend/app/frontend/index.html`
+  and `backend/app/frontend/app.js`
+  with a new `Learning Distillations` panel, digest detail loading,
+  digest review actions (`collapse` / `retire`) and post-action detail refresh.
+  Added regression coverage in:
+  `backend/tests/test_skills.py`
+  for dashboard exposure of distillations,
+  and `backend/tests/test_ai_agent.py`
+  for `runtime_distillations` loading and prompt rendering.
+- reason:
+  the previous slice made distillation auditable and actionable, but compacted
+  learning still was not reusable by the operator or the agent runtime.
+  This slice closes that gap without changing execution or risk behavior.
+- pending:
+  still missing:
+  a cleaner pluggable retrieval interface across `skills/claims/distillations`,
+  plus broader reuse of reviewed digests in ticker-trace and other operator
+  surfaces.
+- blockers:
+  none.
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/services.py backend/app/domains/learning/skills.py backend/app/domains/learning/schemas.py backend/app/domains/learning/agent.py backend/tests/test_skills.py backend/tests/test_ai_agent.py`
+  `node --check backend/app/frontend/app.js`
+  `backend/.venv/bin/pytest -q backend/tests/test_skills.py backend/tests/test_ai_agent.py backend/tests/test_learning_history_retention.py` -> `42 passed`
+  `project-check trading-research-app` -> health `ok`
+  host smoke test:
+  created two temporary host `skill_gap` rows under `strategy:987654322`,
+  distilled them,
+  reviewed the digest with `collapse`,
+  verified `/api/v1/skills/dashboard` returned `distillations[0].meta.review_status = applied`,
+  verified `AutonomousTradingAgentService._build_decision_context(...)`
+  loaded `runtime_distillations = 1`,
+  then removed the temporary rows so
+  `curl -sS http://127.0.0.1:15180/api/v1/skills/dashboard`
+  returned `distillation_count = 0` again on the clean runtime DB.
+
+### 2026-04-22 14:20 UTC
+
+- scope:
+  extracted bounded runtime memory loading behind a shared retrieval service and
+  extended `ticker-trace` / operator budget surfaces to include runtime
+  distillation counts explicitly.
+- changes:
+  added `LearningRuntimeMemoryService` in
+  `backend/app/domains/learning/runtime_memory.py`
+  as the shared runtime loader for `runtime_skills`,
+  `runtime_claims` and `runtime_distillations`, with source registration kept
+  explicit so the retrieval layer is no longer hard-coded directly inside the
+  agent context builders.
+  Refactored `AutonomousTradingAgentService` in
+  `backend/app/domains/learning/agent.py`
+  to consume that shared service for both candidate-decision and
+  open-position-management contexts instead of assembling each runtime memory
+  slice inline.
+  Extended ticker-trace summary/event exposure in
+  `backend/app/domains/learning/schemas.py`
+  and `backend/app/domains/learning/services.py`
+  with:
+  `latest_available_runtime_distillation_count`,
+  `latest_loaded_runtime_distillation_count`,
+  and explicit `runtime_distillations` payloads on journal event details.
+  Extended the frontend budget summarizers in
+  `backend/app/frontend/app.js`
+  so journal feed, ticker-trace summary and other budget-driven operator
+  surfaces now render `distill` counts alongside `skills` and `claims`.
+  Added regression coverage in:
+  `backend/tests/test_ticker_trace.py`
+  for distillation-aware ticker trace summary/detail payloads.
+- reason:
+  the previous slice made runtime distillations available, but the retrieval
+  contract was still duplicated in the agent and the operator only saw them in
+  the dashboard. This slice consolidates the loader and makes distillation
+  reuse visible in broader operational surfaces.
+- pending:
+  still missing:
+  a dedicated operator/debug endpoint that shows what
+  `LearningRuntimeMemoryService` would inject for a given ticker / strategy
+  context, plus richer runtime-memory drilldowns beyond budget counters.
+- blockers:
+  none.
+- verification:
+  `backend/.venv/bin/python -m py_compile backend/app/domains/learning/runtime_memory.py backend/app/domains/learning/agent.py backend/app/domains/learning/services.py backend/app/domains/learning/schemas.py backend/tests/test_ai_agent.py backend/tests/test_ticker_trace.py`
+  `node --check backend/app/frontend/app.js`
+  `backend/.venv/bin/pytest -q backend/tests/test_ai_agent.py backend/tests/test_ticker_trace.py backend/tests/test_skills.py backend/tests/test_learning_history_retention.py` -> `44 passed`
+  `project-check trading-research-app` -> health `ok`
+  host smoke test:
+  inserted a temporary `ai_trade_decision` journal row for ticker `SMKDIST`
+  with `runtime_distillations` plus `context_budget.runtime_distillations`,
+  verified `/api/v1/journal/ticker-trace/SMKDIST?limit=6` returned
+  `latest_available_runtime_distillation_count = 1`,
+  `latest_loaded_runtime_distillation_count = 1`,
+  and the expected distillation key in event details,
+  then deleted the temporary journal row so
+  `/api/v1/journal/ticker-trace/SMKDIST?limit=3`
+  returned `total_journal_entries = 0` again on the clean runtime DB.

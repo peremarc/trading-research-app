@@ -6,7 +6,7 @@ from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
-from app.domains.market.schemas import WorkQueueRead
+from app.domains.market.schemas import ResearchTaskCreate, WorkQueueRead
 from app.domains.execution.schemas import AutoExitBatchResult
 
 
@@ -69,6 +69,8 @@ class TickerTraceSummaryRead(BaseModel):
     latest_loaded_runtime_skill_count: int | None = None
     latest_available_runtime_claim_count: int | None = None
     latest_loaded_runtime_claim_count: int | None = None
+    latest_available_runtime_distillation_count: int | None = None
+    latest_loaded_runtime_distillation_count: int | None = None
     latest_runtime_budget_truncated: bool = False
     latest_score: float | None = None
     latest_timing_total_ms: float | None = None
@@ -121,6 +123,82 @@ class MemoryItemRead(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class RuntimeMemoryInspectionSourceRead(BaseModel):
+    source_type: str
+    signal_id: int | None = None
+    position_id: int | None = None
+    ticker: str | None = None
+    strategy_version_id: int | None = None
+    timestamp: datetime | None = None
+    summary: str | None = None
+
+
+class RuntimeMemoryInspectionRead(BaseModel):
+    ticker: str | None = None
+    strategy_version_id: int | None = None
+    requested_skill_codes: list[str] = Field(default_factory=list)
+    resolved_skill_context: dict = Field(default_factory=dict)
+    skill_context_source: RuntimeMemoryInspectionSourceRead
+    runtime_skills: list[dict] = Field(default_factory=list)
+    runtime_claims: list[dict] = Field(default_factory=list)
+    runtime_distillations: list[dict] = Field(default_factory=list)
+    context_budget: dict = Field(default_factory=dict)
+
+
+class MemoryDistillationRequest(BaseModel):
+    dry_run: bool = True
+    include_claim_reviews: bool = True
+    include_operator_feedback: bool = True
+    include_skill_gaps: bool = True
+    include_skill_candidates: bool = True
+    claim_limit: int = Field(default=200, ge=1, le=500)
+    disagreement_limit: int = Field(default=200, ge=1, le=500)
+    skill_gap_limit: int = Field(default=200, ge=1, le=500)
+    skill_candidate_limit: int = Field(default=200, ge=1, le=500)
+    min_group_size: int = Field(default=2, ge=2, le=20)
+
+
+class MemoryDistillationDigestRead(BaseModel):
+    distillation_type: str
+    key: str
+    scope: str
+    content: str
+    importance: float
+    action: str
+    memory_id: int | None = None
+    source_count: int = 0
+    source_ids: list[int] = Field(default_factory=list)
+    meta: dict = Field(default_factory=dict)
+
+
+class MemoryDistillationSectionRead(BaseModel):
+    distillation_type: str
+    digest_count: int = 0
+    created_count: int = 0
+    updated_count: int = 0
+    unchanged_count: int = 0
+    digests: list[MemoryDistillationDigestRead] = Field(default_factory=list)
+
+
+class MemoryDistillationResult(BaseModel):
+    dry_run: bool
+    created_count: int = 0
+    updated_count: int = 0
+    unchanged_count: int = 0
+    sections: list[MemoryDistillationSectionRead] = Field(default_factory=list)
+
+
+class MemoryDistillationReviewRequest(BaseModel):
+    action: str = Field(min_length=1, max_length=32)
+    summary: str = Field(min_length=1, max_length=4000)
+    keep_entity_id: int | None = None
+
+
+class MemoryDistillationReviewResult(BaseModel):
+    digest: MemoryItemRead
+    effect: dict = Field(default_factory=dict)
 
 
 class KnowledgeClaimCreate(BaseModel):
@@ -246,6 +324,40 @@ class SkillRevisionRead(BaseModel):
     meta: dict = Field(default_factory=dict)
 
 
+class SkillPortableArtifactRead(BaseModel):
+    artifact_version: str
+    artifact_type: str
+    skill_code: str | None = None
+    target_skill_code: str | None = None
+    exported_at: datetime | None = None
+    document: dict = Field(default_factory=dict)
+    skill_md: str
+    yaml_text: str
+
+
+class SkillPortableImportRequest(BaseModel):
+    format: str = Field(min_length=1, max_length=24)
+    content: str = Field(min_length=1, max_length=200000)
+    import_as: str = Field(default="candidate", min_length=1, max_length=24)
+    scope: str | None = Field(default=None, max_length=50)
+    key: str | None = Field(default=None, max_length=120)
+    summary: str | None = Field(default=None, max_length=4000)
+    target_skill_code: str | None = Field(default=None, max_length=120)
+    candidate_action: str | None = Field(default=None, max_length=40)
+    ticker: str | None = Field(default=None, max_length=12)
+    strategy_version_id: int | None = None
+    candidate_id: int | None = Field(default=None, ge=1)
+
+
+class SkillPortableImportResult(BaseModel):
+    format: str
+    import_as: str
+    document: dict = Field(default_factory=dict)
+    candidate: SkillCandidateRead | None = None
+    revision: SkillRevisionRead | None = None
+    journal_entry_id: int | None = None
+
+
 class SkillCandidateRead(BaseModel):
     id: int
     scope: str
@@ -264,6 +376,40 @@ class SkillCandidateRead(BaseModel):
     created_at: datetime
     importance: float
     meta: dict = Field(default_factory=dict)
+
+
+class SkillProposalRead(BaseModel):
+    id: int
+    scope: str
+    key: str
+    summary: str
+    proposal_type: str
+    proposal_status: str = "pending"
+    target_skill_code: str | None = None
+    candidate_action: str | None = None
+    source_type: str | None = None
+    source_claim_id: int | None = None
+    source_gap_id: int | None = None
+    source_workflow_id: int | None = None
+    source_workflow_run_id: int | None = None
+    source_workflow_artifact_id: int | None = None
+    source_operator_disagreement_cluster_id: int | None = None
+    linked_skill_candidate_id: int | None = None
+    ticker: str | None = None
+    strategy_version_id: int | None = None
+    created_at: datetime
+    importance: float
+    meta: dict = Field(default_factory=dict)
+
+
+class SkillProposalReviewRequest(BaseModel):
+    outcome: str = Field(min_length=1, max_length=24)
+    summary: str = Field(min_length=1, max_length=4000)
+
+
+class SkillProposalReviewResult(BaseModel):
+    proposal: SkillProposalRead
+    candidate: SkillCandidateRead | None = None
 
 
 class SkillCandidateValidationRequest(BaseModel):
@@ -399,9 +545,11 @@ class OperatorDisagreementClusterPromoteGapResult(BaseModel):
 
 class SkillDashboardRead(BaseModel):
     catalog: list[SkillDefinitionRead] = Field(default_factory=list)
+    proposals: list[SkillProposalRead] = Field(default_factory=list)
     candidates: list[SkillCandidateRead] = Field(default_factory=list)
     active_revisions: list[SkillRevisionRead] = Field(default_factory=list)
     gaps: list[SkillGapRead] = Field(default_factory=list)
+    distillations: list[MemoryItemRead] = Field(default_factory=list)
 
 
 class LearningWorkflowItemRead(BaseModel):
@@ -432,6 +580,41 @@ class LearningWorkflowHistoryEntryRead(BaseModel):
     effect: dict = Field(default_factory=dict)
 
 
+class LearningWorkflowArtifactRead(BaseModel):
+    id: int
+    workflow_run_id: int
+    artifact_type: str
+    entity_type: str | None = None
+    entity_id: int | None = None
+    title: str | None = None
+    summary: str | None = None
+    ticker: str | None = None
+    strategy_version_id: int | None = None
+    payload: dict = Field(default_factory=dict)
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class LearningWorkflowRunRead(BaseModel):
+    id: int
+    workflow_id: int
+    run_kind: str
+    trigger_source: str | None = None
+    status: str
+    summary: str | None = None
+    input_payload: dict = Field(default_factory=dict)
+    context_payload: dict = Field(default_factory=dict)
+    output_payload: dict = Field(default_factory=dict)
+    artifact_count: int = 0
+    started_at: datetime
+    completed_at: datetime | None = None
+    created_at: datetime
+    artifacts: list[LearningWorkflowArtifactRead] = Field(default_factory=list)
+
+    model_config = {"from_attributes": True}
+
+
 class LearningWorkflowRead(BaseModel):
     id: int
     workflow_type: str
@@ -449,8 +632,44 @@ class LearningWorkflowRead(BaseModel):
     last_synced_at: datetime | None = None
     resolved_at: datetime | None = None
     history: list[LearningWorkflowHistoryEntryRead] = Field(default_factory=list)
+    recent_runs: list[LearningWorkflowRunRead] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
+
+
+class LearningWorkflowSkillGapCreate(BaseModel):
+    scope: str = Field(min_length=1, max_length=50)
+    key: str = Field(min_length=1, max_length=120)
+    summary: str = Field(min_length=1, max_length=4000)
+    gap_type: str = Field(min_length=1, max_length=80)
+    ticker: str | None = Field(default=None, max_length=12)
+    strategy_version_id: int | None = None
+    position_id: int | None = None
+    status: str = Field(default="open", max_length=24)
+    linked_skill_code: str | None = Field(default=None, max_length=120)
+    target_skill_code: str | None = Field(default=None, max_length=120)
+    candidate_action: str | None = Field(default=None, max_length=40)
+    source_type: str | None = Field(default=None, max_length=40)
+    importance: float = Field(default=0.72, ge=0.0, le=1.0)
+    evidence: dict = Field(default_factory=dict)
+    meta: dict = Field(default_factory=dict)
+
+
+class LearningWorkflowSkillCandidateCreate(BaseModel):
+    scope: str = Field(min_length=1, max_length=50)
+    key: str = Field(min_length=1, max_length=120)
+    summary: str = Field(min_length=1, max_length=4000)
+    target_skill_code: str | None = Field(default=None, max_length=120)
+    candidate_action: str | None = Field(default=None, max_length=40)
+    candidate_status: str = Field(default="draft", max_length=24)
+    activation_status: str | None = Field(default=None, max_length=24)
+    validation_required: bool = True
+    source_type: str | None = Field(default=None, max_length=40)
+    source_trade_review_id: int | None = None
+    ticker: str | None = Field(default=None, max_length=12)
+    strategy_version_id: int | None = None
+    importance: float = Field(default=0.72, ge=0.0, le=1.0)
+    meta: dict = Field(default_factory=dict)
 
 
 class LearningWorkflowActionRequest(BaseModel):
@@ -458,6 +677,10 @@ class LearningWorkflowActionRequest(BaseModel):
     entity_id: int = Field(ge=1)
     action: str = Field(min_length=1, max_length=40)
     summary: str = Field(min_length=1, max_length=4000)
+    claims: list[KnowledgeClaimCreate] = Field(default_factory=list)
+    research_tasks: list[ResearchTaskCreate] = Field(default_factory=list)
+    skill_gaps: list[LearningWorkflowSkillGapCreate] = Field(default_factory=list)
+    skill_candidates: list[LearningWorkflowSkillCandidateCreate] = Field(default_factory=list)
 
 
 class LearningWorkflowActionResult(BaseModel):

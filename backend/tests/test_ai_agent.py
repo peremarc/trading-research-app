@@ -1,7 +1,11 @@
+from datetime import datetime, timezone
+
 import pytest
 
 from app.core.config import Settings
 from app.db.models.memory import MemoryItem
+from app.db.models.journal import JournalEntry
+from app.db.models.signal import TradeSignal
 from app.domains.learning.agent import AIDecisionError, AutonomousTradingAgentService, ProviderSlot
 from app.domains.learning.claims import ClaimEvidenceSeed, ClaimSeed, KnowledgeClaimService
 from app.domains.learning.protocol import (
@@ -540,6 +544,32 @@ def test_agent_decision_context_loads_runtime_skills_on_demand(session) -> None:
         activate=True,
     )
 
+    distillation = MemoryItem(
+        memory_type="learning_distillation",
+        scope="strategy:7",
+        key="distill:skill-gap:detect-risk-off-conditions",
+        content="Repeated NVDA breakout reviews kept surfacing the same risk-off execution gap.",
+        meta={
+            "distillation_type": "skill_gap_digest",
+            "scope": "strategy:7",
+            "ticker": "NVDA",
+            "target_skill_code": "detect_risk_off_conditions",
+            "gap_ids": [401, 402],
+            "review_status": "applied",
+            "review_action": "collapse",
+            "review_summary": "Collapse repeated risk-off gaps into the validated caution overlay.",
+            "reviewed_at": "2026-04-22T13:45:00+00:00",
+            "review_effect": {
+                "action": "collapse",
+                "candidate_id": candidate.id,
+                "collapsed_gap_ids": [401, 402],
+            },
+        },
+        importance=0.83,
+    )
+    session.add(distillation)
+    session.commit()
+
     service = AutonomousTradingAgentService(Settings(ai_runtime_skill_limit=2, ai_runtime_skill_step_limit=4))
     context = service._build_decision_context(  # noqa: SLF001
         session,
@@ -584,8 +614,10 @@ def test_agent_decision_context_loads_runtime_skills_on_demand(session) -> None:
 
     runtime_skills = context["agent_protocol"]["runtime_skills"]
     runtime_claims = context["agent_protocol"]["runtime_claims"]
+    runtime_distillations = context["agent_protocol"]["runtime_distillations"]
     assert len(runtime_skills) == 1
     assert len(runtime_claims) == 1
+    assert len(runtime_distillations) == 1
     assert runtime_skills[0]["skill_code"] == "detect_risk_off_conditions"
     assert runtime_skills[0]["validated_revision_summary"] == (
         "Use stricter caution when expiry or event-risk makes breakout quality fragile."
@@ -600,9 +632,209 @@ def test_agent_decision_context_loads_runtime_skills_on_demand(session) -> None:
     assert context["agent_protocol"]["context_budget"]["available_runtime_claim_count"] == 1
     assert context["agent_protocol"]["context_budget"]["loaded_runtime_claim_count"] == 1
     assert context["agent_protocol"]["context_budget"]["runtime_claims"]["loaded_keys"] == ["review-claim:breakout-volume-filter"]
-    assert context["agent_protocol"]["context_budget"]["loaded_runtime_item_count"] == 2
+    assert context["agent_protocol"]["context_budget"]["available_runtime_distillation_count"] == 1
+    assert context["agent_protocol"]["context_budget"]["loaded_runtime_distillation_count"] == 1
+    assert context["agent_protocol"]["context_budget"]["runtime_distillations"]["loaded_keys"] == [
+        "distill:skill-gap:detect-risk-off-conditions"
+    ]
+    assert context["agent_protocol"]["context_budget"]["loaded_runtime_item_count"] == 3
     prompt = service._build_runtime_skill_prompt(context["agent_protocol"])  # noqa: SLF001
     claim_prompt = service._build_runtime_claim_prompt(context["agent_protocol"])  # noqa: SLF001
+    distillation_prompt = service._build_runtime_distillation_prompt(context["agent_protocol"])  # noqa: SLF001
     assert "Skill `detect_risk_off_conditions`" in prompt
     assert "Relevant durable claim memory is supplied below." in claim_prompt
     assert "Breakout entries need stronger relative volume confirmation." in claim_prompt
+    assert "Reviewed learning distillation digests are supplied below." in distillation_prompt
+    assert "distill:skill-gap:detect-risk-off-conditions" in distillation_prompt
+
+
+def test_runtime_memory_inspector_endpoint_returns_resolved_runtime_packets(client, session) -> None:
+    claim = KnowledgeClaimService().create_claim(
+        session,
+        ClaimSeed(
+            scope="strategy:7",
+            key="review-claim:breakout-volume-filter",
+            claim_type="review_improvement",
+            claim_text="Breakout entries need stronger relative volume confirmation.",
+            linked_ticker="NVDA",
+            strategy_version_id=7,
+            status="supported",
+            confidence=0.82,
+            freshness_state="current",
+            meta={"source": "runtime-memory-inspector-test"},
+        ),
+    )
+    KnowledgeClaimService().add_evidence(
+        session,
+        claim_id=claim.id,
+        seed=ClaimEvidenceSeed(
+            source_type="trade_review",
+            source_key="trade_review:nvda-volume-filter",
+            stance="support",
+            summary="Recent failed breakout reviews improved after requiring stronger volume.",
+            evidence_payload={"review_id": 91},
+            strength=0.77,
+        ),
+    )
+
+    candidate = MemoryItem(
+        memory_type="skill_candidate",
+        scope="strategy:7",
+        key="skill_candidate:test:runtime-memory-inspector",
+        content="Add stricter event-risk and expiry caution before breakout entries.",
+        meta={
+            "summary": "Add stricter event-risk and expiry caution before breakout entries.",
+            "target_skill_code": "detect_risk_off_conditions",
+            "candidate_action": "update_existing_skill",
+            "candidate_status": "draft",
+            "validation_required": True,
+            "source_type": "trade_review",
+            "ticker": "NVDA",
+            "strategy_version_id": 7,
+        },
+        importance=0.84,
+    )
+    session.add(candidate)
+    session.commit()
+    session.refresh(candidate)
+
+    SkillLifecycleService().validate_candidate(
+        session,
+        candidate_id=candidate.id,
+        validation_mode="paper",
+        validation_outcome="approve",
+        summary="Use stricter caution when expiry or event-risk makes breakout quality fragile.",
+        sample_size=16,
+        win_rate=62.5,
+        avg_pnl_pct=1.7,
+        max_drawdown_pct=-2.9,
+        evidence={"source": "paper_batch"},
+        activate=True,
+    )
+
+    distillation = MemoryItem(
+        memory_type="learning_distillation",
+        scope="strategy:7",
+        key="distill:skill-gap:detect-risk-off-conditions",
+        content="Repeated NVDA breakout reviews kept surfacing the same risk-off execution gap.",
+        meta={
+            "distillation_type": "skill_gap_digest",
+            "scope": "strategy:7",
+            "ticker": "NVDA",
+            "strategy_version_id": 7,
+            "target_skill_code": "detect_risk_off_conditions",
+            "gap_ids": [401, 402],
+            "review_status": "applied",
+            "review_action": "collapse",
+            "review_summary": "Collapse repeated risk-off gaps into the validated caution overlay.",
+            "reviewed_at": "2026-04-22T13:45:00+00:00",
+            "review_effect": {
+                "action": "collapse",
+                "candidate_id": candidate.id,
+                "collapsed_gap_ids": [401, 402],
+            },
+        },
+        importance=0.83,
+    )
+    signal = TradeSignal(
+        ticker="NVDA",
+        strategy_id=3,
+        strategy_version_id=7,
+        timeframe="1D",
+        signal_type="breakout_long",
+        thesis="Inspector source signal.",
+        signal_time=datetime(2026, 4, 22, 14, 35, 0, tzinfo=timezone.utc),
+        signal_context={
+            "skill_context": {
+                "catalog_version": "skills_v1",
+                "routing_mode": "deterministic_v1",
+                "phase": "do",
+                "considered_skills": [{"code": "detect_risk_off_conditions"}],
+                "applied_skills": [
+                    {
+                        "code": "detect_risk_off_conditions",
+                        "reason": "macro, event-risk or expiry context suggests degraded execution quality",
+                        "confidence": 0.88,
+                    }
+                ],
+                "primary_skill_code": "detect_risk_off_conditions",
+                "risk_skill_active": True,
+                "summary": "Primary skill selected: detect_risk_off_conditions.",
+            }
+        },
+        status="watch",
+        created_at=datetime(2026, 4, 22, 14, 35, 0, tzinfo=timezone.utc),
+    )
+    session.add_all([distillation, signal])
+    session.commit()
+
+    response = client.get("/api/v1/memory/runtime-inspect", params={"ticker": "nvda"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ticker"] == "NVDA"
+    assert payload["strategy_version_id"] == 7
+    assert payload["requested_skill_codes"] == []
+    assert payload["skill_context_source"]["source_type"] == "signal_context"
+    assert payload["skill_context_source"]["signal_id"] == signal.id
+    assert payload["resolved_skill_context"]["primary_skill_code"] == "detect_risk_off_conditions"
+    assert len(payload["runtime_skills"]) == 1
+    assert len(payload["runtime_claims"]) == 1
+    assert len(payload["runtime_distillations"]) == 1
+    assert payload["runtime_skills"][0]["skill_code"] == "detect_risk_off_conditions"
+    assert payload["runtime_claims"][0]["claim_id"] == claim.id
+    assert payload["runtime_distillations"][0]["digest_id"] == distillation.id
+    assert payload["context_budget"]["available_runtime_item_count"] == 3
+    assert payload["context_budget"]["loaded_runtime_item_count"] == 3
+
+
+def test_runtime_memory_inspector_endpoint_requires_a_query_anchor(client) -> None:
+    response = client.get("/api/v1/memory/runtime-inspect")
+
+    assert response.status_code == 400
+    assert "requires ticker, strategy_version_id or skill_codes" in response.json()["detail"]
+
+
+def test_agent_persists_runtime_skills_in_decision_journal_and_memory(session) -> None:
+    service = AutonomousTradingAgentService(Settings())
+    decision = service._parse_decision(  # noqa: SLF001
+        {
+            "action": "watch",
+            "confidence": 0.64,
+            "thesis": "Need more confirmation before entering.",
+            "risks": ["macro uncertainty"],
+            "lessons_applied": ["respect risk-off overlay"],
+        }
+    )
+
+    service._persist_decision(  # noqa: SLF001
+        session,
+        ticker="NVDA",
+        strategy_id=3,
+        strategy_version_id=7,
+        watchlist_code="tech_growth",
+        signal_payload={"combined_score": 0.74},
+        market_context={"execution_mode": "paper"},
+        decision=decision,
+        runtime_skills=[
+            {
+                "skill_code": "detect_risk_off_conditions",
+                "selection_reason": "Macro uncertainty is degrading breakout quality.",
+                "instruction_source": "catalog_plus_active_revision",
+                "validated_revision_id": 11,
+            }
+        ],
+        runtime_claims=[],
+        runtime_distillations=[],
+        context_budget={
+            "runtime_skills": {"available_count": 1, "loaded_count": 1, "truncated_count": 0},
+            "runtime_claims": {"available_count": 0, "loaded_count": 0, "truncated_count": 0},
+            "runtime_distillations": {"available_count": 0, "loaded_count": 0, "truncated_count": 0},
+        },
+    )
+
+    journal_entry = session.query(JournalEntry).filter(JournalEntry.entry_type == "ai_trade_decision").one()
+    memory_item = session.query(MemoryItem).filter(MemoryItem.memory_type == "agent_decision").one()
+
+    assert journal_entry.observations["runtime_skills"][0]["skill_code"] == "detect_risk_off_conditions"
+    assert memory_item.meta["runtime_skills"][0]["validated_revision_id"] == 11

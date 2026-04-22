@@ -8,12 +8,15 @@ from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
 from app.db.models.journal import JournalEntry
+from app.db.models.knowledge_claim import KnowledgeClaim
+from app.db.models.learning_workflow import LearningWorkflowArtifact
 from app.db.models.memory import MemoryItem
 from app.db.models.skill_validation import SkillValidationRecord
 from app.domains.learning.operator_feedback import OperatorDisagreementService
 
 
 SKILL_CATALOG_VERSION = "skills_v1"
+SKILL_PROPOSAL_MEMORY_TYPE = "skill_proposal"
 SKILL_CANDIDATE_MEMORY_TYPE = "skill_candidate"
 VALIDATED_SKILL_REVISION_MEMORY_TYPE = "validated_skill_revision"
 SKILL_GAP_MEMORY_TYPE = "skill_gap"
@@ -862,42 +865,13 @@ class SkillGapService:
             self._link_gap_to_candidate(session, gap=item, candidate=existing_candidate, created=False)
             return SkillLifecycleService._candidate_payload(existing_candidate)
 
-        target_skill_code = str(meta.get("target_skill_code") or meta.get("linked_skill_code") or "").strip()
-        candidate_action = str(meta.get("candidate_action") or "").strip()
-        if not target_skill_code:
-            anchor = (
-                str(meta.get("gap_type") or "").strip()
-                or str(meta.get("claim_key") or "").strip()
-                or str(item.key or "").strip()
-            )
-            normalized_anchor = anchor.lower().replace(" ", "_").replace(":", "_")
-            target_skill_code = f"gap_{normalized_anchor}"[:80] if normalized_anchor else ""
-        if not candidate_action:
-            candidate_action = "update_existing_skill" if SkillCatalogService().has(target_skill_code) else "draft_candidate_skill"
-
         from app.domains.learning.schemas import JournalEntryCreate, MemoryItemCreate
         from app.domains.learning.services import JournalService, MemoryService
 
-        summary = str(meta.get("summary") or item.content or "").strip() or "Promote skill gap into candidate procedural skill."
-        candidate_meta = {
-            "promotion_path_stage": "gap_bridge",
-            "candidate_status": "draft",
-            "candidate_action": candidate_action,
-            "target_skill_code": target_skill_code or None,
-            "source_type": "skill_gap",
-            "source_gap_id": item.id,
-            "source_gap_key": item.key,
-            "source_gap_type": meta.get("gap_type"),
-            "source_gap_status": meta.get("status"),
-            "ticker": meta.get("ticker"),
-            "strategy_version_id": meta.get("strategy_version_id"),
-            "position_id": meta.get("position_id"),
-            "validation_required": True,
-            "summary": summary,
-            "gap_meta": meta,
-        }
+        candidate_meta = self.build_candidate_meta(item)
+        summary = str(candidate_meta.get("summary") or item.content or "").strip() or "Promote skill gap into candidate procedural skill."
         candidate_scope = str(item.scope or f"strategy:{meta.get('strategy_version_id') or 'unknown'}")
-        candidate_key = f"skill_candidate:gap:{item.id}:{target_skill_code or 'unmapped'}"[:160]
+        candidate_key = f"skill_candidate:gap:{item.id}:{str(candidate_meta.get('target_skill_code') or 'unmapped')}"[:160]
 
         candidate_item = MemoryService().create_item(
             session,
@@ -934,6 +908,39 @@ class SkillGapService:
         payload = SkillLifecycleService._candidate_payload(candidate_item)
         payload["journal_entry_id"] = journal_entry.id
         return payload
+
+    def build_candidate_meta(self, item: MemoryItem) -> dict:
+        meta = dict(item.meta or {})
+        target_skill_code = str(meta.get("target_skill_code") or meta.get("linked_skill_code") or "").strip()
+        candidate_action = str(meta.get("candidate_action") or "").strip()
+        if not target_skill_code:
+            anchor = (
+                str(meta.get("gap_type") or "").strip()
+                or str(meta.get("claim_key") or "").strip()
+                or str(item.key or "").strip()
+            )
+            normalized_anchor = anchor.lower().replace(" ", "_").replace(":", "_")
+            target_skill_code = f"gap_{normalized_anchor}"[:80] if normalized_anchor else ""
+        if not candidate_action:
+            candidate_action = "update_existing_skill" if SkillCatalogService().has(target_skill_code) else "draft_candidate_skill"
+        summary = str(meta.get("summary") or item.content or "").strip() or "Promote skill gap into candidate procedural skill."
+        return {
+            "promotion_path_stage": "gap_bridge",
+            "candidate_status": "draft",
+            "candidate_action": candidate_action,
+            "target_skill_code": target_skill_code or None,
+            "source_type": "skill_gap",
+            "source_gap_id": item.id,
+            "source_gap_key": item.key,
+            "source_gap_type": meta.get("gap_type"),
+            "source_gap_status": meta.get("status"),
+            "ticker": meta.get("ticker"),
+            "strategy_version_id": meta.get("strategy_version_id"),
+            "position_id": meta.get("position_id"),
+            "validation_required": True,
+            "summary": summary,
+            "gap_meta": meta,
+        }
 
     @staticmethod
     def _extract_setup(entry_context: dict) -> str | None:
@@ -1015,6 +1022,9 @@ class ClaimSkillBridgeService:
     def __init__(self, catalog_service: SkillCatalogService | None = None) -> None:
         self.catalog_service = catalog_service or SkillCatalogService()
         self.skill_promotion_service = SkillPromotionService(catalog_service=self.catalog_service)
+
+    def build_candidate_meta(self, *, claim, force: bool = False) -> dict | None:
+        return self._build_candidate_meta(claim=claim, force=force)
 
     def maybe_promote_claim(
         self,
@@ -1213,6 +1223,515 @@ class ClaimSkillBridgeService:
         session.add(claim)
         session.commit()
         session.refresh(claim)
+
+
+class SkillWorkshopService:
+    WORKFLOW_ARTIFACT_TARGETS: dict[str, dict[str, str]] = {
+        "premarket_review_completion": {
+            "proposal_type": "workflow_review",
+            "target_skill_code": "detect_risk_off_conditions",
+            "candidate_action": "update_existing_skill",
+        },
+        "postmarket_review_completion": {
+            "proposal_type": "workflow_review",
+            "target_skill_code": "do_trade_post_mortem",
+            "candidate_action": "update_existing_skill",
+        },
+        "regime_shift_review_completion": {
+            "proposal_type": "workflow_review",
+            "target_skill_code": "detect_risk_off_conditions",
+            "candidate_action": "update_existing_skill",
+        },
+    }
+
+    def __init__(self, catalog_service: SkillCatalogService | None = None) -> None:
+        self.catalog_service = catalog_service or SkillCatalogService()
+        self.claim_bridge_service = ClaimSkillBridgeService(catalog_service=self.catalog_service)
+        self.skill_gap_service = SkillGapService()
+
+    def list_proposals(
+        self,
+        session: Session,
+        *,
+        limit: int = 50,
+        include_resolved: bool = False,
+    ) -> list[dict]:
+        statement = (
+            select(MemoryItem)
+            .where(MemoryItem.memory_type == SKILL_PROPOSAL_MEMORY_TYPE)
+            .order_by(desc(MemoryItem.created_at), desc(MemoryItem.importance), desc(MemoryItem.id))
+            .limit(max(1, min(int(limit), 200)))
+        )
+        payloads = [self._proposal_payload(item) for item in session.scalars(statement).all()]
+        if include_resolved:
+            return payloads
+        return [
+            item
+            for item in payloads
+            if str(item.get("proposal_status") or "").strip().lower() == "pending"
+        ]
+
+    def get_proposal(self, session: Session, *, proposal_id: int) -> dict | None:
+        item = session.get(MemoryItem, proposal_id)
+        if item is None or item.memory_type != SKILL_PROPOSAL_MEMORY_TYPE:
+            return None
+        return self._proposal_payload(item)
+
+    def sync_proposals(self, session: Session, *, limit_per_source: int = 40) -> list[dict]:
+        rows: list[dict] = []
+        rows.extend(self._claim_rows(session, limit=limit_per_source))
+        rows.extend(self._gap_rows(session, limit=limit_per_source))
+        rows.extend(self._cluster_rows(session, limit=limit_per_source))
+        rows.extend(self._workflow_rows(session, limit=limit_per_source))
+        for row in rows:
+            self._upsert_proposal(session, row=row)
+        return self.list_proposals(session, limit=max(limit_per_source * 4, 20), include_resolved=False)
+
+    def review_proposal(
+        self,
+        session: Session,
+        *,
+        proposal_id: int,
+        outcome: str,
+        summary: str,
+    ) -> dict:
+        item = session.get(MemoryItem, proposal_id)
+        if item is None or item.memory_type != SKILL_PROPOSAL_MEMORY_TYPE:
+            raise ValueError("Skill proposal not found.")
+
+        normalized_outcome = str(outcome or "").strip().lower()
+        if normalized_outcome not in {"approve", "reject"}:
+            raise ValueError("Skill proposal outcome must be approve or reject.")
+        summary_text = str(summary or "").strip()
+        if not summary_text:
+            raise ValueError("Skill proposal review summary is required.")
+
+        from app.domains.learning.schemas import JournalEntryCreate
+        from app.domains.learning.services import JournalService
+
+        meta = dict(item.meta or {})
+        candidate_payload: dict | None = None
+        if normalized_outcome == "approve":
+            candidate_payload = self._apply_proposal(session, proposal_item=item)
+            if candidate_payload is None:
+                raise ValueError("Skill proposal could not be applied under the current bridge policy.")
+            meta["proposal_status"] = "applied"
+            meta["linked_skill_candidate_id"] = candidate_payload.get("id") if isinstance(candidate_payload, dict) else None
+            meta["linked_skill_candidate_key"] = candidate_payload.get("key") if isinstance(candidate_payload, dict) else None
+            meta["last_applied_at"] = datetime.now(UTC).isoformat()
+        else:
+            meta["proposal_status"] = "rejected"
+        meta["review_outcome"] = normalized_outcome
+        meta["review_summary"] = summary_text
+        meta["reviewed_at"] = datetime.now(UTC).isoformat()
+        item.meta = meta
+        session.add(item)
+        session.commit()
+        session.refresh(item)
+
+        proposal_payload = self._proposal_payload(item)
+        JournalService().create_entry(
+            session,
+            JournalEntryCreate(
+                entry_type="skill_proposal_applied" if normalized_outcome == "approve" else "skill_proposal_rejected",
+                ticker=proposal_payload.get("ticker"),
+                strategy_version_id=proposal_payload.get("strategy_version_id"),
+                observations={
+                    "skill_proposal": SkillLifecycleService._json_ready_payload(proposal_payload),
+                    "skill_candidate": SkillLifecycleService._json_ready_payload(candidate_payload),
+                },
+                reasoning=summary_text,
+                decision=f"{normalized_outcome}_skill_proposal",
+                lessons=summary_text,
+            ),
+        )
+        return {
+            "proposal": proposal_payload,
+            "candidate": candidate_payload,
+        }
+
+    def _claim_rows(self, session: Session, *, limit: int) -> list[dict]:
+        rows: list[dict] = []
+        statement = (
+            select(KnowledgeClaim)
+            .order_by(desc(KnowledgeClaim.updated_at), desc(KnowledgeClaim.id))
+            .limit(max(1, min(int(limit), 200)))
+        )
+        for claim in session.scalars(statement).all():
+            claim_meta = dict(claim.meta or {})
+            if claim_meta.get("linked_skill_candidate_id") is not None:
+                continue
+            candidate_meta = self.claim_bridge_service.build_candidate_meta(claim=claim, force=False)
+            if not isinstance(candidate_meta, dict):
+                continue
+            rows.append(
+                {
+                    "scope": str(claim.scope or f"strategy:{claim.strategy_version_id or 'unknown'}"),
+                    "key": f"skill_proposal:claim:{claim.id}"[:160],
+                    "summary": str(candidate_meta.get("summary") or claim.claim_text or "").strip(),
+                    "importance": min(max(float(getattr(claim, "confidence", 0.7) or 0.7), 0.55), 0.95),
+                    "meta": {
+                        "proposal_type": "claim_bridge",
+                        "proposal_status": "pending",
+                        "source_type": "knowledge_claim",
+                        "source_claim_id": claim.id,
+                        "source_claim_key": claim.key,
+                        "target_skill_code": candidate_meta.get("target_skill_code"),
+                        "candidate_action": candidate_meta.get("candidate_action"),
+                        "ticker": claim.linked_ticker,
+                        "strategy_version_id": claim.strategy_version_id,
+                        "proposed_candidate_meta": candidate_meta,
+                    },
+                }
+            )
+        return rows
+
+    def _gap_rows(self, session: Session, *, limit: int) -> list[dict]:
+        rows: list[dict] = []
+        statement = (
+            select(MemoryItem)
+            .where(MemoryItem.memory_type == SKILL_GAP_MEMORY_TYPE)
+            .order_by(desc(MemoryItem.created_at), desc(MemoryItem.importance), desc(MemoryItem.id))
+            .limit(max(1, min(int(limit), 200)))
+        )
+        for item in session.scalars(statement).all():
+            gap_meta = dict(item.meta or {})
+            if str(gap_meta.get("status") or "open").strip().lower() != "open":
+                continue
+            if gap_meta.get("linked_skill_candidate_id") is not None:
+                continue
+            candidate_meta = self.skill_gap_service.build_candidate_meta(item)
+            rows.append(
+                {
+                    "scope": str(item.scope or f"strategy:{gap_meta.get('strategy_version_id') or 'unknown'}"),
+                    "key": f"skill_proposal:gap:{item.id}"[:160],
+                    "summary": str(candidate_meta.get("summary") or item.content or "").strip(),
+                    "importance": min(max(float(item.importance or 0.72), 0.55), 0.95),
+                    "meta": {
+                        "proposal_type": "gap_bridge",
+                        "proposal_status": "pending",
+                        "source_type": "skill_gap",
+                        "source_gap_id": item.id,
+                        "target_skill_code": candidate_meta.get("target_skill_code"),
+                        "candidate_action": candidate_meta.get("candidate_action"),
+                        "ticker": gap_meta.get("ticker"),
+                        "strategy_version_id": gap_meta.get("strategy_version_id"),
+                        "proposed_candidate_meta": candidate_meta,
+                    },
+                }
+            )
+        return rows
+
+    def _cluster_rows(self, session: Session, *, limit: int) -> list[dict]:
+        rows: list[dict] = []
+        clusters = OperatorDisagreementService().sync_clusters(session, limit=limit, min_count=2)
+        for cluster in clusters:
+            if str(cluster.get("status") or "").strip().lower() != "open":
+                continue
+            if cluster.get("promoted_skill_gap_id") is not None:
+                continue
+            target_skill_code = str(cluster.get("target_skill_code") or "").strip()
+            if not target_skill_code:
+                anchor = (
+                    str(cluster.get("claim_key") or "").strip()
+                    or str(cluster.get("entity_type") or "").strip()
+                    or str(cluster.get("cluster_key") or "").strip()
+                )
+                normalized_anchor = anchor.lower().replace(" ", "_").replace(":", "_")
+                target_skill_code = f"cluster_{normalized_anchor}"[:80] if normalized_anchor else ""
+            candidate_action = (
+                "update_existing_skill" if self.catalog_service.has(target_skill_code) else "draft_candidate_skill"
+            )
+            summary = (
+                f"Repeated operator disagreement suggests reviewing procedure around "
+                f"{target_skill_code or cluster.get('claim_key') or cluster.get('entity_type') or 'this area'}."
+            )
+            rows.append(
+                {
+                    "scope": (
+                        f"strategy:{cluster.get('strategy_version_id')}"
+                        if cluster.get("strategy_version_id") is not None
+                        else "operator_feedback"
+                    ),
+                    "key": f"skill_proposal:operator_disagreement_cluster:{cluster['id']}"[:160],
+                    "summary": summary,
+                    "importance": min(0.7 + (0.03 * int(cluster.get("event_count") or 0)), 0.95),
+                    "meta": {
+                        "proposal_type": "operator_disagreement_pattern",
+                        "proposal_status": "pending",
+                        "source_type": "operator_disagreement_cluster",
+                        "source_operator_disagreement_cluster_id": cluster["id"],
+                        "target_skill_code": target_skill_code or None,
+                        "candidate_action": candidate_action,
+                        "ticker": cluster.get("ticker"),
+                        "strategy_version_id": cluster.get("strategy_version_id"),
+                        "proposed_candidate_meta": {
+                            "promotion_path_stage": "skill_workshop",
+                            "candidate_status": "draft",
+                            "candidate_action": candidate_action,
+                            "target_skill_code": target_skill_code or None,
+                            "source_type": "operator_disagreement_cluster",
+                            "source_operator_disagreement_cluster_id": cluster["id"],
+                            "source_cluster_key": cluster.get("cluster_key"),
+                            "ticker": cluster.get("ticker"),
+                            "strategy_version_id": cluster.get("strategy_version_id"),
+                            "validation_required": True,
+                            "summary": summary,
+                            "cluster_meta": cluster.get("meta"),
+                        },
+                    },
+                }
+            )
+        return rows
+
+    def _workflow_rows(self, session: Session, *, limit: int) -> list[dict]:
+        rows: list[dict] = []
+        artifact_types = tuple(self.WORKFLOW_ARTIFACT_TARGETS.keys())
+        statement = (
+            select(LearningWorkflowArtifact)
+            .where(LearningWorkflowArtifact.artifact_type.in_(artifact_types))
+            .order_by(desc(LearningWorkflowArtifact.created_at), desc(LearningWorkflowArtifact.id))
+            .limit(max(1, min(int(limit), 200)))
+        )
+        for artifact in session.scalars(statement).all():
+            spec = self.WORKFLOW_ARTIFACT_TARGETS.get(str(artifact.artifact_type))
+            if spec is None:
+                continue
+            payload = dict(artifact.payload or {})
+            summary = self._workflow_summary(artifact=artifact, payload=payload)
+            proposed_candidate_meta = {
+                "promotion_path_stage": "skill_workshop",
+                "candidate_status": "draft",
+                "candidate_action": spec["candidate_action"],
+                "target_skill_code": spec["target_skill_code"],
+                "source_type": "learning_workflow_artifact",
+                "source_workflow_id": artifact.workflow_id,
+                "source_workflow_run_id": artifact.workflow_run_id,
+                "source_workflow_artifact_id": artifact.id,
+                "source_workflow_type": payload.get("workflow_type"),
+                "ticker": artifact.ticker,
+                "strategy_version_id": artifact.strategy_version_id,
+                "validation_required": True,
+                "summary": summary,
+                "workflow_artifact_payload": payload,
+            }
+            rows.append(
+                {
+                    "scope": f"workflow:{payload.get('workflow_type') or artifact.artifact_type}",
+                    "key": f"skill_proposal:workflow_artifact:{artifact.id}"[:160],
+                    "summary": summary,
+                    "importance": min(max(float((artifact.payload or {}).get("importance") or 0.7), 0.55), 0.92),
+                    "meta": {
+                        "proposal_type": spec["proposal_type"],
+                        "proposal_status": "pending",
+                        "source_type": "learning_workflow_artifact",
+                        "source_workflow_id": artifact.workflow_id,
+                        "source_workflow_run_id": artifact.workflow_run_id,
+                        "source_workflow_artifact_id": artifact.id,
+                        "target_skill_code": spec["target_skill_code"],
+                        "candidate_action": spec["candidate_action"],
+                        "ticker": artifact.ticker,
+                        "strategy_version_id": artifact.strategy_version_id,
+                        "proposed_candidate_meta": proposed_candidate_meta,
+                    },
+                }
+            )
+        return rows
+
+    def _upsert_proposal(self, session: Session, *, row: dict) -> dict:
+        from app.domains.learning.schemas import MemoryItemCreate
+        from app.domains.learning.services import MemoryService
+
+        normalized_key = str(row.get("key") or "")[:120]
+        meta_payload = dict(row.get("meta") or {})
+        meta_payload["summary"] = str(row.get("summary") or "").strip()
+        existing = session.scalar(
+            select(MemoryItem).where(
+                MemoryItem.memory_type == SKILL_PROPOSAL_MEMORY_TYPE,
+                MemoryItem.key == normalized_key,
+            )
+        )
+        if existing is None:
+            item = MemoryService().create_item(
+                session,
+                MemoryItemCreate(
+                    memory_type=SKILL_PROPOSAL_MEMORY_TYPE,
+                    scope=str(row.get("scope") or "workflow:global"),
+                    key=normalized_key,
+                    content=str(row.get("summary") or "Skill proposal").strip(),
+                    meta=self._json_ready_payload(meta_payload),
+                    importance=float(row.get("importance") or 0.72),
+                ),
+            )
+            return self._proposal_payload(item)
+
+        current_meta = dict(existing.meta or {})
+        merged_meta = dict(meta_payload)
+        for key in (
+            "proposal_status",
+            "review_outcome",
+            "review_summary",
+            "reviewed_at",
+            "linked_skill_candidate_id",
+            "linked_skill_candidate_key",
+            "last_applied_at",
+        ):
+            if key in current_meta:
+                merged_meta[key] = current_meta[key]
+        existing.scope = str(row.get("scope") or existing.scope)
+        existing.content = str(row.get("summary") or existing.content).strip()
+        existing.meta = self._json_ready_payload(merged_meta)
+        existing.importance = float(row.get("importance") or existing.importance or 0.72)
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        return self._proposal_payload(existing)
+
+    def _apply_proposal(self, session: Session, *, proposal_item: MemoryItem) -> dict | None:
+        meta = dict(proposal_item.meta or {})
+        source_type = str(meta.get("source_type") or "").strip().lower()
+        if source_type == "knowledge_claim":
+            from app.domains.learning.claims import KnowledgeClaimService
+
+            claim_id = meta.get("source_claim_id")
+            if not isinstance(claim_id, int):
+                raise ValueError("Skill proposal claim source is missing.")
+            return KnowledgeClaimService().maybe_promote_claim_to_skill_candidate(session, claim_id=claim_id, force=True)
+        if source_type == "skill_gap":
+            gap_id = meta.get("source_gap_id")
+            if not isinstance(gap_id, int):
+                raise ValueError("Skill proposal gap source is missing.")
+            return self.skill_gap_service.promote_gap_to_candidate(session, gap_id=gap_id)
+        candidate_payload = self._create_candidate_from_proposal(session, proposal_item=proposal_item)
+        if source_type == "operator_disagreement_cluster":
+            cluster_id = meta.get("source_operator_disagreement_cluster_id")
+            if isinstance(cluster_id, int):
+                cluster_item = session.get(MemoryItem, cluster_id)
+                if cluster_item is not None:
+                    cluster_meta = dict(cluster_item.meta or {})
+                    cluster_meta["linked_skill_candidate_id"] = candidate_payload.get("id")
+                    cluster_meta["last_promotion_at"] = datetime.now(UTC).isoformat()
+                    cluster_item.meta = cluster_meta
+                    session.add(cluster_item)
+                    session.commit()
+        return candidate_payload
+
+    def _create_candidate_from_proposal(self, session: Session, *, proposal_item: MemoryItem) -> dict:
+        from app.domains.learning.schemas import MemoryItemCreate
+        from app.domains.learning.services import MemoryService
+
+        proposal_meta = dict(proposal_item.meta or {})
+        linked_candidate_id = proposal_meta.get("linked_skill_candidate_id")
+        if isinstance(linked_candidate_id, int):
+            candidate = session.get(MemoryItem, linked_candidate_id)
+            if candidate is not None and candidate.memory_type == SKILL_CANDIDATE_MEMORY_TYPE:
+                return SkillLifecycleService._candidate_payload(candidate)
+
+        existing_candidate = self._find_existing_candidate_for_proposal(session, proposal_item=proposal_item)
+        if existing_candidate is not None:
+            return SkillLifecycleService._candidate_payload(existing_candidate)
+
+        candidate_meta = dict(proposal_meta.get("proposed_candidate_meta") or {})
+        if not candidate_meta:
+            raise ValueError("Skill proposal does not contain candidate metadata.")
+        candidate_meta["source_skill_proposal_id"] = proposal_item.id
+        candidate_meta["source_skill_proposal_key"] = proposal_item.key
+        candidate_meta["source_skill_proposal_type"] = proposal_meta.get("proposal_type")
+        candidate_scope = str(
+            candidate_meta.get("scope")
+            or proposal_item.scope
+            or f"strategy:{candidate_meta.get('strategy_version_id') or 'unknown'}"
+        )
+        candidate_key = (
+            str(candidate_meta.get("key") or f"skill_candidate:proposal:{proposal_item.id}:{candidate_meta.get('target_skill_code') or 'unmapped'}")
+            [:160]
+        )
+        candidate_item = MemoryService().create_item(
+            session,
+            MemoryItemCreate(
+                memory_type=SKILL_CANDIDATE_MEMORY_TYPE,
+                scope=candidate_scope,
+                key=candidate_key,
+                content=str(candidate_meta.get("summary") or proposal_item.content or "Skill candidate from workshop."),
+                meta=self._json_ready_payload(candidate_meta),
+                importance=min(max(float(proposal_item.importance or 0.72), 0.55), 0.95),
+            ),
+        )
+        return SkillLifecycleService._candidate_payload(candidate_item)
+
+    def _find_existing_candidate_for_proposal(self, session: Session, *, proposal_item: MemoryItem) -> MemoryItem | None:
+        proposal_meta = dict(proposal_item.meta or {})
+        source_artifact_id = proposal_meta.get("source_workflow_artifact_id")
+        source_cluster_id = proposal_meta.get("source_operator_disagreement_cluster_id")
+        statement = (
+            select(MemoryItem)
+            .where(MemoryItem.memory_type == SKILL_CANDIDATE_MEMORY_TYPE)
+            .order_by(desc(MemoryItem.created_at), desc(MemoryItem.importance), desc(MemoryItem.id))
+        )
+        for item in session.scalars(statement).all():
+            meta = dict(item.meta or {})
+            if meta.get("source_skill_proposal_id") == proposal_item.id:
+                return item
+            if source_artifact_id is not None and meta.get("source_workflow_artifact_id") == source_artifact_id:
+                return item
+            if source_cluster_id is not None and meta.get("source_operator_disagreement_cluster_id") == source_cluster_id:
+                return item
+        return None
+
+    @staticmethod
+    def _workflow_summary(*, artifact: LearningWorkflowArtifact, payload: dict) -> str:
+        workflow_type = str(payload.get("workflow_type") or "").strip()
+        if artifact.artifact_type == "regime_shift_review_completion":
+            previous_regime = str(payload.get("previous_regime") or "").strip() or "unknown"
+            current_regime = str(payload.get("current_regime") or "").strip() or "unknown"
+            return (
+                f"Completed regime shift review {previous_regime} -> {current_regime}; "
+                "review whether the risk-off procedure needs an explicit revision."
+            )
+        if artifact.artifact_type == "postmarket_review_completion":
+            review_date = str(payload.get("review_date") or "").strip() or "current session"
+            return (
+                f"Completed postmarket review for {review_date}; "
+                "review whether the post-mortem procedure needs a sharper validated revision."
+            )
+        if artifact.artifact_type == "premarket_review_completion":
+            review_date = str(payload.get("review_date") or "").strip() or "current session"
+            return (
+                f"Completed premarket review for {review_date}; "
+                "review whether the premarket risk posture procedure needs refinement."
+            )
+        return str(artifact.summary or workflow_type or "Workflow artifact suggests a procedural proposal.").strip()
+
+    @staticmethod
+    def _proposal_payload(item: MemoryItem) -> dict:
+        meta = dict(item.meta or {})
+        return {
+            "id": item.id,
+            "scope": item.scope,
+            "key": item.key,
+            "summary": str(meta.get("summary") or item.content or ""),
+            "proposal_type": meta.get("proposal_type") or "skill_workshop",
+            "proposal_status": meta.get("proposal_status") or "pending",
+            "target_skill_code": meta.get("target_skill_code"),
+            "candidate_action": meta.get("candidate_action"),
+            "source_type": meta.get("source_type"),
+            "source_claim_id": meta.get("source_claim_id"),
+            "source_gap_id": meta.get("source_gap_id"),
+            "source_workflow_id": meta.get("source_workflow_id"),
+            "source_workflow_run_id": meta.get("source_workflow_run_id"),
+            "source_workflow_artifact_id": meta.get("source_workflow_artifact_id"),
+            "source_operator_disagreement_cluster_id": meta.get("source_operator_disagreement_cluster_id"),
+            "linked_skill_candidate_id": meta.get("linked_skill_candidate_id"),
+            "ticker": meta.get("ticker"),
+            "strategy_version_id": meta.get("strategy_version_id"),
+            "created_at": item.created_at,
+            "importance": item.importance,
+            "meta": meta,
+        }
+
+    @staticmethod
+    def _json_ready_payload(payload: dict) -> dict:
+        return SkillLifecycleService._json_ready_payload(payload) or {}
 
 
 class SkillLifecycleService:
@@ -1467,11 +1986,23 @@ class SkillLifecycleService:
         }
 
     def build_dashboard(self, session: Session) -> dict:
+        from app.domains.learning.services import LearningMemoryDistillationService
+
         return {
             "catalog": self.list_catalog(session),
+            "proposals": SkillWorkshopService(catalog_service=self.catalog_service).list_proposals(
+                session,
+                limit=20,
+                include_resolved=False,
+            ),
             "candidates": self.list_candidates(session),
             "active_revisions": self.list_revisions(session, include_inactive=False),
             "gaps": SkillGapService().list_gaps(session, limit=20),
+            "distillations": LearningMemoryDistillationService().list_digests(
+                session,
+                limit=12,
+                include_reviewed=True,
+            ),
         }
 
     def attach_runtime_state(self, session: Session, skill_context: dict | None) -> dict:

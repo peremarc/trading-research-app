@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     scheduler_do_hour: int = 15
     scheduler_check_hour: int = 22
     market_data_provider: str = "ibkr_proxy"
-    ibkr_proxy_base_url: str = "https://dev-ibkr.peremarc.com"
+    ibkr_proxy_base_url: str = "http://127.0.0.1:15177"
     ibkr_proxy_api_key: str | None = None
     ibkr_proxy_timeout_seconds: int = 15
     market_data_max_concurrent_requests: int = 2

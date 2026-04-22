@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import hashlib
 import json
 from datetime import date, datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from app.db.models.analysis import AnalysisRun
 from app.db.models.candidate_validation_snapshot import CandidateValidationSnapshot
 from app.db.models.decision_context import DecisionContextSnapshot
 from app.db.models.journal import JournalEntry
+from app.db.models.knowledge_claim import KnowledgeClaim
 from app.db.models.memory import MemoryItem
 from app.db.models.position import Position
 from app.db.models.research_task import ResearchTask
@@ -57,6 +59,42 @@ from app.domains.strategy.schemas import WatchlistCreate, WatchlistItemCreate
 from app.providers.calendar import CalendarProviderError
 from app.providers.news import NewsProviderError
 from app.providers.web_research import WebResearchError
+
+LEARNING_DISTILLATION_MEMORY_TYPE = "learning_distillation"
+
+
+@dataclass(frozen=True)
+class LearningDistillationRuntimePacket:
+    digest_id: int
+    key: str
+    distillation_type: str
+    scope: str
+    summary: str
+    importance: float
+    review_action: str
+    review_summary: str
+    source_count: int = 0
+    linked_ticker: str | None = None
+    strategy_version_id: int | None = None
+    target_skill_code: str | None = None
+    effect: dict = field(default_factory=dict)
+
+    def to_payload(self) -> dict:
+        return {
+            "digest_id": self.digest_id,
+            "key": self.key,
+            "distillation_type": self.distillation_type,
+            "scope": self.scope,
+            "summary": self.summary,
+            "importance": round(min(max(float(self.importance), 0.0), 1.0), 2),
+            "review_action": self.review_action,
+            "review_summary": self.review_summary,
+            "source_count": self.source_count,
+            "linked_ticker": self.linked_ticker,
+            "strategy_version_id": self.strategy_version_id,
+            "target_skill_code": self.target_skill_code,
+            "effect": dict(self.effect or {}),
+        }
 
 
 class JournalService:
@@ -203,6 +241,16 @@ class TickerDecisionTraceService:
             latest_loaded_runtime_skill_count=self._runtime_budget_count(latest_context_budget, "runtime_skills", "loaded_count"),
             latest_available_runtime_claim_count=self._runtime_budget_count(latest_context_budget, "runtime_claims", "available_count"),
             latest_loaded_runtime_claim_count=self._runtime_budget_count(latest_context_budget, "runtime_claims", "loaded_count"),
+            latest_available_runtime_distillation_count=self._runtime_budget_count(
+                latest_context_budget,
+                "runtime_distillations",
+                "available_count",
+            ),
+            latest_loaded_runtime_distillation_count=self._runtime_budget_count(
+                latest_context_budget,
+                "runtime_distillations",
+                "loaded_count",
+            ),
             latest_runtime_budget_truncated=self._runtime_budget_truncated(latest_context_budget),
             latest_score=self._derive_score(latest_signal, latest_signal_context),
             latest_timing_total_ms=self._coerce_float(latest_timing_profile.get("total_ms")),
@@ -348,6 +396,13 @@ class TickerDecisionTraceService:
                 },
                 "operator_disagreement": operator_disagreement,
                 "skill_context": skill_context,
+                "runtime_skills": observations.get("runtime_skills") if isinstance(observations.get("runtime_skills"), list) else [],
+                "runtime_claims": observations.get("runtime_claims") if isinstance(observations.get("runtime_claims"), list) else [],
+                "runtime_distillations": (
+                    observations.get("runtime_distillations")
+                    if isinstance(observations.get("runtime_distillations"), list)
+                    else []
+                ),
                 "context_budget": cls._extract_context_budget(observations),
                 "skill_candidate": skill_candidate,
                 "timing_profile": cls._as_dict(observations.get("timing_profile")),
@@ -560,7 +615,8 @@ class TickerDecisionTraceService:
     def _runtime_budget_truncated(cls, context_budget: dict) -> bool:
         skill_truncated = cls._runtime_budget_count(context_budget, "runtime_skills", "truncated_count") or 0
         claim_truncated = cls._runtime_budget_count(context_budget, "runtime_claims", "truncated_count") or 0
-        return (skill_truncated + claim_truncated) > 0
+        distillation_truncated = cls._runtime_budget_count(context_budget, "runtime_distillations", "truncated_count") or 0
+        return (skill_truncated + claim_truncated + distillation_truncated) > 0
 
     @staticmethod
     def _first_guard_reason(guard_results: dict, fallback: str | None = None) -> str | None:
@@ -587,14 +643,19 @@ class MemoryService:
     RETENTION_LIMITS_EXACT: dict[tuple[str, str], int] = {
         ("episodic", "pdca_check"): 288,
         ("episodic", "pdca_act"): 288,
+        (LEARNING_DISTILLATION_MEMORY_TYPE, "operator_feedback"): 120,
         ("operator_disagreement", "operator_feedback"): 240,
         ("operator_disagreement_cluster", "operator_feedback"): 120,
         ("skill_gap", "operator_feedback"): 120,
+        ("skill_proposal", "operator_feedback"): 120,
     }
     RETENTION_LIMITS_PREFIX: dict[tuple[str, str], int] = {
+        (LEARNING_DISTILLATION_MEMORY_TYPE, "strategy:"): 120,
         ("strategy_evolution", "strategy:"): 120,
         ("skill_candidate", "strategy:"): 120,
         ("skill_gap", "strategy:"): 120,
+        ("skill_proposal", "strategy:"): 120,
+        ("skill_proposal", "workflow:"): 120,
         ("validated_skill_revision", "skill:"): 60,
     }
 
@@ -749,6 +810,1327 @@ class LearningHistoryMaintenanceService:
             "deleted_ids": deleted_ids,
             "rules": rules,
         }
+
+
+class LearningMemoryDistillationService:
+    def distill_memory(
+        self,
+        session: Session,
+        *,
+        dry_run: bool = True,
+        include_claim_reviews: bool = True,
+        include_operator_feedback: bool = True,
+        include_skill_gaps: bool = True,
+        include_skill_candidates: bool = True,
+        claim_limit: int = 200,
+        disagreement_limit: int = 200,
+        skill_gap_limit: int = 200,
+        skill_candidate_limit: int = 200,
+        min_group_size: int = 2,
+    ) -> dict:
+        normalized_min_group_size = max(2, min(int(min_group_size or 2), 20))
+        if not any((include_claim_reviews, include_operator_feedback, include_skill_gaps, include_skill_candidates)):
+            raise ValueError("At least one distillation source must be enabled.")
+
+        sections: list[dict] = []
+        total_created = 0
+        total_updated = 0
+        total_unchanged = 0
+
+        if include_claim_reviews:
+            sections.append(
+                self._apply_digest_candidates(
+                    session,
+                    distillation_type="claim_review_digest",
+                    candidates=self._claim_review_digest_candidates(
+                        session,
+                        limit=claim_limit,
+                        min_group_size=normalized_min_group_size,
+                    ),
+                    dry_run=dry_run,
+                )
+            )
+
+        if include_operator_feedback:
+            sections.append(
+                self._apply_digest_candidates(
+                    session,
+                    distillation_type="operator_disagreement_digest",
+                    candidates=self._operator_disagreement_digest_candidates(
+                        session,
+                        limit=disagreement_limit,
+                        min_group_size=normalized_min_group_size,
+                    ),
+                    dry_run=dry_run,
+                )
+            )
+
+        if include_skill_gaps:
+            sections.append(
+                self._apply_digest_candidates(
+                    session,
+                    distillation_type="skill_gap_digest",
+                    candidates=self._skill_gap_digest_candidates(
+                        session,
+                        limit=skill_gap_limit,
+                        min_group_size=normalized_min_group_size,
+                    ),
+                    dry_run=dry_run,
+                )
+            )
+
+        if include_skill_candidates:
+            sections.append(
+                self._apply_digest_candidates(
+                    session,
+                    distillation_type="skill_candidate_digest",
+                    candidates=self._skill_candidate_digest_candidates(
+                        session,
+                        limit=skill_candidate_limit,
+                        min_group_size=normalized_min_group_size,
+                    ),
+                    dry_run=dry_run,
+                )
+            )
+
+        for section in sections:
+            total_created += int(section["created_count"])
+            total_updated += int(section["updated_count"])
+            total_unchanged += int(section["unchanged_count"])
+
+        return {
+            "dry_run": dry_run,
+            "created_count": total_created,
+            "updated_count": total_updated,
+            "unchanged_count": total_unchanged,
+            "sections": sections,
+        }
+
+    def _apply_digest_candidates(
+        self,
+        session: Session,
+        *,
+        distillation_type: str,
+        candidates: list[dict],
+        dry_run: bool,
+    ) -> dict:
+        keys = [str(candidate["key"]) for candidate in candidates]
+        existing_items = []
+        if keys:
+            existing_items = list(
+                session.scalars(
+                    select(MemoryItem).where(
+                        MemoryItem.memory_type == LEARNING_DISTILLATION_MEMORY_TYPE,
+                        MemoryItem.key.in_(keys),
+                    )
+                ).all()
+            )
+        existing_by_key = {str(item.key): item for item in existing_items}
+        outcomes: list[dict] = []
+        touched_scopes: set[str] = set()
+
+        for candidate in candidates:
+            key = str(candidate["key"])
+            existing = existing_by_key.get(key)
+            candidate_payload = {
+                **candidate,
+                "meta": self._merge_digest_review_meta(existing, candidate.get("meta")),
+            }
+            action = "create" if existing is None else "update"
+            if existing is not None and not self._digest_changed(existing, candidate_payload):
+                action = "noop"
+            if not dry_run and action != "noop":
+                item = existing or MemoryItem(
+                    memory_type=LEARNING_DISTILLATION_MEMORY_TYPE,
+                    scope=str(candidate_payload["scope"]),
+                    key=key,
+                    content=str(candidate_payload["content"]),
+                    meta=dict(candidate_payload["meta"]),
+                    importance=float(candidate_payload["importance"]),
+                )
+                if existing is not None:
+                    item.scope = str(candidate_payload["scope"])
+                    item.content = str(candidate_payload["content"])
+                    item.meta = dict(candidate_payload["meta"])
+                    item.importance = float(candidate_payload["importance"])
+                session.add(item)
+                existing_by_key[key] = item
+                touched_scopes.add(str(candidate_payload["scope"]))
+            outcomes.append(
+                {
+                    "distillation_type": distillation_type,
+                    "key": key,
+                    "scope": str(candidate_payload["scope"]),
+                    "content": str(candidate_payload["content"]),
+                    "importance": float(candidate_payload["importance"]),
+                    "action": action,
+                    "source_count": int(candidate_payload["source_count"]),
+                    "source_ids": list(candidate_payload["source_ids"]),
+                    "meta": dict(candidate_payload["meta"]),
+                }
+            )
+
+        if not dry_run and touched_scopes:
+            session.commit()
+            for scope in touched_scopes:
+                MemoryService._apply_retention(session, LEARNING_DISTILLATION_MEMORY_TYPE, scope)
+            persisted = list(
+                session.scalars(
+                    select(MemoryItem).where(
+                        MemoryItem.memory_type == LEARNING_DISTILLATION_MEMORY_TYPE,
+                        MemoryItem.key.in_(keys),
+                    )
+                ).all()
+            )
+            persisted_by_key = {str(item.key): item for item in persisted}
+        else:
+            persisted_by_key = existing_by_key
+
+        for outcome in outcomes:
+            item = persisted_by_key.get(outcome["key"])
+            outcome["memory_id"] = item.id if item is not None else None
+
+        return {
+            "distillation_type": distillation_type,
+            "digest_count": len(outcomes),
+            "created_count": len([item for item in outcomes if item["action"] == "create"]),
+            "updated_count": len([item for item in outcomes if item["action"] == "update"]),
+            "unchanged_count": len([item for item in outcomes if item["action"] == "noop"]),
+            "digests": outcomes,
+        }
+
+    def _claim_review_digest_candidates(
+        self,
+        session: Session,
+        *,
+        limit: int,
+        min_group_size: int,
+    ) -> list[dict]:
+        from app.domains.learning.claims import KnowledgeClaimService
+
+        claims = KnowledgeClaimService().list_claims(session, limit=max(50, min(int(limit), 500)))
+        grouped: dict[tuple[str, str | None, int | None, str], list[KnowledgeClaim]] = {}
+
+        for claim in claims:
+            review_reason, review_priority = self._claim_review_reason(claim)
+            if review_reason is None:
+                continue
+            group_key = (
+                str(claim.scope or "").strip() or "global",
+                str(claim.linked_ticker or "").strip().upper() or None,
+                claim.strategy_version_id,
+                review_reason,
+            )
+            grouped.setdefault(group_key, []).append(claim)
+
+        candidates: list[dict] = []
+        for (scope, ticker, strategy_version_id, review_reason), items in grouped.items():
+            if len(items) < min_group_size:
+                continue
+            items.sort(
+                key=lambda claim: (
+                    int(getattr(claim, "contradiction_count", 0) or 0),
+                    int(getattr(claim, "evidence_count", 0) or 0),
+                    float(getattr(claim, "confidence", 0.0) or 0.0),
+                    getattr(claim, "updated_at", None) or getattr(claim, "created_at", None),
+                ),
+                reverse=True,
+            )
+            example_text = "; ".join(self._compact_text(claim.claim_text, limit=120) for claim in items[:2])
+            review_priority = max(self._claim_review_reason(item)[1] for item in items)
+            content = (
+                f"{len(items)} claims in {scope} require {self._label_for_review_reason(review_reason)}"
+                + (f" for {ticker}" if ticker else "")
+                + f". Examples: {example_text}"
+            ).strip()
+            key = self._digest_key("claim-review", review_reason, scope, ticker or "global")
+            candidates.append(
+                {
+                    "key": key,
+                    "scope": self._safe_memory_scope(scope),
+                    "content": content,
+                    "importance": min(0.56 + (0.05 * len(items)) + (0.04 * review_priority), 0.94),
+                    "source_count": len(items),
+                    "source_ids": [claim.id for claim in items],
+                    "meta": {
+                        "distillation_type": "claim_review_digest",
+                        "review_reason": review_reason,
+                        "scope": scope,
+                        "ticker": ticker,
+                        "strategy_version_id": strategy_version_id,
+                        "claim_ids": [claim.id for claim in items],
+                        "claim_statuses": sorted({str(claim.status or "").strip().lower() for claim in items}),
+                        "freshness_states": sorted({str(claim.freshness_state or "").strip().lower() for claim in items}),
+                        "evidence_count": sum(int(claim.evidence_count or 0) for claim in items),
+                        "contradiction_count": sum(int(claim.contradiction_count or 0) for claim in items),
+                    },
+                }
+            )
+        candidates.sort(key=lambda item: (item["importance"], item["source_count"], item["key"]), reverse=True)
+        return candidates
+
+    def _operator_disagreement_digest_candidates(
+        self,
+        session: Session,
+        *,
+        limit: int,
+        min_group_size: int,
+    ) -> list[dict]:
+        from app.domains.learning.operator_feedback import OperatorDisagreementService
+
+        service = OperatorDisagreementService()
+        source_items = service.list_items(session, limit=max(50, min(int(limit), 500)))
+        raw_clusters = [
+            item
+            for item in service._group_clusters(source_items)
+            if int(item.get("event_count") or 0) >= min_group_size
+        ]
+        existing_clusters = {
+            str(item.get("cluster_key")): item
+            for item in service.list_clusters(session, limit=max(50, min(int(limit), 500)))
+        }
+        grouped: dict[tuple[str, str | None, str], list[dict]] = {}
+
+        for cluster in raw_clusters:
+            persisted = existing_clusters.get(str(cluster.get("cluster_key") or ""))
+            anchor = self._cluster_anchor(cluster)
+            if not anchor:
+                continue
+            ticker = str(cluster.get("ticker") or "").strip().upper() or None
+            strategy_version_id = cluster.get("strategy_version_id")
+            scope = f"strategy:{strategy_version_id}" if strategy_version_id is not None else "operator_feedback"
+            group_key = (scope, ticker, anchor)
+            normalized_cluster = {
+                **cluster,
+                "id": persisted.get("id") if isinstance(persisted, dict) else None,
+                "status": (persisted or {}).get("status") if isinstance(persisted, dict) else "open",
+                "promoted_claim_id": (persisted or {}).get("promoted_claim_id") if isinstance(persisted, dict) else None,
+                "promoted_skill_gap_id": (persisted or {}).get("promoted_skill_gap_id") if isinstance(persisted, dict) else None,
+            }
+            grouped.setdefault(group_key, []).append(normalized_cluster)
+
+        candidates: list[dict] = []
+        for (scope, ticker, anchor), clusters in grouped.items():
+            total_events = sum(int(cluster.get("event_count") or 0) for cluster in clusters)
+            cluster_ids = [int(cluster["id"]) for cluster in clusters if isinstance(cluster.get("id"), int)]
+            promoted_claims = [cluster.get("promoted_claim_id") for cluster in clusters if cluster.get("promoted_claim_id") is not None]
+            promoted_gaps = [cluster.get("promoted_skill_gap_id") for cluster in clusters if cluster.get("promoted_skill_gap_id") is not None]
+            samples: list[str] = []
+            for cluster in clusters:
+                for sample in list(cluster.get("sample_summaries") or []):
+                    normalized_sample = self._compact_text(str(sample), limit=90)
+                    if normalized_sample and normalized_sample not in samples:
+                        samples.append(normalized_sample)
+                    if len(samples) >= 3:
+                        break
+                if len(samples) >= 3:
+                    break
+            content = (
+                f"Repeated operator disagreement around {anchor}"
+                + (f" on {ticker}" if ticker else "")
+                + f": {total_events} events across {len(clusters)} cluster(s)."
+                + (
+                    f" Promoted claims {len(promoted_claims)}, promoted gaps {len(promoted_gaps)}."
+                    if promoted_claims or promoted_gaps
+                    else ""
+                )
+                + (f" Recent examples: {'; '.join(samples)}" if samples else "")
+            ).strip()
+            key = self._digest_key("operator-feedback", anchor, scope, ticker or "global")
+            candidates.append(
+                {
+                    "key": key,
+                    "scope": self._safe_memory_scope(scope),
+                    "content": content,
+                    "importance": min(0.6 + (0.03 * total_events) + (0.03 * len(clusters)), 0.95),
+                    "source_count": len(clusters),
+                    "source_ids": cluster_ids,
+                    "meta": {
+                        "distillation_type": "operator_disagreement_digest",
+                        "scope": scope,
+                        "ticker": ticker,
+                        "anchor": anchor,
+                        "cluster_keys": [str(cluster.get("cluster_key")) for cluster in clusters],
+                        "cluster_ids": cluster_ids,
+                        "total_event_count": total_events,
+                        "promoted_claim_ids": promoted_claims,
+                        "promoted_skill_gap_ids": promoted_gaps,
+                    },
+                }
+            )
+        candidates.sort(
+            key=lambda item: (
+                item["importance"],
+                item["meta"].get("total_event_count", 0),
+                item["source_count"],
+                item["key"],
+            ),
+            reverse=True,
+        )
+        return candidates
+
+    def list_digests(
+        self,
+        session: Session,
+        *,
+        limit: int = 100,
+        distillation_type: str | None = None,
+        include_reviewed: bool = True,
+    ) -> list[MemoryItem]:
+        statement = (
+            select(MemoryItem)
+            .where(MemoryItem.memory_type == LEARNING_DISTILLATION_MEMORY_TYPE)
+            .order_by(MemoryItem.created_at.desc(), MemoryItem.importance.desc(), MemoryItem.id.desc())
+            .limit(max(50, min(max(int(limit), 1) * 4, 500)))
+        )
+        items = list(session.scalars(statement).all())
+        normalized_type = str(distillation_type or "").strip().lower()
+        filtered: list[MemoryItem] = []
+        for item in items:
+            meta = dict(item.meta or {})
+            item_type = str(meta.get("distillation_type") or "").strip().lower()
+            review_status = str(meta.get("review_status") or "").strip().lower()
+            if normalized_type and item_type != normalized_type:
+                continue
+            if not include_reviewed and review_status in {"applied", "retired", "collapsed"}:
+                continue
+            filtered.append(item)
+            if len(filtered) >= max(1, min(int(limit), 200)):
+                break
+        return filtered
+
+    def get_digest(self, session: Session, *, digest_id: int) -> MemoryItem | None:
+        item = session.get(MemoryItem, digest_id)
+        if item is None or item.memory_type != LEARNING_DISTILLATION_MEMORY_TYPE:
+            return None
+        return item
+
+    def build_runtime_packets(
+        self,
+        session: Session,
+        *,
+        ticker: str | None = None,
+        strategy_version_id: int | None = None,
+        max_packets: int = 2,
+    ) -> list[dict]:
+        selection = self.build_runtime_selection(
+            session,
+            ticker=ticker,
+            strategy_version_id=strategy_version_id,
+            max_packets=max_packets,
+        )
+        return [item for item in selection.get("packets", []) if isinstance(item, dict)]
+
+    def build_runtime_selection(
+        self,
+        session: Session,
+        *,
+        ticker: str | None = None,
+        strategy_version_id: int | None = None,
+        max_packets: int = 2,
+    ) -> dict:
+        packet_limit = max(0, int(max_packets or 0))
+        packets: list[dict] = []
+        digests = self._runtime_candidate_digests(
+            session,
+            ticker=ticker,
+            strategy_version_id=strategy_version_id,
+        )
+
+        if packet_limit > 0:
+            for item in digests[:packet_limit]:
+                packet = self._build_runtime_packet(item)
+                if packet is None:
+                    continue
+                packets.append(packet.to_payload())
+
+        available_keys = [str(item.key or "").strip() for item in digests if str(item.key or "").strip()]
+        loaded_keys = [str(item.get("key") or "").strip() for item in packets if str(item.get("key") or "").strip()]
+        skipped_keys = [key for key in available_keys if key not in set(loaded_keys)]
+        return {
+            "packets": packets,
+            "budget": {
+                "enabled": packet_limit > 0,
+                "available_count": len(available_keys),
+                "loaded_count": len(loaded_keys),
+                "truncated_count": max(len(available_keys) - len(loaded_keys), 0),
+                "max_packets": packet_limit,
+                "loaded_keys": loaded_keys,
+                "skipped_keys": skipped_keys[:5],
+            },
+        }
+
+    @staticmethod
+    def render_runtime_distillation_prompt(packets: list[dict] | None) -> str:
+        if not isinstance(packets, list) or not packets:
+            return ""
+
+        lines = [
+            "Reviewed learning distillation digests are supplied below.",
+            "Treat them as compacted operator memory about repeated backlog or procedural friction, not as direct market evidence.",
+            "They may sharpen caution or highlight recurring operational patterns, but they never override live evidence, regime policy or hard risk constraints.",
+        ]
+        for index, item in enumerate(packets, start=1):
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            if not key:
+                continue
+            distillation_type = str(item.get("distillation_type") or "distillation").strip()
+            review_action = str(item.get("review_action") or "reviewed").strip()
+            lines.append(f"{index}. Digest `{key}` [{distillation_type} / {review_action}]")
+            summary = str(item.get("summary") or "").strip()
+            if summary:
+                lines.append(f"   Summary: {summary}")
+            review_summary = str(item.get("review_summary") or "").strip()
+            if review_summary:
+                lines.append(f"   Review outcome: {review_summary}")
+            qualifiers: list[str] = []
+            target_skill_code = str(item.get("target_skill_code") or "").strip()
+            linked_ticker = str(item.get("linked_ticker") or "").strip()
+            if target_skill_code:
+                qualifiers.append(f"target_skill={target_skill_code}")
+            if linked_ticker:
+                qualifiers.append(f"ticker={linked_ticker}")
+            if item.get("source_count") is not None:
+                qualifiers.append(f"sources={int(item.get('source_count') or 0)}")
+            if qualifiers:
+                lines.append(f"   Scope: {' | '.join(qualifiers)}")
+        return "\n".join(lines)
+
+    def review_digest(
+        self,
+        session: Session,
+        *,
+        digest_id: int,
+        action: str,
+        summary: str,
+        keep_entity_id: int | None = None,
+    ) -> dict:
+        item = self.get_digest(session, digest_id=digest_id)
+        if item is None:
+            raise ValueError("Learning distillation digest not found.")
+
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action not in {"collapse", "retire"}:
+            raise ValueError("Digest action must be collapse or retire.")
+        summary_text = str(summary or "").strip()
+        if not summary_text:
+            raise ValueError("Digest review summary is required.")
+
+        distillation_type = str(dict(item.meta or {}).get("distillation_type") or "").strip().lower()
+        if distillation_type == "skill_gap_digest":
+            effect = self._review_skill_gap_digest(
+                session,
+                digest_item=item,
+                action=normalized_action,
+                summary=summary_text,
+                keep_entity_id=keep_entity_id,
+            )
+        elif distillation_type == "skill_candidate_digest":
+            effect = self._review_skill_candidate_digest(
+                session,
+                digest_item=item,
+                action=normalized_action,
+                summary=summary_text,
+                keep_entity_id=keep_entity_id,
+            )
+        else:
+            raise ValueError("Only skill-gap and skill-candidate digests support review actions.")
+
+        refreshed = self.get_digest(session, digest_id=digest_id)
+        if refreshed is None:
+            raise ValueError("Learning distillation digest not found after review.")
+        return {
+            "digest": refreshed,
+            "effect": effect,
+        }
+
+    def _skill_gap_digest_candidates(
+        self,
+        session: Session,
+        *,
+        limit: int,
+        min_group_size: int,
+    ) -> list[dict]:
+        statement = (
+            select(MemoryItem)
+            .where(MemoryItem.memory_type == "skill_gap")
+            .order_by(MemoryItem.created_at.desc(), MemoryItem.importance.desc(), MemoryItem.id.desc())
+            .limit(max(50, min(int(limit), 500)))
+        )
+        grouped: dict[tuple[str, str | None, str], list[MemoryItem]] = {}
+        for item in session.scalars(statement).all():
+            meta = dict(item.meta or {})
+            if str(meta.get("status") or "open").strip().lower() != "open":
+                continue
+            anchor = self._skill_gap_anchor(item)
+            if not anchor:
+                continue
+            scope = str(item.scope or "operator_feedback").strip() or "operator_feedback"
+            ticker = str(meta.get("ticker") or "").strip().upper() or None
+            grouped.setdefault((scope, ticker, anchor), []).append(item)
+
+        candidates: list[dict] = []
+        for (scope, ticker, anchor), items in grouped.items():
+            if len(items) < min_group_size:
+                continue
+            items.sort(key=lambda current: (current.importance, current.created_at, current.id), reverse=True)
+            gap_types = self._unique_strings(dict(item.meta or {}).get("gap_type") for item in items)
+            candidate_actions = self._unique_strings(dict(item.meta or {}).get("candidate_action") for item in items)
+            source_types = self._unique_strings(dict(item.meta or {}).get("source_type") for item in items)
+            linked_candidate_ids = sorted(
+                {
+                    int(linked_id)
+                    for linked_id in (
+                        dict(item.meta or {}).get("linked_skill_candidate_id")
+                        for item in items
+                    )
+                    if isinstance(linked_id, int)
+                }
+            )
+            sample_summaries = self._collect_item_summaries(items, max_items=3, limit=90)
+            collapse_recommended = bool(linked_candidate_ids)
+            content = (
+                f"{len(items)} open skill gaps around {anchor}"
+                + (f" on {ticker}" if ticker else "")
+                + f" in {scope}."
+                + (f" Gap types: {', '.join(gap_types[:3])}." if gap_types else "")
+                + (f" Candidate actions: {', '.join(candidate_actions[:3])}." if candidate_actions else "")
+                + (
+                    f" {len(linked_candidate_ids)} already link to a skill candidate; collapse review is recommended."
+                    if collapse_recommended
+                    else ""
+                )
+                + (f" Recent examples: {'; '.join(sample_summaries)}" if sample_summaries else "")
+            ).strip()
+            candidates.append(
+                {
+                    "key": self._digest_key("skill-gap", anchor, scope, ticker or "global"),
+                    "scope": self._safe_memory_scope(scope),
+                    "content": content,
+                    "importance": min(0.58 + (0.04 * len(items)) + (0.03 * len(linked_candidate_ids)), 0.94),
+                    "source_count": len(items),
+                    "source_ids": [item.id for item in items],
+                    "meta": {
+                        "distillation_type": "skill_gap_digest",
+                        "scope": scope,
+                        "ticker": ticker,
+                        "gap_anchor": anchor,
+                        "target_skill_code": self._single_value_or_none(
+                            dict(item.meta or {}).get("target_skill_code") or dict(item.meta or {}).get("linked_skill_code")
+                            for item in items
+                        ),
+                        "gap_ids": [item.id for item in items],
+                        "gap_types": gap_types,
+                        "source_types": source_types,
+                        "candidate_actions": candidate_actions,
+                        "linked_skill_candidate_ids": linked_candidate_ids,
+                        "open_gap_count": len(items),
+                        "collapse_to_candidate_recommended": collapse_recommended,
+                    },
+                }
+            )
+        candidates.sort(
+            key=lambda item: (
+                item["importance"],
+                item["meta"].get("open_gap_count", 0),
+                item["source_count"],
+                item["key"],
+            ),
+            reverse=True,
+        )
+        return candidates
+
+    def _skill_candidate_digest_candidates(
+        self,
+        session: Session,
+        *,
+        limit: int,
+        min_group_size: int,
+    ) -> list[dict]:
+        statement = (
+            select(MemoryItem)
+            .where(MemoryItem.memory_type == "skill_candidate")
+            .order_by(MemoryItem.created_at.desc(), MemoryItem.importance.desc(), MemoryItem.id.desc())
+            .limit(max(50, min(int(limit), 500)))
+        )
+        grouped: dict[tuple[str, str | None, str], list[MemoryItem]] = {}
+        for item in session.scalars(statement).all():
+            meta = dict(item.meta or {})
+            if str(meta.get("activation_status") or "").strip().lower() == "superseded":
+                continue
+            anchor = self._skill_candidate_anchor(item)
+            if not anchor:
+                continue
+            scope = str(item.scope or "operator_feedback").strip() or "operator_feedback"
+            ticker = str(meta.get("ticker") or "").strip().upper() or None
+            grouped.setdefault((scope, ticker, anchor), []).append(item)
+
+        candidates: list[dict] = []
+        for (scope, ticker, anchor), items in grouped.items():
+            if len(items) < min_group_size:
+                continue
+            items.sort(key=lambda current: (current.importance, current.created_at, current.id), reverse=True)
+            status_counts = self._count_labels(
+                str(dict(item.meta or {}).get("candidate_status") or "draft").strip().lower() or "draft"
+                for item in items
+            )
+            activation_counts = self._count_labels(
+                str(dict(item.meta or {}).get("activation_status") or "none").strip().lower() or "none"
+                for item in items
+            )
+            source_types = self._unique_strings(dict(item.meta or {}).get("source_type") for item in items)
+            candidate_actions = self._unique_strings(dict(item.meta or {}).get("candidate_action") for item in items)
+            validation_record_ids = sorted(
+                {
+                    int(record_id)
+                    for record_id in (dict(item.meta or {}).get("latest_validation_record_id") for item in items)
+                    if isinstance(record_id, int)
+                }
+            )
+            collapse_recommended = (
+                any(
+                    status in activation_counts
+                    for status in ("active", "validated_not_activated", "pending_catalog_integration")
+                )
+                and any(status in status_counts for status in ("draft", "rejected"))
+            )
+            retirement_recommended = set(status_counts).issubset({"rejected"}) and bool(status_counts)
+            sample_summaries = self._collect_item_summaries(items, max_items=3, limit=90)
+            content = (
+                f"{len(items)} skill candidates accumulated around {anchor}"
+                + (f" on {ticker}" if ticker else "")
+                + f" in {scope}."
+                + (f" Statuses: {self._format_count_map(status_counts)}." if status_counts else "")
+                + (f" Sources: {', '.join(source_types[:3])}." if source_types else "")
+                + (" A validated path already exists; collapse older drafts or rejects." if collapse_recommended else "")
+                + (" All grouped candidates are rejected; retirement is recommended." if retirement_recommended else "")
+                + (f" Recent examples: {'; '.join(sample_summaries)}" if sample_summaries else "")
+            ).strip()
+            candidates.append(
+                {
+                    "key": self._digest_key("skill-candidate", anchor, scope, ticker or "global"),
+                    "scope": self._safe_memory_scope(scope),
+                    "content": content,
+                    "importance": min(
+                        0.58
+                        + (0.04 * len(items))
+                        + (0.03 * len(validation_record_ids))
+                        + (0.03 if collapse_recommended else 0.0)
+                        + (0.02 if retirement_recommended else 0.0),
+                        0.95,
+                    ),
+                    "source_count": len(items),
+                    "source_ids": [item.id for item in items],
+                    "meta": {
+                        "distillation_type": "skill_candidate_digest",
+                        "scope": scope,
+                        "ticker": ticker,
+                        "candidate_anchor": anchor,
+                        "target_skill_code": self._single_value_or_none(
+                            dict(item.meta or {}).get("target_skill_code") for item in items
+                        ),
+                        "candidate_ids": [item.id for item in items],
+                        "candidate_status_counts": status_counts,
+                        "activation_status_counts": activation_counts,
+                        "source_types": source_types,
+                        "candidate_actions": candidate_actions,
+                        "latest_validation_record_ids": validation_record_ids,
+                        "collapse_backlog_recommended": collapse_recommended,
+                        "retirement_recommended": retirement_recommended,
+                    },
+                }
+            )
+        candidates.sort(
+            key=lambda item: (
+                item["importance"],
+                item["source_count"],
+                len(item["meta"].get("latest_validation_record_ids", [])),
+                item["key"],
+            ),
+            reverse=True,
+        )
+        return candidates
+
+    @staticmethod
+    def _claim_review_reason(claim: KnowledgeClaim) -> tuple[str | None, int]:
+        normalized_status = str(claim.status or "").strip().lower()
+        normalized_freshness = str(claim.freshness_state or "").strip().lower()
+        if normalized_status == "retired":
+            return None, 0
+        if normalized_status == "contested":
+            return "contradiction_review_due", 3
+        if normalized_status == "contradicted":
+            return "claim_refuted_review_due", 3
+        if normalized_freshness == "stale":
+            return "freshness_review_due", 2
+        if normalized_freshness == "aging":
+            return "freshness_check_recommended", 1
+        return None, 0
+
+    @staticmethod
+    def _label_for_review_reason(review_reason: str) -> str:
+        labels = {
+            "contradiction_review_due": "contradiction review",
+            "claim_refuted_review_due": "refutation review",
+            "freshness_review_due": "freshness review",
+            "freshness_check_recommended": "a freshness check",
+        }
+        return labels.get(review_reason, "review")
+
+    @staticmethod
+    def _cluster_anchor(cluster: dict) -> str:
+        return (
+            str(cluster.get("target_skill_code") or "").strip()
+            or str(cluster.get("claim_key") or "").strip()
+            or str(cluster.get("entity_type") or "").strip()
+            or str(cluster.get("disagreement_type") or "").strip()
+        )
+
+    @staticmethod
+    def _skill_gap_anchor(item: MemoryItem) -> str:
+        meta = dict(item.meta or {})
+        return (
+            str(meta.get("target_skill_code") or "").strip()
+            or str(meta.get("linked_skill_code") or "").strip()
+            or str(meta.get("gap_type") or "").strip()
+            or str(item.key or "").strip()
+        )
+
+    @staticmethod
+    def _skill_candidate_anchor(item: MemoryItem) -> str:
+        meta = dict(item.meta or {})
+        return (
+            str(meta.get("target_skill_code") or "").strip()
+            or str(meta.get("source_claim_key") or "").strip()
+            or str(meta.get("source_gap_key") or "").strip()
+            or str(item.key or "").strip()
+        )
+
+    @staticmethod
+    def _safe_memory_scope(scope: str) -> str:
+        normalized = str(scope or "").strip() or "operator_feedback"
+        return normalized[:50]
+
+    @staticmethod
+    def _compact_text(value: str, *, limit: int) -> str:
+        normalized = re.sub(r"\s+", " ", str(value or "").strip())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: max(limit - 3, 1)].rstrip() + "..."
+
+    @staticmethod
+    def _digest_key(*parts: str) -> str:
+        slug_parts = []
+        for part in parts:
+            normalized = re.sub(r"[^a-z0-9]+", "-", str(part or "").strip().lower()).strip("-")
+            slug_parts.append(normalized or "x")
+        return ":".join(["distill", *slug_parts])[:120]
+
+    @staticmethod
+    def _unique_strings(values) -> list[str]:
+        unique: list[str] = []
+        for value in values:
+            normalized = str(value or "").strip()
+            if not normalized or normalized in unique:
+                continue
+            unique.append(normalized)
+        return unique
+
+    @classmethod
+    def _collect_item_summaries(cls, items: list[MemoryItem], *, max_items: int, limit: int) -> list[str]:
+        summaries: list[str] = []
+        for item in items:
+            meta = dict(item.meta or {})
+            summary = cls._compact_text(str(meta.get("summary") or item.content or ""), limit=limit)
+            if summary and summary not in summaries:
+                summaries.append(summary)
+            if len(summaries) >= max_items:
+                break
+        return summaries
+
+    @staticmethod
+    def _count_labels(values) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for value in values:
+            normalized = str(value or "").strip().lower()
+            if not normalized:
+                continue
+            counts[normalized] = counts.get(normalized, 0) + 1
+        return counts
+
+    @staticmethod
+    def _format_count_map(counts: dict[str, int]) -> str:
+        return ", ".join(f"{label} x{count}" for label, count in sorted(counts.items()))
+
+    @staticmethod
+    def _single_value_or_none(values) -> str | None:
+        unique = {str(value).strip() for value in values if str(value or "").strip()}
+        if len(unique) == 1:
+            return next(iter(unique))
+        return None
+
+    @staticmethod
+    def _merge_digest_review_meta(item: MemoryItem | None, candidate_meta: object) -> dict:
+        merged = dict(candidate_meta or {})
+        if item is None:
+            return merged
+        current_meta = dict(item.meta or {})
+        for key in (
+            "review_status",
+            "review_action",
+            "review_summary",
+            "reviewed_at",
+            "review_effect",
+            "review_journal_entry_id",
+        ):
+            if key in current_meta:
+                merged[key] = current_meta[key]
+        return merged
+
+    def _review_skill_gap_digest(
+        self,
+        session: Session,
+        *,
+        digest_item: MemoryItem,
+        action: str,
+        summary: str,
+        keep_entity_id: int | None,
+    ) -> dict:
+        from app.domains.learning.schemas import JournalEntryCreate
+        from app.domains.learning.skills import SkillGapService, SkillLifecycleService
+
+        digest_meta = dict(digest_item.meta or {})
+        source_ids = [int(item_id) for item_id in list(digest_meta.get("gap_ids") or []) if isinstance(item_id, int)]
+        gaps = self._load_memory_items(session, source_ids, expected_memory_type="skill_gap")
+        open_gaps = [item for item in gaps if str(dict(item.meta or {}).get("status") or "open").strip().lower() == "open"]
+        if not open_gaps:
+            raise ValueError("No open skill gaps remain for this digest.")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        candidate_item: MemoryItem | None = None
+        candidate_created = False
+        retired_gap_ids: list[int] = []
+        collapsed_gap_ids: list[int] = []
+
+        if action == "collapse":
+            candidate_item, candidate_created = self._resolve_gap_collapse_candidate(
+                session,
+                digest_item=digest_item,
+                gaps=open_gaps,
+                keep_entity_id=keep_entity_id,
+            )
+            if candidate_item is None:
+                raise ValueError("No skill candidate is available to collapse this digest.")
+            for gap in open_gaps:
+                gap_meta = dict(gap.meta or {})
+                gap_meta["status"] = "collapsed"
+                gap_meta["collapsed_at"] = now_iso
+                gap_meta["collapse_summary"] = summary
+                gap_meta["collapsed_into_candidate_id"] = candidate_item.id
+                gap_meta["collapsed_by_distillation_digest_id"] = digest_item.id
+                gap_meta["resolution_source"] = "distillation_review"
+                gap_meta["linked_skill_candidate_id"] = candidate_item.id
+                gap.meta = gap_meta
+                session.add(gap)
+                collapsed_gap_ids.append(gap.id)
+        else:
+            if keep_entity_id is not None:
+                raise ValueError("Retire action does not accept keep_entity_id for skill-gap digests.")
+            for gap in open_gaps:
+                gap_meta = dict(gap.meta or {})
+                gap_meta["status"] = "retired"
+                gap_meta["retired_at"] = now_iso
+                gap_meta["retirement_summary"] = summary
+                gap_meta["retired_by_distillation_digest_id"] = digest_item.id
+                gap_meta["resolution_source"] = "distillation_review"
+                gap.meta = gap_meta
+                session.add(gap)
+                retired_gap_ids.append(gap.id)
+
+        effect = {
+            "action": action,
+            "collapsed_gap_ids": collapsed_gap_ids,
+            "retired_gap_ids": retired_gap_ids,
+            "candidate_id": candidate_item.id if candidate_item is not None else None,
+            "candidate_created": candidate_created,
+            "source_gap_ids": source_ids,
+        }
+        journal_entry = JournalService().create_entry(
+            session,
+            JournalEntryCreate(
+                entry_type="skill_gap_digest_collapsed" if action == "collapse" else "skill_gap_digest_retired",
+                ticker=digest_meta.get("ticker"),
+                strategy_version_id=self._single_strategy_version_from_items(open_gaps),
+                observations={
+                    "distillation_digest": self._memory_item_payload(digest_item),
+                    "effect": SkillLifecycleService._json_ready_payload(effect),
+                },
+                reasoning=summary,
+                decision=action,
+                lessons=summary,
+            ),
+        )
+        self._store_digest_review(
+            session,
+            digest_item=digest_item,
+            action=action,
+            summary=summary,
+            effect={**effect, "journal_entry_id": journal_entry.id},
+            reviewed_at=now_iso,
+        )
+        return {**effect, "journal_entry_id": journal_entry.id}
+
+    def _review_skill_candidate_digest(
+        self,
+        session: Session,
+        *,
+        digest_item: MemoryItem,
+        action: str,
+        summary: str,
+        keep_entity_id: int | None,
+    ) -> dict:
+        from app.domains.learning.schemas import JournalEntryCreate
+        from app.domains.learning.skills import SkillLifecycleService
+
+        digest_meta = dict(digest_item.meta or {})
+        source_ids = [int(item_id) for item_id in list(digest_meta.get("candidate_ids") or []) if isinstance(item_id, int)]
+        candidates = self._load_memory_items(session, source_ids, expected_memory_type="skill_candidate")
+        active_candidates = [
+            item
+            for item in candidates
+            if str(dict(item.meta or {}).get("candidate_status") or "").strip().lower() != "retired"
+        ]
+        if not active_candidates:
+            raise ValueError("No active skill candidates remain for this digest.")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        kept_candidate: MemoryItem | None = None
+        retired_candidate_ids: list[int] = []
+
+        if action == "collapse":
+            kept_candidate = self._resolve_candidate_survivor(active_candidates, keep_entity_id=keep_entity_id)
+            if kept_candidate is None:
+                raise ValueError("No skill candidate is available to keep for this digest.")
+            for candidate in active_candidates:
+                if candidate.id == kept_candidate.id:
+                    continue
+                candidate_meta = dict(candidate.meta or {})
+                candidate_meta["candidate_status"] = "retired"
+                candidate_meta["retired_at"] = now_iso
+                candidate_meta["retirement_summary"] = summary
+                candidate_meta["retired_by_distillation_digest_id"] = digest_item.id
+                candidate_meta["retired_in_favor_of_candidate_id"] = kept_candidate.id
+                normalized_activation = str(candidate_meta.get("activation_status") or "").strip().lower()
+                if normalized_activation in {"active", "validated_not_activated", "pending_catalog_integration"}:
+                    candidate_meta["activation_status"] = "superseded"
+                elif not normalized_activation:
+                    candidate_meta["activation_status"] = "retired"
+                candidate.meta = candidate_meta
+                session.add(candidate)
+                retired_candidate_ids.append(candidate.id)
+
+            survivor_meta = dict(kept_candidate.meta or {})
+            survivor_meta["collapse_reviewed_at"] = now_iso
+            survivor_meta["collapse_review_summary"] = summary
+            survivor_meta["collapse_digest_id"] = digest_item.id
+            kept_candidate.meta = survivor_meta
+            session.add(kept_candidate)
+        else:
+            if keep_entity_id is not None:
+                raise ValueError("Retire action does not accept keep_entity_id for skill-candidate digests.")
+            if any(
+                str(dict(item.meta or {}).get("activation_status") or "").strip().lower()
+                in {"active", "validated_not_activated", "pending_catalog_integration"}
+                for item in active_candidates
+            ):
+                raise ValueError("Cannot retire a digest that still contains validated or active candidate backlog.")
+            for candidate in active_candidates:
+                candidate_meta = dict(candidate.meta or {})
+                candidate_meta["candidate_status"] = "retired"
+                candidate_meta["retired_at"] = now_iso
+                candidate_meta["retirement_summary"] = summary
+                candidate_meta["retired_by_distillation_digest_id"] = digest_item.id
+                if not str(candidate_meta.get("activation_status") or "").strip():
+                    candidate_meta["activation_status"] = "retired"
+                candidate.meta = candidate_meta
+                session.add(candidate)
+                retired_candidate_ids.append(candidate.id)
+
+        effect = {
+            "action": action,
+            "kept_candidate_id": kept_candidate.id if kept_candidate is not None else None,
+            "retired_candidate_ids": retired_candidate_ids,
+            "source_candidate_ids": source_ids,
+        }
+        journal_entry = JournalService().create_entry(
+            session,
+            JournalEntryCreate(
+                entry_type="skill_candidate_digest_collapsed" if action == "collapse" else "skill_candidate_digest_retired",
+                ticker=digest_meta.get("ticker"),
+                strategy_version_id=self._single_strategy_version_from_items(active_candidates),
+                observations={
+                    "distillation_digest": self._memory_item_payload(digest_item),
+                    "effect": SkillLifecycleService._json_ready_payload(effect),
+                },
+                reasoning=summary,
+                decision=action,
+                lessons=summary,
+            ),
+        )
+        self._store_digest_review(
+            session,
+            digest_item=digest_item,
+            action=action,
+            summary=summary,
+            effect={**effect, "journal_entry_id": journal_entry.id},
+            reviewed_at=now_iso,
+        )
+        return {**effect, "journal_entry_id": journal_entry.id}
+
+    @staticmethod
+    def _load_memory_items(session: Session, ids: list[int], *, expected_memory_type: str) -> list[MemoryItem]:
+        items: list[MemoryItem] = []
+        for item_id in ids:
+            item = session.get(MemoryItem, item_id)
+            if item is None or item.memory_type != expected_memory_type:
+                continue
+            items.append(item)
+        return items
+
+    def _resolve_gap_collapse_candidate(
+        self,
+        session: Session,
+        *,
+        digest_item: MemoryItem,
+        gaps: list[MemoryItem],
+        keep_entity_id: int | None,
+    ) -> tuple[MemoryItem | None, bool]:
+        from app.domains.learning.skills import SkillGapService
+
+        digest_meta = dict(digest_item.meta or {})
+        expected_target_skill_code = str(digest_meta.get("target_skill_code") or "").strip() or None
+        if keep_entity_id is not None:
+            candidate = session.get(MemoryItem, keep_entity_id)
+            if candidate is None or candidate.memory_type != "skill_candidate":
+                raise ValueError("Requested keep_entity_id is not a skill candidate.")
+            candidate_target = str(dict(candidate.meta or {}).get("target_skill_code") or "").strip() or None
+            if expected_target_skill_code and candidate_target and candidate_target != expected_target_skill_code:
+                raise ValueError("Requested keep_entity_id targets a different skill.")
+            return candidate, False
+
+        linked_candidate_ids = [
+            int(candidate_id)
+            for candidate_id in list(digest_meta.get("linked_skill_candidate_ids") or [])
+            if isinstance(candidate_id, int)
+        ]
+        ranked_candidates = self._rank_candidates(
+            [
+                candidate
+                for candidate in self._load_memory_items(session, linked_candidate_ids, expected_memory_type="skill_candidate")
+                if candidate is not None
+            ]
+        )
+        if ranked_candidates:
+            return ranked_candidates[0], False
+
+        gap_service = SkillGapService()
+        primary_gap = sorted(gaps, key=lambda item: (item.importance, item.created_at, item.id), reverse=True)[0]
+        candidate_payload = gap_service.promote_gap_to_candidate(session, gap_id=primary_gap.id)
+        candidate_id = candidate_payload.get("id") if isinstance(candidate_payload, dict) else None
+        if not isinstance(candidate_id, int):
+            return None, False
+        candidate = session.get(MemoryItem, candidate_id)
+        return candidate, True
+
+    def _resolve_candidate_survivor(self, candidates: list[MemoryItem], *, keep_entity_id: int | None) -> MemoryItem | None:
+        if keep_entity_id is not None:
+            for candidate in candidates:
+                if candidate.id == keep_entity_id:
+                    return candidate
+            raise ValueError("Requested keep_entity_id is not part of this candidate digest.")
+        ranked = self._rank_candidates(candidates)
+        return ranked[0] if ranked else None
+
+    @classmethod
+    def _rank_candidates(cls, candidates: list[MemoryItem]) -> list[MemoryItem]:
+        return sorted(candidates, key=cls._candidate_rank_key, reverse=True)
+
+    @staticmethod
+    def _candidate_rank_key(item: MemoryItem) -> tuple:
+        meta = dict(item.meta or {})
+        candidate_status_rank = {
+            "validated": 4,
+            "draft": 3,
+            "rejected": 2,
+            "retired": 1,
+        }.get(str(meta.get("candidate_status") or "draft").strip().lower(), 0)
+        activation_status_rank = {
+            "active": 5,
+            "validated_not_activated": 4,
+            "pending_catalog_integration": 3,
+            "rejected": 2,
+            "superseded": 1,
+        }.get(str(meta.get("activation_status") or "").strip().lower(), 0)
+        has_validation = 1 if isinstance(meta.get("latest_validation_record_id"), int) else 0
+        return (
+            activation_status_rank,
+            candidate_status_rank,
+            has_validation,
+            float(item.importance or 0.0),
+            item.created_at,
+            item.id,
+        )
+
+    @staticmethod
+    def _single_strategy_version_from_items(items: list[MemoryItem]) -> int | None:
+        values = {
+            int(strategy_version_id)
+            for strategy_version_id in (dict(item.meta or {}).get("strategy_version_id") for item in items)
+            if isinstance(strategy_version_id, int)
+        }
+        if len(values) == 1:
+            return next(iter(values))
+        return None
+
+    @staticmethod
+    def _memory_item_payload(item: MemoryItem) -> dict:
+        return {
+            "id": item.id,
+            "memory_type": item.memory_type,
+            "scope": item.scope,
+            "key": item.key,
+            "content": item.content,
+            "meta": dict(item.meta or {}),
+            "importance": item.importance,
+            "created_at": item.created_at.isoformat() if item.created_at is not None else None,
+        }
+
+    def _store_digest_review(
+        self,
+        session: Session,
+        *,
+        digest_item: MemoryItem,
+        action: str,
+        summary: str,
+        effect: dict,
+        reviewed_at: str,
+    ) -> None:
+        digest_meta = dict(digest_item.meta or {})
+        digest_meta["review_status"] = "applied"
+        digest_meta["review_action"] = action
+        digest_meta["review_summary"] = summary
+        digest_meta["reviewed_at"] = reviewed_at
+        digest_meta["review_effect"] = effect
+        digest_item.meta = digest_meta
+        session.add(digest_item)
+        session.commit()
+        session.refresh(digest_item)
+
+    def _runtime_candidate_digests(
+        self,
+        session: Session,
+        *,
+        ticker: str | None = None,
+        strategy_version_id: int | None = None,
+    ) -> list[MemoryItem]:
+        statement = (
+            select(MemoryItem)
+            .where(MemoryItem.memory_type == LEARNING_DISTILLATION_MEMORY_TYPE)
+            .order_by(MemoryItem.importance.desc(), MemoryItem.created_at.desc(), MemoryItem.id.desc())
+            .limit(200)
+        )
+        normalized_ticker = str(ticker or "").strip().upper() or None
+        candidates: list[tuple[tuple, MemoryItem]] = []
+        for item in session.scalars(statement).all():
+            meta = dict(item.meta or {})
+            if str(meta.get("review_status") or "").strip().lower() != "applied":
+                continue
+            if str(meta.get("review_action") or "").strip().lower() != "collapse":
+                continue
+            distillation_type = str(meta.get("distillation_type") or "").strip().lower()
+            if distillation_type not in {"skill_gap_digest", "skill_candidate_digest"}:
+                continue
+            item_ticker = str(meta.get("ticker") or "").strip().upper() or None
+            item_strategy_version_id = self._strategy_version_id_for_digest(item)
+            strategy_match = strategy_version_id is not None and item_strategy_version_id == strategy_version_id
+            ticker_match = normalized_ticker is not None and item_ticker == normalized_ticker
+            if strategy_version_id is not None or normalized_ticker is not None:
+                if not strategy_match and not ticker_match:
+                    continue
+            candidates.append(
+                (
+                    (
+                        1 if strategy_match else 0,
+                        1 if ticker_match else 0,
+                        float(item.importance or 0.0),
+                        self._reviewed_at_sort_key(item),
+                        int(item.id),
+                    ),
+                    item,
+                )
+            )
+        candidates.sort(key=lambda entry: entry[0], reverse=True)
+        return [item for _, item in candidates]
+
+    def _build_runtime_packet(self, item: MemoryItem) -> LearningDistillationRuntimePacket | None:
+        meta = dict(item.meta or {})
+        distillation_type = str(meta.get("distillation_type") or "").strip().lower()
+        review_summary = str(meta.get("review_summary") or "").strip()
+        if not distillation_type or not review_summary:
+            return None
+        return LearningDistillationRuntimePacket(
+            digest_id=item.id,
+            key=str(item.key or "").strip(),
+            distillation_type=distillation_type,
+            scope=str(item.scope or "").strip(),
+            summary=str(item.content or "").strip(),
+            importance=float(item.importance or 0.0),
+            review_action=str(meta.get("review_action") or "").strip().lower() or "collapse",
+            review_summary=review_summary,
+            source_count=len(
+                [item_id for item_id in list(meta.get("gap_ids") or meta.get("candidate_ids") or []) if isinstance(item_id, int)]
+            ),
+            linked_ticker=str(meta.get("ticker") or "").strip().upper() or None,
+            strategy_version_id=self._strategy_version_id_for_digest(item),
+            target_skill_code=str(meta.get("target_skill_code") or "").strip() or None,
+            effect=dict(meta.get("review_effect") or {}),
+        )
+
+    @staticmethod
+    def _strategy_version_id_for_digest(item: MemoryItem) -> int | None:
+        meta = dict(item.meta or {})
+        raw_value = meta.get("strategy_version_id")
+        if isinstance(raw_value, int) and raw_value > 0:
+            return raw_value
+        scope = str(meta.get("scope") or item.scope or "").strip()
+        if scope.startswith("strategy:"):
+            suffix = scope.split(":", 1)[1].strip()
+            if suffix.isdigit():
+                return int(suffix)
+        return None
+
+    @staticmethod
+    def _reviewed_at_sort_key(item: MemoryItem) -> float:
+        meta = dict(item.meta or {})
+        reviewed_at = str(meta.get("reviewed_at") or "").strip()
+        if reviewed_at:
+            try:
+                return datetime.fromisoformat(reviewed_at).timestamp()
+            except ValueError:
+                pass
+        created_at = item.created_at or datetime.now(timezone.utc)
+        return created_at.timestamp()
+
+    @staticmethod
+    def _digest_changed(item: MemoryItem, candidate: dict) -> bool:
+        return not (
+            str(item.scope) == str(candidate["scope"])
+            and str(item.content) == str(candidate["content"])
+            and abs(float(item.importance or 0.0) - float(candidate["importance"])) < 1e-6
+            and dict(item.meta or {}) == dict(candidate["meta"])
+        )
 
 
 class BotChatService:
