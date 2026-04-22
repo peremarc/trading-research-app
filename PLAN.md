@@ -1171,7 +1171,7 @@ El principio rector es este:
   aprendizaje reutilizable
 * nunca permitir auto-modificación rápida de reglas live sin validación
 
-Estado actual esperado del proyecto:
+Estado actual del proyecto:
 
 * `tools` separadas de `skills`
 * memoria persistente
@@ -1179,6 +1179,13 @@ Estado actual esperado del proyecto:
 * skills catalogadas y validadas
 * claims/evidence persistidos
 * skills y claims cargados on-demand en runtime
+* workflows explícitos de aprendizaje ya implementados:
+  `premarket_review`, `postmarket_review`, `weekly_skill_audit`,
+  `stale_claim_review`, `regime_shift_review`
+* detección de `skill_gap` y promoción controlada desde reviews y feedback
+* puente formal `claim -> skill_candidate` ya implementado
+* presupuesto cognitivo observable en runtime y ticker trace, aunque todavía
+  no como superficie operativa de primer nivel
 
 Lo que debe venir después, en este orden:
 
@@ -1277,6 +1284,174 @@ El sistema debe poder:
 * resumir periodos largos
 * distinguir entre conocimiento actual y conocimiento histórico
 
+#### Qué sí conviene copiar de OpenClaw/Hermes
+
+No quiero copiar su producto entero ni su superficie de plataforma. Lo útil
+para este proyecto está en estos patrones:
+
+* `skill workshop` o memoria procedimental explícita:
+  convertir correcciones, workflows exitosos y pitfalls en propuestas de skill
+  revisables, no en cambios live implícitos
+* `workflow/task ledger`:
+  cada ejecución programada o manual debe dejar inputs, outputs, artefactos,
+  coste cognitivo, skills cargadas y resultado final
+* `skills` como artefactos portables:
+  `SKILL.md` o YAML exportable para diff, review, test y portabilidad
+* interfaz de memoria pluggable:
+  permitir retrieval más rico para claims/evidence/patterns sin acoplar el
+  modelo a una sola implementación de almacenamiento
+* sesiones aisladas para lanes de research:
+  el trabajo programado o de exploración debe correr con contexto acotado y
+  trazabilidad propia
+* delegación acotada:
+  solo para lanes de research no ejecutivos, nunca para la decisión final de
+  riesgo o ejecución
+
+#### Qué no conviene copiar
+
+* gateways de mensajería, chat surfaces o control planes genéricos
+* marketplaces públicos de skills o instalación abierta de terceros
+* memoria centrada en persona/usuario tipo `Honcho` como prioridad principal
+* `execute_code` arbitrario dentro del path live de decisión
+* auto-modificación rápida de reglas activas sin replay/paper/backtest
+
+#### Nuevo orden recomendado de implementación
+
+El roadmap original ya cubrió buena parte de la base. El siguiente orden
+recomendado, a partir del estado real del repo, es este:
+
+##### Slice 1: ledger de ejecuciones y artefactos de workflow
+
+Cada `learning_workflow` debe poder registrar runs reales, no solo su estado
+agregado.
+
+Debe existir:
+
+* `workflow_run`
+* `workflow_artifact`
+* inputs del run
+* outputs persistidos
+* duración, coste y contexto cargado
+* journal enlazado
+
+Objetivo:
+
+* saber qué produjo cada workflow
+* poder reabrir, comparar y auditar runs
+* dejar base para skill workshop y distillation
+
+##### Slice 2: skill workshop interno basado en propuestas
+
+Quiero una capa explícita que convierta evidencia útil en propuestas de skill,
+sin activarlas automáticamente.
+
+Debe capturar:
+
+* correcciones del operador
+* workflows completados con outcome útil
+* gaps recurrentes
+* claims o clusters que se vuelven claramente procedimentales
+
+Debe producir:
+
+* `skill_proposal`
+* diff o patch sobre skill existente
+* motivo y evidencia enlazada
+* estado `pending/rejected/applied`
+
+##### Slice 3: outputs de workflows conectados a artefactos reales
+
+Los workflows no deben cerrarse solo con un resumen textual.
+
+Cada workflow debe poder dejar explícitamente:
+
+* `research_task`
+* `claim`
+* `skill_gap`
+* `skill_candidate`
+* `workflow_artifact`
+
+Objetivo:
+
+* que `premarket_review`, `postmarket_review` y `regime_shift_review`
+  produzcan trabajo reutilizable
+* que el cierre del workflow deje una huella estructurada y trazable
+
+Estado actual:
+
+* implementado en forma operator-driven:
+  `LearningWorkflowActionRequest` ya puede materializar
+  `research_task`, `knowledge_claim`, `skill_gap` y `skill_candidate`
+  directamente durante la acción del workflow
+* cada salida queda enlazada al mismo `workflow_run` como artifact explícito
+  junto al completion artifact y al journal entry asociado
+
+##### Slice 4: skills portables y exportables
+
+Una vez exista `skill workshop`, las skills deben poder salir del runtime
+relacional.
+
+Entregables:
+
+* export `validated_skill_revision -> SKILL.md`
+* export opcional a YAML estructurado
+* import controlado desde artefacto a candidato o revisión
+* tests de round-trip y compatibilidad
+
+Estado actual:
+
+* implementado:
+  `GET /api/v1/skills/revisions/{revision_id}/portable`
+  ya exporta un `validated_skill_revision` como documento portable con
+  `yaml_text` y `skill_md`
+* implementado:
+  `POST /api/v1/skills/portable/import`
+  ya permite importar el artefacto como `skill_candidate` draft o como
+  `validated_skill_revision` inactiva
+* el import queda trazado en `journal_entries`
+  y el round-trip está cubierto en tests
+
+##### Slice 5: destilación y compacción de memoria
+
+La siguiente fase debe reducir crecimiento y ruido.
+
+Debe cubrir:
+
+* fusión de claims duplicados
+* degradación o retiro de claims viejos
+* compacción de disagreement clusters
+* resumen por ventana temporal
+* separación entre memoria activa e histórica
+
+##### Slice 6: interfaz de memory backend pluggable
+
+Después de ordenar la memoria local, quiero abrir una interfaz para retrieval
+externo o más semántico.
+
+No como prioridad de producto visible, sino como frontera técnica:
+
+* `memory backend interface`
+* implementación local por defecto
+* futura implementación vectorial/semántica
+* retrieval por ticker, strategy, regime, setup y outcome
+
+##### Slice 7: delegación acotada para research lanes
+
+Solo después de que el ledger, skill workshop y memoria estén ordenados.
+
+Delegación permitida:
+
+* macro research
+* news/web research
+* structure review o evidence gathering
+
+Delegación no permitida:
+
+* decisión final de entrada/salida
+* sizing
+* cambios directos sobre policy live
+* activación automática de revisiones
+
 #### Entregables esperados por slice
 
 Cada nueva slice del loop de aprendizaje debe dejar:
@@ -1292,6 +1467,16 @@ Cada nueva slice del loop de aprendizaje debe dejar:
 
 Después del diseño, ayúdame a empezar a construirlo.
 Por favor:
+
+Orden inmediato recomendado desde el estado actual:
+
+1. backend:
+   conectar la capa ya implementada de `memory distillation`
+   y acciones revisables de `collapse / retire`
+   al surface operador y/o al retrieval bounded del runtime,
+   para que los digestos no sean solo storage auditable
+2. opcional después:
+   interfaz pluggable de memory backend y delegación acotada para research
 
 * propón estructura de carpetas
 * sugiere nombres de módulos y archivos

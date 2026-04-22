@@ -112,7 +112,19 @@ def _reset_api_service_singletons() -> None:
     learning_api.skill_lifecycle_service = learning_api.SkillLifecycleService(
         catalog_service=learning_api.skill_catalog_service
     )
+    learning_api.skill_workshop_service = learning_api.SkillWorkshopService(
+        catalog_service=learning_api.skill_catalog_service
+    )
+    learning_api.skill_portable_service = learning_api.SkillPortableArtifactService(
+        catalog_service=learning_api.skill_catalog_service,
+        skill_lifecycle_service=learning_api.skill_lifecycle_service,
+    )
     learning_api.knowledge_claim_service = learning_api.KnowledgeClaimService()
+    learning_api.learning_memory_distillation_service = learning_api.LearningMemoryDistillationService()
+    learning_api.runtime_memory_service = learning_api.LearningRuntimeMemoryService(
+        skill_lifecycle_service=learning_api.skill_lifecycle_service,
+        knowledge_claim_service=learning_api.knowledge_claim_service,
+    )
     learning_api.learning_workflow_service = learning_api.LearningWorkflowService()
     learning_api.operator_disagreement_service = learning_api.OperatorDisagreementService()
 

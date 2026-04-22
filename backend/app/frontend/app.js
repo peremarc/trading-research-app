@@ -36,6 +36,7 @@ const elements = {
   incidentBoard: document.getElementById("incident-board"),
   journalFeed: document.getElementById("journal-feed"),
   learningDetail: document.getElementById("learning-detail"),
+  learningDistillations: document.getElementById("learning-distillations"),
   learningWorkflows: document.getElementById("learning-workflows"),
   macroResearchSignals: document.getElementById("macro-research-signals"),
   macroThemeWatchlists: document.getElementById("macro-theme-watchlists"),
@@ -49,7 +50,13 @@ const elements = {
   pipelineDetail: document.getElementById("pipeline-detail"),
   pipelinesList: document.getElementById("pipelines-list"),
   researchTasks: document.getElementById("research-tasks"),
+  runtimeMemoryForm: document.getElementById("runtime-memory-form"),
+  runtimeMemoryInspector: document.getElementById("runtime-memory-inspector"),
+  runtimeMemoryPhaseInput: document.getElementById("runtime-memory-phase-input"),
+  runtimeMemorySkillCodesInput: document.getElementById("runtime-memory-skill-codes-input"),
+  runtimeMemoryStrategyInput: document.getElementById("runtime-memory-strategy-input"),
   runtimeSummary: document.getElementById("runtime-summary"),
+  runtimeMemoryTickerInput: document.getElementById("runtime-memory-ticker-input"),
   skillActiveRevisions: document.getElementById("skill-active-revisions"),
   skillCandidates: document.getElementById("skill-candidates"),
   skillGaps: document.getElementById("skill-gaps"),
@@ -78,9 +85,17 @@ const state = {
     draft: null,
     compareBaselines: {},
     payload: null,
+    runtimeMemory: null,
   },
   scheduler: null,
   selectedStrategyId: null,
+  runtimeMemory: {
+    payload: null,
+    phase: "do",
+    skillCodes: [],
+    strategyVersionId: null,
+    ticker: null,
+  },
   trace: {
     payload: null,
     ticker: null,
@@ -134,6 +149,13 @@ elements.tickerTraceForm?.addEventListener("submit", async (event) => {
   const ticker = elements.tickerTraceInput?.value?.trim();
   if (!ticker) return;
   await loadTickerTrace(ticker);
+});
+
+elements.runtimeMemoryForm?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const requestState = readRuntimeMemoryFormState();
+  if (!requestState.ticker && requestState.strategyVersionId === null && !requestState.skillCodes.length) return;
+  await loadRuntimeMemoryInspector(requestState);
 });
 
 document.querySelectorAll("[data-chat-prompt]").forEach((button) => {
@@ -262,6 +284,7 @@ async function refreshDashboard() {
   renderDashboard();
   await refreshLearningDetail({ silent: true });
   await refreshTickerTraceFromDashboard();
+  await refreshRuntimeMemoryInspectorFromDashboard();
 }
 
 function renderDashboard() {
@@ -660,6 +683,23 @@ function runtimeBudgetCount(contextBudget, section, key, fallbackKey) {
   return null;
 }
 
+function normalizeTicker(value) {
+  const normalized = String(value || "").trim().toUpperCase();
+  return normalized || null;
+}
+
+function parseCommaSeparatedList(value) {
+  const seen = new Set();
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => {
+      if (!item || seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    });
+}
+
 function summarizeContextBudget(contextBudget) {
   const payload = asObject(contextBudget);
   if (!Object.keys(payload).length) return null;
@@ -669,9 +709,30 @@ function summarizeContextBudget(contextBudget) {
   const claimLoaded = runtimeBudgetCount(payload, "runtime_claims", "loaded_count", "loaded_runtime_claim_count");
   const claimAvailable = runtimeBudgetCount(payload, "runtime_claims", "available_count", "available_runtime_claim_count");
   const claimTrimmed = runtimeBudgetCount(payload, "runtime_claims", "truncated_count", "truncated_runtime_claim_count") || 0;
-  if (![skillLoaded, skillAvailable, claimLoaded, claimAvailable].some((value) => Number.isFinite(value))) return null;
-  const loadedTotal = (skillLoaded || 0) + (claimLoaded || 0);
-  const availableTotal = (skillAvailable || 0) + (claimAvailable || 0);
+  const distillationLoaded = runtimeBudgetCount(
+    payload,
+    "runtime_distillations",
+    "loaded_count",
+    "loaded_runtime_distillation_count",
+  );
+  const distillationAvailable = runtimeBudgetCount(
+    payload,
+    "runtime_distillations",
+    "available_count",
+    "available_runtime_distillation_count",
+  );
+  const distillationTrimmed = runtimeBudgetCount(
+    payload,
+    "runtime_distillations",
+    "truncated_count",
+    "truncated_runtime_distillation_count",
+  ) || 0;
+  if (
+    ![skillLoaded, skillAvailable, claimLoaded, claimAvailable, distillationLoaded, distillationAvailable]
+      .some((value) => Number.isFinite(value))
+  ) return null;
+  const loadedTotal = (skillLoaded || 0) + (claimLoaded || 0) + (distillationLoaded || 0);
+  const availableTotal = (skillAvailable || 0) + (claimAvailable || 0) + (distillationAvailable || 0);
   const detailParts = [];
   if (Number.isFinite(skillLoaded) || Number.isFinite(skillAvailable)) {
     detailParts.push(`skills ${skillLoaded ?? 0}/${skillAvailable ?? skillLoaded ?? 0}`);
@@ -679,7 +740,10 @@ function summarizeContextBudget(contextBudget) {
   if (Number.isFinite(claimLoaded) || Number.isFinite(claimAvailable)) {
     detailParts.push(`claims ${claimLoaded ?? 0}/${claimAvailable ?? claimLoaded ?? 0}`);
   }
-  const trimmedTotal = skillTrimmed + claimTrimmed;
+  if (Number.isFinite(distillationLoaded) || Number.isFinite(distillationAvailable)) {
+    detailParts.push(`distill ${distillationLoaded ?? 0}/${distillationAvailable ?? distillationLoaded ?? 0}`);
+  }
+  const trimmedTotal = skillTrimmed + claimTrimmed + distillationTrimmed;
   if (trimmedTotal > 0) detailParts.push(`trimmed ${trimmedTotal}`);
   return {
     headline: availableTotal > 0 ? `${loadedTotal}/${availableTotal} runtime items` : `${loadedTotal} runtime items`,
@@ -1026,6 +1090,7 @@ function renderSkillsDashboard(skillsDashboard) {
   const candidates = Array.isArray(skillsDashboard?.candidates) ? skillsDashboard.candidates : [];
   const revisions = Array.isArray(skillsDashboard?.active_revisions) ? skillsDashboard.active_revisions : [];
   const gaps = Array.isArray(skillsDashboard?.gaps) ? skillsDashboard.gaps : [];
+  const distillations = Array.isArray(skillsDashboard?.distillations) ? skillsDashboard.distillations : [];
 
   renderStackList(
     elements.skillCandidates,
@@ -1133,6 +1198,37 @@ function renderSkillsDashboard(skillsDashboard) {
     `,
     "No hay skill gaps detectados.",
   );
+
+  renderStackList(
+    elements.learningDistillations,
+    distillations,
+    (digest) => {
+      const meta = asObject(digest?.meta);
+      const distillationType = String(meta.distillation_type || digest.memory_type || "digest").trim();
+      const reviewStatus = String(meta.review_status || "pending").trim().toLowerCase();
+      const reviewClass = reviewStatus === "applied" ? "pill-approved" : "pill-degraded";
+      const reviewAction = String(meta.review_action || "").trim();
+      const targetSkillCode = String(meta.target_skill_code || "").trim();
+      const ticker = String(meta.ticker || "").trim();
+      return `
+        <h3>${escapeHtml(targetSkillCode || digest.key || "learning_distillation")}</h3>
+        <div class="row">
+          ${pill(distillationType, "pill-info")}
+          ${pill(reviewStatus, reviewClass)}
+          ${reviewAction ? pill(reviewAction, "pill-candidate") : ""}
+          ${ticker ? pill(ticker, "pill-approved") : ""}
+          ${renderLearningDetailButton({ entityType: "distillation_digest", entityId: digest.id })}
+        </div>
+        <p class="muted">${escapeHtml(digest.content || "Sin resumen.")}</p>
+        <p class="muted">${escapeHtml(`scope=${digest.scope || "n/a"} · imp=${formatNumber(digest.importance)} · ${formatDate(meta.reviewed_at || digest.created_at)}`)}</p>
+        <div class="row skill-action-row">
+          ${renderDistillationReviewActions(digest)}
+        </div>
+      `;
+    },
+    "No hay digestos de distillation recientes.",
+  );
+  attachLearningPanelButtons(elements.learningDistillations);
 }
 
 function renderClaimReviewQueue(items) {
@@ -1532,8 +1628,29 @@ function renderSkillCandidateActions(candidate, { inlineReview = false } = {}) {
   `;
 }
 
+function renderDistillationReviewActions(digest, { inlineReview = false } = {}) {
+  const digestId = Number(digest?.id);
+  const meta = asObject(digest?.meta);
+  const distillationType = String(meta.distillation_type || "").trim().toLowerCase();
+  const reviewStatus = String(meta.review_status || "").trim().toLowerCase();
+  if (!Number.isFinite(digestId)) return "";
+  if (!["skill_gap_digest", "skill_candidate_digest"].includes(distillationType)) return "";
+  if (reviewStatus === "applied") return "";
+  if (inlineReview) {
+    return `
+      <button type="button" class="action action-success learning-inline-review-button" data-kind="distillation_review" data-digest-id="${digestId}" data-action="collapse" data-action-label="Collapse digest ${digestId}">Collapse</button>
+      <button type="button" class="action action-muted learning-inline-review-button" data-kind="distillation_review" data-digest-id="${digestId}" data-action="retire" data-action-label="Retire digest ${digestId}">Retire</button>
+    `;
+  }
+  return `
+    <button type="button" class="action action-success distillation-review-button" data-digest-id="${digestId}" data-action="collapse">Collapse</button>
+    <button type="button" class="action action-muted distillation-review-button" data-digest-id="${digestId}" data-action="retire">Retire</button>
+  `;
+}
+
 async function refreshAfterLearningMutation(successMessage) {
   await refreshDashboard();
+  await refreshLearningDetail({ silent: true });
   if (state.trace.ticker) {
     await loadTickerTrace(state.trace.ticker, { silent: true });
   }
@@ -1659,6 +1776,25 @@ async function reviewSkillGap(gapId, outcome, { summary = null, refresh = true }
   return doneMessage;
 }
 
+async function reviewDistillationDigest(digestId, action, { summary = null, keepEntityId = null, refresh = true } = {}) {
+  const summaryText = typeof summary === "string" ? summary.trim() : "";
+  if (!summaryText) return null;
+  setStatus(`Aplicando review sobre digest ${digestId}...`);
+  await request(`/memory/maintenance/digests/${digestId}/review`, {
+    method: "POST",
+    body: JSON.stringify({
+      action,
+      summary: summaryText,
+      keep_entity_id: Number.isFinite(Number(keepEntityId)) ? Number(keepEntityId) : null,
+    }),
+  });
+  const doneMessage = `Digest ${digestId} actualizado.`;
+  if (refresh) {
+    await refreshAfterLearningMutation(doneMessage);
+  }
+  return doneMessage;
+}
+
 async function applyWorkflowAction({ workflowId, entityId, itemType, action, summary = null, refresh = true }) {
   const verbs = {
     confirm: "Confirmar",
@@ -1735,7 +1871,9 @@ function renderJournalFeed(entries) {
       const resolutionClass = observations.resolution_class;
       const resolutionOutcome = observations.resolution_outcome;
       const claimsApplied = Array.isArray(observations.claims_applied) ? observations.claims_applied : [];
+      const runtimeSkills = Array.isArray(observations.runtime_skills) ? observations.runtime_skills : [];
       const runtimeClaims = Array.isArray(observations.runtime_claims) ? observations.runtime_claims : [];
+      const runtimeDistillations = Array.isArray(observations.runtime_distillations) ? observations.runtime_distillations : [];
       const contextBudget = asObject(observations.context_budget);
       const budgetSummary = summarizeContextBudget(contextBudget);
       const claimPills = claimsApplied.slice(0, 3).map((item) => pill(item, "pill-candidate")).join("");
@@ -1746,8 +1884,8 @@ function renderJournalFeed(entries) {
         budgetSummary ? pill("runtime budget", budgetSummary.truncated ? "pill-degraded" : "pill-info") : "",
       ].join("");
       const detailButton = renderLearningDetailButton(mapJournalEntryToEntity(entry));
-      const claimMeta = runtimeClaims.length
-        ? `<p class="muted">claims runtime=${runtimeClaims.length}${claimsApplied.length ? ` · applied=${claimsApplied.length}` : ""}</p>`
+      const claimMeta = (runtimeSkills.length || runtimeClaims.length || runtimeDistillations.length)
+        ? `<p class="muted">skills runtime=${runtimeSkills.length}${runtimeClaims.length ? ` · claims runtime=${runtimeClaims.length}` : ""}${runtimeDistillations.length ? ` · distillations runtime=${runtimeDistillations.length}` : ""}${claimsApplied.length ? ` · applied=${claimsApplied.length}` : ""}</p>`
         : "";
       const budgetMeta = budgetSummary
         ? `<p class="muted">${escapeHtml(budgetSummary.headline)} · ${escapeHtml(budgetSummary.detail)}</p>`
@@ -1886,11 +2024,11 @@ async function refreshTickerTraceFromDashboard() {
     renderTickerTrace();
     return;
   }
-  await loadTickerTrace(ticker, { silent: true });
+  await loadTickerTrace(ticker, { silent: true, syncRuntimeInspector: false });
 }
 
-async function loadTickerTrace(ticker, { silent = false } = {}) {
-  const normalizedTicker = String(ticker || "").trim().toUpperCase();
+async function loadTickerTrace(ticker, { silent = false, syncRuntimeInspector = true } = {}) {
+  const normalizedTicker = normalizeTicker(ticker);
   if (!normalizedTicker) {
     state.trace.ticker = null;
     state.trace.payload = null;
@@ -1910,10 +2048,413 @@ async function loadTickerTrace(ticker, { silent = false } = {}) {
   state.trace.ticker = normalizedTicker;
   state.trace.payload = payload;
   renderTickerTrace();
+  if (syncRuntimeInspector) {
+    await refreshRuntimeMemoryInspectorFromDashboard({ preferredTicker: normalizedTicker, silent: true });
+  }
 
   if (!silent) {
     setStatus(`Trace de ${normalizedTicker} actualizado.`);
   }
+}
+
+function readRuntimeMemoryFormState() {
+  const rawStrategyVersionId = Number.parseInt(String(elements.runtimeMemoryStrategyInput?.value || "").trim(), 10);
+  return {
+    ticker: normalizeTicker(elements.runtimeMemoryTickerInput?.value),
+    strategyVersionId: Number.isFinite(rawStrategyVersionId) && rawStrategyVersionId > 0 ? rawStrategyVersionId : null,
+    skillCodes: parseCommaSeparatedList(elements.runtimeMemorySkillCodesInput?.value),
+    phase: String(elements.runtimeMemoryPhaseInput?.value || "").trim() || "do",
+  };
+}
+
+async function refreshRuntimeMemoryInspectorFromDashboard({ preferredTicker = null, silent = true } = {}) {
+  const requestState = readRuntimeMemoryFormState();
+  const effectiveTicker = requestState.ticker || normalizeTicker(preferredTicker) || state.trace.ticker || deriveDefaultTraceTicker(state.dashboards || {});
+  if (!effectiveTicker && requestState.strategyVersionId === null && !requestState.skillCodes.length) {
+    state.runtimeMemory = {
+      payload: null,
+      phase: requestState.phase,
+      skillCodes: [],
+      strategyVersionId: null,
+      ticker: null,
+    };
+    renderRuntimeMemoryInspector();
+    return;
+  }
+  await loadRuntimeMemoryInspector(
+    {
+      ticker: effectiveTicker,
+      strategyVersionId: requestState.strategyVersionId,
+      skillCodes: requestState.skillCodes,
+      phase: requestState.phase,
+    },
+    {
+      silent,
+      writeInputs: !requestState.ticker && Boolean(effectiveTicker),
+    },
+  );
+}
+
+async function loadRuntimeMemoryInspector(
+  {
+    ticker = null,
+    strategyVersionId = null,
+    skillCodes = [],
+    phase = "do",
+  } = {},
+  {
+    silent = false,
+    writeInputs = true,
+  } = {},
+) {
+  const normalizedTicker = normalizeTicker(ticker);
+  const normalizedStrategyVersionId = Number.isFinite(Number(strategyVersionId)) && Number(strategyVersionId) > 0
+    ? Number(strategyVersionId)
+    : null;
+  const normalizedSkillCodes = Array.isArray(skillCodes)
+    ? parseCommaSeparatedList(skillCodes.join(","))
+    : parseCommaSeparatedList(skillCodes);
+  const normalizedPhase = String(phase || "do").trim() || "do";
+
+  if (!normalizedTicker && normalizedStrategyVersionId === null && !normalizedSkillCodes.length) {
+    state.runtimeMemory = {
+      payload: null,
+      phase: normalizedPhase,
+      skillCodes: [],
+      strategyVersionId: null,
+      ticker: null,
+    };
+    renderRuntimeMemoryInspector();
+    if (state.trace.payload) {
+      renderTickerTrace();
+    }
+    return;
+  }
+
+  if (!silent) {
+    setStatus(`Cargando runtime memory${normalizedTicker ? ` de ${normalizedTicker}` : ""}...`);
+  }
+
+  const params = new URLSearchParams();
+  if (normalizedTicker) params.set("ticker", normalizedTicker);
+  if (normalizedStrategyVersionId !== null) params.set("strategy_version_id", String(normalizedStrategyVersionId));
+  if (normalizedSkillCodes.length) params.set("skill_codes", normalizedSkillCodes.join(","));
+  if (normalizedPhase) params.set("phase", normalizedPhase);
+
+  const payload = await request(`/memory/runtime-inspect?${params.toString()}`);
+  state.runtimeMemory = {
+    payload,
+    phase: String(asObject(payload?.resolved_skill_context).phase || normalizedPhase).trim() || "do",
+    skillCodes: Array.isArray(payload?.requested_skill_codes) ? payload.requested_skill_codes : normalizedSkillCodes,
+    strategyVersionId: Number.isFinite(Number(payload?.strategy_version_id))
+      ? Number(payload.strategy_version_id)
+      : normalizedStrategyVersionId,
+    ticker: normalizeTicker(payload?.ticker || normalizedTicker),
+  };
+
+  if (writeInputs) {
+    if (elements.runtimeMemoryTickerInput) {
+      elements.runtimeMemoryTickerInput.value = state.runtimeMemory.ticker || "";
+    }
+    if (elements.runtimeMemoryStrategyInput) {
+      elements.runtimeMemoryStrategyInput.value = state.runtimeMemory.strategyVersionId
+        ? String(state.runtimeMemory.strategyVersionId)
+        : "";
+    }
+    if (elements.runtimeMemorySkillCodesInput) {
+      elements.runtimeMemorySkillCodesInput.value = state.runtimeMemory.skillCodes.join(", ");
+    }
+    if (elements.runtimeMemoryPhaseInput) {
+      elements.runtimeMemoryPhaseInput.value = state.runtimeMemory.phase || "do";
+    }
+  }
+
+  renderRuntimeMemoryInspector();
+  if (state.trace.payload) {
+    renderTickerTrace();
+  }
+  if (!silent) {
+    setStatus(`Runtime memory inspeccionado${state.runtimeMemory.ticker ? ` para ${state.runtimeMemory.ticker}` : ""}.`);
+  }
+}
+
+function renderRuntimeMemoryInspector() {
+  if (!elements.runtimeMemoryInspector) return;
+  const payload = state.runtimeMemory.payload;
+  if (!payload) {
+    elements.runtimeMemoryInspector.innerHTML = `
+      <div class="stack-item">
+        <strong>Sin inspeccion activa</strong>
+        <p class="muted">Usa un ticker, una strategy version o skill codes para ver el contexto bounded que cargaria el agente.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const source = asObject(payload.skill_context_source);
+  const context = asObject(payload.resolved_skill_context);
+  const runtimeSkills = Array.isArray(payload.runtime_skills) ? payload.runtime_skills : [];
+  const runtimeClaims = Array.isArray(payload.runtime_claims) ? payload.runtime_claims : [];
+  const runtimeDistillations = Array.isArray(payload.runtime_distillations) ? payload.runtime_distillations : [];
+  const budgetSummary = summarizeContextBudget(payload.context_budget);
+  const appliedSkills = Array.isArray(context.applied_skills) ? context.applied_skills : [];
+  const consideredSkills = Array.isArray(context.considered_skills) ? context.considered_skills : [];
+  const primarySkill = String(context.primary_skill_code || "").trim();
+  const sourceType = String(source.source_type || "none").trim() || "none";
+  const requestSummary = [
+    state.runtimeMemory.ticker || "sin ticker",
+    state.runtimeMemory.strategyVersionId ? `strategy ${state.runtimeMemory.strategyVersionId}` : "sin strategy",
+    state.runtimeMemory.skillCodes.length ? `skills ${state.runtimeMemory.skillCodes.join(", ")}` : "sin override",
+  ].join(" · ");
+
+  renderStackList(
+    elements.runtimeMemoryInspector,
+    [
+      {
+        title: "Selection",
+        body: `
+          <div class="row">
+            ${pill(sourceType, sourceType === "none" ? "pill-degraded" : "pill-info")}
+            ${primarySkill ? pill(primarySkill, "pill-approved") : ""}
+            ${context.phase ? pill(`phase ${context.phase}`, "pill-candidate") : ""}
+            ${payload.strategy_version_id ? pill(`strategy ${payload.strategy_version_id}`, "pill-info") : ""}
+          </div>
+          <p class="muted">${escapeHtml(requestSummary)}</p>
+          <p class="muted">${escapeHtml(
+            source.summary
+              || (sourceType === "none"
+                ? "No hay skill_context persistido para esta combinacion; solo se aplican overrides explicitos."
+                : "Skill context resuelto desde la memoria operativa mas cercana."),
+          )}</p>
+          <p class="muted">${escapeHtml(
+            budgetSummary
+              ? `${budgetSummary.headline} · ${budgetSummary.detail}`
+              : "Sin runtime items cargados para esta seleccion.",
+          )}</p>
+        `,
+      },
+      {
+        title: "Resolved Skill Context",
+        body: `
+          <div class="snapshot-list">
+            <div class="snapshot-item">
+              <div>
+                <strong>${escapeHtml(primarySkill || "sin primary skill")}</strong>
+                <p>${escapeHtml(
+                  `${appliedSkills.length} applied · ${consideredSkills.length} considered · ${context.routing_mode || "routing_mode n/a"}`,
+                )}</p>
+              </div>
+              <span class="row">
+                ${context.catalog_version ? pill(context.catalog_version, "pill-info") : ""}
+                ${context.summary ? pill("summary", "pill-candidate") : ""}
+              </span>
+            </div>
+          </div>
+          <details>
+            <summary>Ver JSON completo</summary>
+            <pre class="terminal-card">${escapeHtml(JSON.stringify(context, null, 2))}</pre>
+          </details>
+        `,
+      },
+      {
+        title: `Runtime Skills (${runtimeSkills.length})`,
+        body: renderRuntimeMemorySkillPackets(runtimeSkills),
+      },
+      {
+        title: `Runtime Claims (${runtimeClaims.length})`,
+        body: renderRuntimeMemoryClaimPackets(runtimeClaims),
+      },
+      {
+        title: `Runtime Distillations (${runtimeDistillations.length})`,
+        body: renderRuntimeMemoryDistillationPackets(runtimeDistillations),
+      },
+    ],
+    (section) => `
+      <h3>${escapeHtml(section.title)}</h3>
+      ${section.body}
+    `,
+    "Sin contexto runtime disponible.",
+  );
+  attachLearningDetailButtons(elements.runtimeMemoryInspector);
+}
+
+function renderRuntimeMemorySkillPackets(items) {
+  if (!items.length) return `<p class="muted">No se cargaron runtime skills para esta seleccion.</p>`;
+  return `
+    <div class="snapshot-list">
+      ${items.map((item) => {
+        const procedureSteps = Array.isArray(item.procedure_steps) ? item.procedure_steps : [];
+        return `
+          <div class="snapshot-item">
+            <div>
+              <strong>${escapeHtml(item.skill_code || item.skill_name || "skill")}</strong>
+              <p>${escapeHtml(item.selection_reason || item.objective || "Sin razon de seleccion registrada.")}</p>
+              <p class="muted">${escapeHtml(
+                procedureSteps.length
+                  ? `steps: ${procedureSteps.slice(0, 3).join(" | ")}`
+                  : item.validated_revision_summary || "Sin steps compactados.",
+              )}</p>
+            </div>
+            <span class="row">
+              ${item.category ? pill(item.category, "pill-info") : ""}
+              ${item.instruction_source ? pill(item.instruction_source, "pill-candidate") : ""}
+              ${Number.isFinite(item.confidence) ? pill(`conf ${Number(item.confidence).toFixed(2)}`, "pill-approved") : ""}
+              ${renderLearningDetailButton(
+                Number.isFinite(Number(item.validated_revision_id))
+                  ? { entityType: "skill_revision", entityId: Number(item.validated_revision_id) }
+                  : null,
+              )}
+            </span>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderRuntimeMemoryClaimPackets(items) {
+  if (!items.length) return `<p class="muted">No se cargaron durable claims para esta seleccion.</p>`;
+  return `
+    <div class="snapshot-list">
+      ${items.map((item) => `
+        <div class="snapshot-item">
+          <div>
+            <strong>${escapeHtml(item.key || item.claim_type || "claim")}</strong>
+            <p>${escapeHtml(item.claim_text || "Sin texto de claim.")}</p>
+            <p class="muted">${escapeHtml(
+              Array.isArray(item.evidence_summaries) && item.evidence_summaries.length
+                ? item.evidence_summaries.slice(0, 2).join(" | ")
+                : "Sin evidencia resumida en packet.",
+            )}</p>
+          </div>
+          <span class="row">
+            ${item.status ? pill(item.status, item.status === "supported" ? "pill-approved" : "pill-degraded") : ""}
+            ${item.freshness_state ? pill(item.freshness_state, item.freshness_state === "current" ? "pill-active" : "pill-degraded") : ""}
+            ${Number.isFinite(item.confidence) ? pill(`conf ${Number(item.confidence).toFixed(2)}`, "pill-candidate") : ""}
+            ${renderLearningDetailButton(
+              Number.isFinite(Number(item.claim_id))
+                ? { entityType: "claim", entityId: Number(item.claim_id) }
+                : null,
+            )}
+          </span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderRuntimeMemoryDistillationPackets(items) {
+  if (!items.length) return `<p class="muted">No se cargaron digestos revisados para esta seleccion.</p>`;
+  return `
+    <div class="snapshot-list">
+      ${items.map((item) => `
+        <div class="snapshot-item">
+          <div>
+            <strong>${escapeHtml(item.key || item.distillation_type || "distillation")}</strong>
+            <p>${escapeHtml(item.summary || "Sin resumen de digest.")}</p>
+            <p class="muted">${escapeHtml(item.review_summary || "Sin review summary.")}</p>
+          </div>
+          <span class="row">
+            ${item.distillation_type ? pill(item.distillation_type, "pill-info") : ""}
+            ${item.review_action ? pill(item.review_action, "pill-approved") : ""}
+            ${item.target_skill_code ? pill(item.target_skill_code, "pill-candidate") : ""}
+            ${renderLearningDetailButton(
+              Number.isFinite(Number(item.digest_id))
+                ? { entityType: "distillation_digest", entityId: Number(item.digest_id) }
+                : null,
+            )}
+          </span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function currentTraceRuntimeMemoryPayload() {
+  const traceTicker = normalizeTicker(state.trace.ticker || asObject(state.trace.payload).ticker);
+  const payload = state.runtimeMemory.payload;
+  if (!traceTicker || !payload) return null;
+  return normalizeTicker(payload.ticker) === traceTicker ? payload : null;
+}
+
+function renderTickerTraceRuntimeSnapshot() {
+  const payload = currentTraceRuntimeMemoryPayload();
+  if (!payload) return "";
+
+  const source = asObject(payload.skill_context_source);
+  const context = asObject(payload.resolved_skill_context);
+  const runtimeSkills = Array.isArray(payload.runtime_skills) ? payload.runtime_skills : [];
+  const runtimeClaims = Array.isArray(payload.runtime_claims) ? payload.runtime_claims : [];
+  const runtimeDistillations = Array.isArray(payload.runtime_distillations) ? payload.runtime_distillations : [];
+  const budgetSummary = summarizeContextBudget(payload.context_budget);
+  const sourceType = String(source.source_type || "none").trim() || "none";
+  const primarySkill = String(context.primary_skill_code || "").trim();
+  const sections = [
+    runtimeSkills.length
+      ? `<div><strong>Skills</strong>${renderRuntimeMemorySkillPackets(runtimeSkills.slice(0, 2))}</div>`
+      : "",
+    runtimeClaims.length
+      ? `<div><strong>Claims</strong>${renderRuntimeMemoryClaimPackets(runtimeClaims.slice(0, 2))}</div>`
+      : "",
+    runtimeDistillations.length
+      ? `<div><strong>Distillations</strong>${renderRuntimeMemoryDistillationPackets(runtimeDistillations.slice(0, 2))}</div>`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("");
+
+  return `
+    <article class="stack-item">
+      <h3>Runtime Snapshot</h3>
+      <div class="row">
+        ${pill(sourceType, sourceType === "none" ? "pill-degraded" : "pill-info")}
+        ${primarySkill ? pill(primarySkill, "pill-approved") : ""}
+        ${context.phase ? pill(`phase ${context.phase}`, "pill-candidate") : ""}
+        ${payload.strategy_version_id ? pill(`strategy ${payload.strategy_version_id}`, "pill-info") : ""}
+        ${budgetSummary ? pill(budgetSummary.headline, budgetSummary.truncated ? "pill-degraded" : "pill-active") : ""}
+      </div>
+      <p class="muted">${escapeHtml(
+        source.summary
+          || context.summary
+          || "Snapshot bounded del contexto runtime resuelto para este ticker.",
+      )}</p>
+      ${sections || `<p class="muted">No hay runtime packets cargados para este ticker.</p>`}
+    </article>
+  `;
+}
+
+function renderTickerTraceRuntimeEventDrilldown(event) {
+  const details = asObject(event.details);
+  const runtimeSkills = Array.isArray(details.runtime_skills) ? details.runtime_skills : [];
+  const runtimeClaims = Array.isArray(details.runtime_claims) ? details.runtime_claims : [];
+  const runtimeDistillations = Array.isArray(details.runtime_distillations) ? details.runtime_distillations : [];
+  const budgetSummary = summarizeContextBudget(details.context_budget);
+  if (!runtimeSkills.length && !runtimeClaims.length && !runtimeDistillations.length && !budgetSummary) return "";
+
+  const sections = [
+    runtimeSkills.length
+      ? `<div><strong>Skills cargadas</strong>${renderRuntimeMemorySkillPackets(runtimeSkills.slice(0, 2))}</div>`
+      : "",
+    runtimeClaims.length
+      ? `<div><strong>Claims cargadas</strong>${renderRuntimeMemoryClaimPackets(runtimeClaims.slice(0, 2))}</div>`
+      : "",
+    runtimeDistillations.length
+      ? `<div><strong>Distillations cargadas</strong>${renderRuntimeMemoryDistillationPackets(runtimeDistillations.slice(0, 2))}</div>`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("");
+
+  return `
+    <div class="stack-item">
+      <div class="row">
+        ${budgetSummary ? pill("runtime memory", budgetSummary.truncated ? "pill-degraded" : "pill-info") : ""}
+        ${budgetSummary ? pill(budgetSummary.headline, "pill-candidate") : ""}
+      </div>
+      ${budgetSummary ? `<p class="muted">${escapeHtml(budgetSummary.detail)}</p>` : ""}
+      ${sections}
+    </div>
+  `;
 }
 
 function renderTickerTrace() {
@@ -1962,6 +2503,14 @@ function renderTickerTrace() {
           ? Number(summary.latest_available_runtime_claim_count) - Number(summary.latest_loaded_runtime_claim_count)
           : null,
     },
+    runtime_distillations: {
+      available_count: summary.latest_available_runtime_distillation_count,
+      loaded_count: summary.latest_loaded_runtime_distillation_count,
+      truncated_count:
+        Number.isFinite(summary.latest_available_runtime_distillation_count) && Number.isFinite(summary.latest_loaded_runtime_distillation_count)
+          ? Number(summary.latest_available_runtime_distillation_count) - Number(summary.latest_loaded_runtime_distillation_count)
+          : null,
+    },
   });
   elements.tickerTraceSummary.innerHTML = `
     <div class="ticker-trace-summary-head">
@@ -1989,6 +2538,7 @@ function renderTickerTrace() {
       ${tickerTraceStat("Cuello", summary.latest_timing_slowest_stage ? humanizeLabel(summary.latest_timing_slowest_stage) : "n/a", Number.isFinite(summary.latest_timing_slowest_stage_ms) ? `${Math.round(summary.latest_timing_slowest_stage_ms)} ms` : "sin dato")}
     </div>
     <p class="muted">${escapeHtml(summary.latest_guard_reason || "Sin guardrail dominante registrado en la ultima senal.")}</p>
+    ${renderTickerTraceRuntimeSnapshot()}
   `;
 
   renderStackList(
@@ -2007,10 +2557,12 @@ function renderTickerTrace() {
         ${renderLearningDetailButton(mapTickerTraceEventToEntity(event))}
       </div>
       <p class="muted">${escapeHtml(event.summary || "Sin resumen.")}</p>
+      ${renderTickerTraceRuntimeEventDrilldown(event)}
       <p class="muted">${escapeHtml(buildTickerTraceMeta(event))}</p>
     `,
     `No hay eventos persistidos para ${ticker}.`,
   );
+  attachLearningDetailButtons(elements.tickerTraceSummary);
   attachLearningDetailButtons(elements.tickerTraceFeed);
 }
 
@@ -2205,6 +2757,31 @@ function attachSkillGapReviewButtons(container) {
   });
 }
 
+function attachDistillationReviewButtons(container) {
+  if (!container) return;
+  container.querySelectorAll(".distillation-review-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const digestId = Number(button.dataset.digestId);
+      const action = button.dataset.action;
+      if (!Number.isFinite(digestId) || !action) return;
+      button.disabled = true;
+      try {
+        await openLearningDetailWithDraft("distillation_digest", digestId, {
+          kind: "distillation_review",
+          digestId,
+          action,
+          summary: "",
+          title: `${button.textContent?.trim() || "Review"} digest ${digestId}`,
+          submitLabel: button.textContent?.trim() || "Apply",
+          subtitle: "Resume por que este digest debe colapsarse o retirarse.",
+        });
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
 function attachSkillCandidateValidateButtons(container) {
   if (!container) return;
   container.querySelectorAll(".skill-candidate-validate-button").forEach((button) => {
@@ -2261,6 +2838,28 @@ function attachValidationCompareButtons(container) {
   });
 }
 
+function attachRuntimeMemoryLoadButtons(container) {
+  if (!container) return;
+  container.querySelectorAll(".runtime-memory-load-button").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const rawPayload = String(button.dataset.runtimeRequest || "").trim();
+      if (!rawPayload) return;
+      let requestPayload;
+      try {
+        requestPayload = JSON.parse(rawPayload);
+      } catch (_error) {
+        return;
+      }
+      button.disabled = true;
+      try {
+        await loadRuntimeMemoryInspector(requestPayload, { silent: false, writeInputs: true });
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
+}
+
 function attachLearningPanelButtons(container) {
   attachLearningDetailButtons(container);
   attachWorkflowActionButtons(container);
@@ -2268,8 +2867,10 @@ function attachLearningPanelButtons(container) {
   attachClaimPromoteButtons(container);
   attachOperatorDisagreementClusterPromoteButtons(container);
   attachSkillGapReviewButtons(container);
+  attachDistillationReviewButtons(container);
   attachSkillCandidateValidateButtons(container);
   attachValidationCompareButtons(container);
+  attachRuntimeMemoryLoadButtons(container);
   attachLearningInlineReviewButtons(container);
   attachLearningInlineReviewForms(container);
 }
@@ -2286,12 +2887,14 @@ async function loadLearningDetail(entityType, entityId, { silent = false, draft 
     setStatus(`Cargando ${normalizedType} ${numericId}...`);
   }
   const payload = await fetchLearningDetail(normalizedType, numericId);
+  const runtimeMemory = await fetchLearningDetailRuntimeMemory(normalizedType, payload);
   state.learningDetail = {
     entityType: normalizedType,
     entityId: numericId,
     draft: draft || (preserveContext ? state.learningDetail.draft : null),
     compareBaselines: persistedBaselines,
     payload,
+    runtimeMemory,
   };
   renderLearningDetail();
   if (!silent) {
@@ -2399,6 +3002,9 @@ async function fetchLearningDetail(entityType, entityId) {
   if (entityType === "skill_gap") {
     return request(`/skills/gaps/${entityId}`);
   }
+  if (entityType === "distillation_digest") {
+    return request(`/memory/maintenance/digests/${entityId}`);
+  }
   if (entityType === "skill_candidate") {
     const candidateBaselineQuery = Number.isFinite(Number(compareBaselines.candidate))
       ? `&baseline_validation_id=${Number(compareBaselines.candidate)}`
@@ -2447,42 +3053,331 @@ async function fetchLearningDetail(entityType, entityId) {
   throw new Error(`Unsupported learning detail type: ${entityType}`);
 }
 
+async function fetchRuntimeMemoryInspectionPayload({
+  ticker = null,
+  strategyVersionId = null,
+  skillCodes = [],
+  phase = "do",
+} = {}) {
+  const normalizedTicker = normalizeTicker(ticker);
+  const normalizedStrategyVersionId = Number.isFinite(Number(strategyVersionId)) && Number(strategyVersionId) > 0
+    ? Number(strategyVersionId)
+    : null;
+  const normalizedSkillCodes = Array.isArray(skillCodes)
+    ? parseCommaSeparatedList(skillCodes.join(","))
+    : parseCommaSeparatedList(skillCodes);
+  const normalizedPhase = String(phase || "do").trim() || "do";
+  if (!normalizedTicker && normalizedStrategyVersionId === null && !normalizedSkillCodes.length) {
+    return null;
+  }
+  const params = new URLSearchParams();
+  if (normalizedTicker) params.set("ticker", normalizedTicker);
+  if (normalizedStrategyVersionId !== null) params.set("strategy_version_id", String(normalizedStrategyVersionId));
+  if (normalizedSkillCodes.length) params.set("skill_codes", normalizedSkillCodes.join(","));
+  if (normalizedPhase) params.set("phase", normalizedPhase);
+  return request(`/memory/runtime-inspect?${params.toString()}`);
+}
+
+function parsePositiveInt(value) {
+  const normalized = Number(value);
+  return Number.isFinite(normalized) && normalized > 0 ? normalized : null;
+}
+
+function strategyVersionIdFromScope(scope) {
+  const normalized = String(scope || "").trim();
+  if (!normalized.startsWith("strategy:")) return null;
+  return parsePositiveInt(normalized.slice("strategy:".length));
+}
+
+function deriveLearningDetailRuntimeRequest(entityType, payload) {
+  if (entityType === "workflow") {
+    const workflow = asObject(payload);
+    const context = asObject(workflow.context);
+    const ticker = normalizeTicker(context.ticker || context.linked_ticker);
+    const strategyVersionId = parsePositiveInt(context.strategy_version_id) || strategyVersionIdFromScope(workflow.scope);
+    const skillCode = String(context.target_skill_code || context.primary_skill_code || "").trim();
+    if (!ticker && strategyVersionId === null && !skillCode) return null;
+    return {
+      ticker,
+      strategyVersionId,
+      skillCodes: skillCode ? [skillCode] : [],
+      phase: String(context.phase || "do").trim() || "do",
+      label: "workflow runtime relevance",
+    };
+  }
+  if (entityType === "claim") {
+    const claim = asObject(payload?.claim);
+    const provenance = asObject(payload?.provenance);
+    const candidate = asObject(provenance.candidate);
+    const revision = asObject(provenance.revision);
+    const skillCode = String(
+      candidate.target_skill_code
+      || asObject(candidate.meta).target_skill_code
+      || revision.skill_code
+      || "",
+    ).trim();
+    const requestPayload = {
+      ticker: normalizeTicker(claim.linked_ticker),
+      strategyVersionId: parsePositiveInt(claim.strategy_version_id) || strategyVersionIdFromScope(claim.scope),
+      skillCodes: skillCode ? [skillCode] : [],
+      phase: "do",
+      label: "claim runtime relevance",
+    };
+    if (!requestPayload.ticker && requestPayload.strategyVersionId === null && !requestPayload.skillCodes.length) return null;
+    return requestPayload;
+  }
+  if (entityType === "skill_gap") {
+    const gap = asObject(payload);
+    const skillCode = String(gap.target_skill_code || gap.linked_skill_code || "").trim();
+    const requestPayload = {
+      ticker: normalizeTicker(gap.ticker),
+      strategyVersionId: parsePositiveInt(gap.strategy_version_id) || strategyVersionIdFromScope(gap.scope),
+      skillCodes: skillCode ? [skillCode] : [],
+      phase: "do",
+      label: "skill gap runtime relevance",
+    };
+    if (!requestPayload.ticker && requestPayload.strategyVersionId === null && !requestPayload.skillCodes.length) return null;
+    return requestPayload;
+  }
+  if (entityType === "distillation_digest") {
+    const digest = asObject(payload);
+    const meta = asObject(digest.meta);
+    const skillCode = String(meta.target_skill_code || "").trim();
+    const requestPayload = {
+      ticker: normalizeTicker(meta.ticker),
+      strategyVersionId: parsePositiveInt(meta.strategy_version_id) || strategyVersionIdFromScope(meta.scope || digest.scope),
+      skillCodes: skillCode ? [skillCode] : [],
+      phase: "do",
+      label: "digest runtime relevance",
+    };
+    if (!requestPayload.ticker && requestPayload.strategyVersionId === null && !requestPayload.skillCodes.length) return null;
+    return requestPayload;
+  }
+  if (entityType === "skill_candidate") {
+    const candidate = asObject(payload?.candidate) && Object.keys(asObject(payload?.candidate)).length
+      ? asObject(payload.candidate)
+      : asObject(payload);
+    const skillCode = String(candidate.target_skill_code || "").trim();
+    const requestPayload = {
+      ticker: normalizeTicker(candidate.ticker),
+      strategyVersionId: parsePositiveInt(candidate.strategy_version_id) || strategyVersionIdFromScope(candidate.scope),
+      skillCodes: skillCode ? [skillCode] : [],
+      phase: "do",
+      label: "candidate runtime relevance",
+    };
+    if (!requestPayload.ticker && requestPayload.strategyVersionId === null && !requestPayload.skillCodes.length) return null;
+    return requestPayload;
+  }
+  if (entityType === "skill_revision") {
+    const revision = asObject(payload?.revision) && Object.keys(asObject(payload?.revision)).length
+      ? asObject(payload.revision)
+      : asObject(payload);
+    const skillCode = String(revision.skill_code || "").trim();
+    const requestPayload = {
+      ticker: normalizeTicker(revision.ticker),
+      strategyVersionId: parsePositiveInt(revision.strategy_version_id) || strategyVersionIdFromScope(revision.scope),
+      skillCodes: skillCode ? [skillCode] : [],
+      phase: "do",
+      label: "revision runtime relevance",
+    };
+    if (!requestPayload.ticker && requestPayload.strategyVersionId === null && !requestPayload.skillCodes.length) return null;
+    return requestPayload;
+  }
+  return null;
+}
+
+async function fetchLearningDetailRuntimeMemory(entityType, payload) {
+  const requestPayload = deriveLearningDetailRuntimeRequest(entityType, payload);
+  if (!requestPayload) return null;
+  try {
+    const runtimePayload = await fetchRuntimeMemoryInspectionPayload(requestPayload);
+    return {
+      request: requestPayload,
+      payload: runtimePayload,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      request: requestPayload,
+      payload: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function runtimeMemoryRequestKey(requestPayload) {
+  const payload = asObject(requestPayload);
+  return JSON.stringify({
+    ticker: normalizeTicker(payload.ticker),
+    strategyVersionId: parsePositiveInt(payload.strategyVersionId ?? payload.strategy_version_id),
+    skillCodes: parseCommaSeparatedList(Array.isArray(payload.skillCodes) ? payload.skillCodes.join(",") : payload.skill_codes),
+    phase: String(payload.phase || "do").trim() || "do",
+  });
+}
+
+function renderRuntimeMemoryLoadButton(requestPayload, { label = "Open In Inspector" } = {}) {
+  if (!requestPayload) return "";
+  const isSynced = runtimeMemoryRequestKey(requestPayload) === runtimeMemoryRequestKey({
+    ticker: state.runtimeMemory.ticker,
+    strategyVersionId: state.runtimeMemory.strategyVersionId,
+    skillCodes: state.runtimeMemory.skillCodes,
+    phase: state.runtimeMemory.phase,
+  });
+  if (isSynced) return pill("inspector synced", "pill-active");
+  const payload = {
+    ticker: normalizeTicker(requestPayload.ticker),
+    strategyVersionId: parsePositiveInt(requestPayload.strategyVersionId),
+    skillCodes: Array.isArray(requestPayload.skillCodes) ? requestPayload.skillCodes : [],
+    phase: String(requestPayload.phase || "do").trim() || "do",
+  };
+  return `<button type="button" class="action action-muted runtime-memory-load-button" data-runtime-request="${escapeHtml(JSON.stringify(payload))}">${escapeHtml(label)}</button>`;
+}
+
+function buildLearningDetailRuntimeMatchSummary(entityType, entityId, runtimePayload, requestPayload) {
+  const payload = asObject(runtimePayload);
+  const runtimeSkills = Array.isArray(payload.runtime_skills) ? payload.runtime_skills : [];
+  const runtimeClaims = Array.isArray(payload.runtime_claims) ? payload.runtime_claims : [];
+  const runtimeDistillations = Array.isArray(payload.runtime_distillations) ? payload.runtime_distillations : [];
+  const skillCodes = Array.isArray(requestPayload?.skillCodes) ? requestPayload.skillCodes : [];
+  const detailId = parsePositiveInt(entityId);
+  const skillMatched = skillCodes.some((code) => runtimeSkills.some((item) => String(item.skill_code || "").trim() === code));
+  const digestMatched = detailId !== null && runtimeDistillations.some((item) => parsePositiveInt(item.digest_id) === detailId);
+  const claimMatched = detailId !== null && runtimeClaims.some((item) => parsePositiveInt(item.claim_id) === detailId);
+  const distillationSkillMatched = skillCodes.some((code) =>
+    runtimeDistillations.some((item) => String(item.target_skill_code || "").trim() === code),
+  );
+
+  if (entityType === "claim") {
+    return claimMatched ? "Claim loaded now in runtime memory." : "Claim not loaded now; only related runtime context is available.";
+  }
+  if (entityType === "distillation_digest") {
+    return digestMatched ? "This digest is loaded now in runtime memory." : "This digest is not loaded now; only adjacent runtime context is available.";
+  }
+  if (["skill_gap", "skill_candidate", "skill_revision"].includes(entityType)) {
+    if (skillMatched) return "Target skill is loaded now as a runtime skill packet.";
+    if (distillationSkillMatched) return "Target skill is not loaded as a direct skill packet, but related distillation memory is active.";
+    return "Target skill is not currently loaded in runtime memory.";
+  }
+  if (entityType === "workflow") {
+    if (skillMatched || distillationSkillMatched || claimMatched || digestMatched) {
+      return "Workflow scope overlaps with currently loaded runtime memory.";
+    }
+    return "Workflow scope is not currently reflected in loaded runtime packets.";
+  }
+  return "Runtime relevance resolved for this detail.";
+}
+
+function renderLearningDetailRuntimeMemoryPanel() {
+  const runtimeMemory = state.learningDetail.runtimeMemory;
+  if (!runtimeMemory || !runtimeMemory.request) return "";
+
+  const requestPayload = asObject(runtimeMemory.request);
+  const runtimePayload = runtimeMemory.payload;
+  const error = String(runtimeMemory.error || "").trim();
+  const requestSummary = [
+    normalizeTicker(requestPayload.ticker) || "sin ticker",
+    parsePositiveInt(requestPayload.strategyVersionId) ? `strategy ${parsePositiveInt(requestPayload.strategyVersionId)}` : "sin strategy",
+    Array.isArray(requestPayload.skillCodes) && requestPayload.skillCodes.length ? `skills ${requestPayload.skillCodes.join(", ")}` : "sin skill override",
+  ].join(" · ");
+
+  if (!runtimePayload) {
+    return `
+      <article class="stack-item">
+        <h3>Runtime Relevance</h3>
+        <div class="row">
+          ${pill("runtime inspect", "pill-degraded")}
+          ${renderRuntimeMemoryLoadButton(requestPayload)}
+        </div>
+        <p class="muted">${escapeHtml(requestSummary)}</p>
+        <p class="muted">${escapeHtml(error || "No se pudo resolver runtime memory para este detail.")}</p>
+      </article>
+    `;
+  }
+
+  const payload = asObject(runtimePayload);
+  const source = asObject(payload.skill_context_source);
+  const context = asObject(payload.resolved_skill_context);
+  const runtimeSkills = Array.isArray(payload.runtime_skills) ? payload.runtime_skills : [];
+  const runtimeClaims = Array.isArray(payload.runtime_claims) ? payload.runtime_claims : [];
+  const runtimeDistillations = Array.isArray(payload.runtime_distillations) ? payload.runtime_distillations : [];
+  const budgetSummary = summarizeContextBudget(payload.context_budget);
+  const entityType = state.learningDetail.entityType;
+  const entityId = state.learningDetail.entityId;
+  const sourceType = String(source.source_type || "none").trim() || "none";
+  const primarySkill = String(context.primary_skill_code || "").trim();
+  const matchSummary = buildLearningDetailRuntimeMatchSummary(entityType, entityId, payload, requestPayload);
+
+  return `
+    <article class="stack-item">
+      <h3>Runtime Relevance</h3>
+      <div class="row">
+        ${pill(sourceType, sourceType === "none" ? "pill-degraded" : "pill-info")}
+        ${primarySkill ? pill(primarySkill, "pill-approved") : ""}
+        ${context.phase ? pill(`phase ${context.phase}`, "pill-candidate") : ""}
+        ${budgetSummary ? pill(budgetSummary.headline, budgetSummary.truncated ? "pill-degraded" : "pill-active") : ""}
+        ${renderRuntimeMemoryLoadButton(requestPayload)}
+      </div>
+      <p class="muted">${escapeHtml(requestSummary)}</p>
+      <p class="muted">${escapeHtml(matchSummary)}</p>
+      <p class="muted">${escapeHtml(
+        source.summary
+          || context.summary
+          || "Runtime memory bounded resuelto para este artefacto.",
+      )}</p>
+      ${runtimeSkills.length ? `<div><strong>Runtime Skills</strong>${renderRuntimeMemorySkillPackets(runtimeSkills.slice(0, 2))}</div>` : ""}
+      ${runtimeClaims.length ? `<div><strong>Runtime Claims</strong>${renderRuntimeMemoryClaimPackets(runtimeClaims.slice(0, 2))}</div>` : ""}
+      ${runtimeDistillations.length ? `<div><strong>Runtime Distillations</strong>${renderRuntimeMemoryDistillationPackets(runtimeDistillations.slice(0, 2))}</div>` : ""}
+      ${
+        !runtimeSkills.length && !runtimeClaims.length && !runtimeDistillations.length
+          ? `<p class="muted">No hay runtime packets cargados para esta combinacion.</p>`
+          : ""
+      }
+    </article>
+  `;
+}
+
 function renderLearningDetail() {
   if (!elements.learningDetail) return;
   const entityType = state.learningDetail.entityType;
   const entityId = state.learningDetail.entityId;
   const payload = state.learningDetail.payload;
   if (!entityType || !payload) {
-    elements.learningDetail.innerHTML = `<div class="stack-item"><p class="muted">Selecciona un workflow, claim, gap o candidate para ver su detalle enlazado.</p></div>`;
+    elements.learningDetail.innerHTML = `<div class="stack-item"><p class="muted">Selecciona un workflow, claim, gap, candidate o digest para ver su detalle enlazado.</p></div>`;
     return;
   }
+  const runtimePanel = renderLearningDetailRuntimeMemoryPanel();
   if (entityType === "workflow") {
-    elements.learningDetail.innerHTML = renderWorkflowDetailPanel(payload) + renderLearningActionComposer();
+    elements.learningDetail.innerHTML = renderWorkflowDetailPanel(payload) + runtimePanel + renderLearningActionComposer();
     attachLearningPanelButtons(elements.learningDetail);
     return;
   }
   if (entityType === "claim") {
-    elements.learningDetail.innerHTML = renderClaimDetailPanel(payload) + renderLearningActionComposer();
+    elements.learningDetail.innerHTML = renderClaimDetailPanel(payload) + runtimePanel + renderLearningActionComposer();
     attachLearningPanelButtons(elements.learningDetail);
     return;
   }
   if (entityType === "skill_gap") {
-    elements.learningDetail.innerHTML = renderSkillGapDetailPanel(payload) + renderLearningActionComposer();
+    elements.learningDetail.innerHTML = renderSkillGapDetailPanel(payload) + runtimePanel + renderLearningActionComposer();
+    attachLearningPanelButtons(elements.learningDetail);
+    return;
+  }
+  if (entityType === "distillation_digest") {
+    elements.learningDetail.innerHTML = renderDistillationDigestDetailPanel(payload) + runtimePanel + renderLearningActionComposer();
     attachLearningPanelButtons(elements.learningDetail);
     return;
   }
   if (entityType === "skill_candidate") {
-    elements.learningDetail.innerHTML = renderSkillCandidateDetailPanel(payload) + renderLearningActionComposer();
+    elements.learningDetail.innerHTML = renderSkillCandidateDetailPanel(payload) + runtimePanel + renderLearningActionComposer();
     attachLearningPanelButtons(elements.learningDetail);
     return;
   }
   if (entityType === "skill_validation") {
-    elements.learningDetail.innerHTML = renderSkillValidationDetailPanel(payload);
+    elements.learningDetail.innerHTML = renderSkillValidationDetailPanel(payload) + runtimePanel;
     attachLearningPanelButtons(elements.learningDetail);
     return;
   }
   if (entityType === "skill_revision") {
-    elements.learningDetail.innerHTML = renderSkillRevisionDetailPanel(payload);
+    elements.learningDetail.innerHTML = renderSkillRevisionDetailPanel(payload) + runtimePanel;
     attachLearningPanelButtons(elements.learningDetail);
     return;
   }
@@ -2584,6 +3479,33 @@ function renderSkillGapDetailPanel(gap) {
         ${renderSkillGapActions(gap, { inlineReview: true })}
       </div>
       <pre class="code-block">${escapeHtml(JSON.stringify(gap?.meta || {}, null, 2))}</pre>
+    </article>
+  `;
+}
+
+function renderDistillationDigestDetailPanel(digest) {
+  const meta = asObject(digest?.meta);
+  const reviewStatus = String(meta.review_status || "pending").trim().toLowerCase();
+  const distillationType = String(meta.distillation_type || digest?.memory_type || "distillation").trim();
+  const targetSkillCode = String(meta.target_skill_code || "").trim();
+  const effect = asObject(meta.review_effect);
+  return `
+    <article class="stack-item">
+      <h3>${escapeHtml(targetSkillCode || digest?.key || `Digest ${digest?.id || ""}`)}</h3>
+      <div class="row">
+        ${pill(distillationType, "pill-info")}
+        ${pill(reviewStatus, reviewStatus === "applied" ? "pill-approved" : "pill-degraded")}
+        ${meta.review_action ? pill(meta.review_action, "pill-candidate") : ""}
+        ${meta.ticker ? pill(meta.ticker, "pill-approved") : ""}
+      </div>
+      <p class="muted">${escapeHtml(digest?.content || "Sin resumen.")}</p>
+      <p class="muted">${escapeHtml(`scope=${digest?.scope || "n/a"} · importance=${formatNumber(digest?.importance)} · created=${formatDate(digest?.created_at)}`)}</p>
+      <div class="row skill-action-row">
+        ${renderDistillationReviewActions(digest, { inlineReview: true })}
+      </div>
+      ${meta.review_summary ? `<p class="muted">${escapeHtml(`review=${meta.review_summary}`)}</p>` : ""}
+      ${Object.keys(effect).length ? `<pre class="code-block">${escapeHtml(JSON.stringify(effect, null, 2))}</pre>` : ""}
+      <pre class="code-block">${escapeHtml(JSON.stringify(meta, null, 2))}</pre>
     </article>
   `;
 }
@@ -3049,6 +3971,17 @@ function attachLearningInlineReviewButtons(container) {
         });
         return;
       }
+      if (kind === "distillation_review") {
+        const digestId = Number(button.dataset.digestId);
+        const action = button.dataset.action;
+        if (!Number.isFinite(digestId) || !action) return;
+        openLearningInlineReviewDraft({
+          ...baseDraft,
+          digestId,
+          action,
+        });
+        return;
+      }
       if (kind === "skill_candidate_validation") {
         const candidateId = Number(button.dataset.candidateId);
         const validationMode = button.dataset.validationMode;
@@ -3146,6 +4079,12 @@ function attachLearningInlineReviewForms(container) {
               artifact_url: parseDraftText(draft.artifactUrl),
               note: parseDraftText(draft.evidenceNote),
             },
+            refresh: false,
+          });
+        } else if (draft.kind === "distillation_review") {
+          doneMessage = await reviewDistillationDigest(draft.digestId, draft.action, {
+            summary,
+            keepEntityId: parseDraftNumber(draft.keepEntityId),
             refresh: false,
           });
         } else if (draft.kind === "workflow_action") {

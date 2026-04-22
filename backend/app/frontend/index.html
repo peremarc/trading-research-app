@@ -301,6 +301,16 @@
       <section class="panel panel-span-6">
         <div class="panel-heading">
           <div>
+            <h2>Learning Distillations</h2>
+            <p>Digestos compactados del backlog de aprendizaje para colapsar o retirar ruido repetido de forma auditada.</p>
+          </div>
+        </div>
+        <div id="learning-distillations" class="stack-list"></div>
+      </section>
+
+      <section class="panel panel-span-6">
+        <div class="panel-heading">
+          <div>
             <h2>Claim Review Queue</h2>
             <p>Claims stale, contested o contradichos que necesitan confirmacion, contradiccion o retiro explicito.</p>
           </div>
@@ -342,7 +352,7 @@
         <div class="panel-heading">
           <div>
             <h2>Learning Detail</h2>
-            <p>Detalle enlazado de workflow, claim, gap o candidate seleccionado desde las vistas operativas.</p>
+            <p>Detalle enlazado de workflow, claim, gap, candidate o digest seleccionado desde las vistas operativas.</p>
           </div>
         </div>
         <div id="learning-detail" class="stack-list"></div>
@@ -391,6 +401,37 @@
       <section class="panel panel-span-12">
         <div class="panel-heading">
           <div>
+            <h2>Runtime Memory Inspector</h2>
+            <p>Inspecciona el contexto bounded que se inyectaria al agente para un ticker, estrategia o lista de skills.</p>
+          </div>
+        </div>
+        <div class="ticker-trace-shell">
+          <form id="runtime-memory-form" class="ticker-trace-toolbar">
+            <label class="ticker-trace-label" for="runtime-memory-ticker-input">
+              <span>Ticker</span>
+              <input id="runtime-memory-ticker-input" class="ticker-trace-input" type="text" maxlength="12" placeholder="Ej: NVDA">
+            </label>
+            <label class="ticker-trace-label" for="runtime-memory-strategy-input">
+              <span>Strategy Version</span>
+              <input id="runtime-memory-strategy-input" class="ticker-trace-input" type="number" min="1" step="1" placeholder="Ej: 7">
+            </label>
+            <label class="ticker-trace-label" for="runtime-memory-skill-codes-input">
+              <span>Skill Codes</span>
+              <input id="runtime-memory-skill-codes-input" class="ticker-trace-input" type="text" maxlength="400" placeholder="code_a, code_b">
+            </label>
+            <label class="ticker-trace-label" for="runtime-memory-phase-input">
+              <span>Phase</span>
+              <input id="runtime-memory-phase-input" class="ticker-trace-input" type="text" maxlength="32" value="do" placeholder="do">
+            </label>
+            <button type="submit" class="action">Inspeccionar</button>
+          </form>
+          <div id="runtime-memory-inspector" class="stack-list"></div>
+        </div>
+      </section>
+
+      <section class="panel panel-span-12">
+        <div class="panel-heading">
+          <div>
             <h2>Decision Journal</h2>
             <p>Decisiones tomadas, ticker afectado y estrategia base usada.</p>
           </div>
@@ -418,6 +459,6 @@
     </article>
   </template>
 
-  <script type="module" src="/assets/app.js?v=20260420-skills-ui-1"></script>
+  <script type="module" src="/assets/app.js?v=20260422-learning-detail-runtime-1"></script>
 </body>
 </html>

@@ -25,6 +25,7 @@ from app.domains.learning.protocol import (
     management_state_transition_for_action,
     position_management_schema,
 )
+from app.domains.learning.runtime_memory import LearningRuntimeMemoryService
 from app.domains.learning.skills import SkillLifecycleService
 from app.domains.learning.world_state import MarketStateService
 from app.providers.llm import (
@@ -115,6 +116,11 @@ class AutonomousTradingAgentService:
         self.market_state_service = MarketStateService(settings=self.settings)
         self.skill_lifecycle_service = SkillLifecycleService()
         self.knowledge_claim_service = KnowledgeClaimService()
+        self.runtime_memory_service = LearningRuntimeMemoryService(
+            settings=self.settings,
+            skill_lifecycle_service=self.skill_lifecycle_service,
+            knowledge_claim_service=self.knowledge_claim_service,
+        )
         provider_slots = self._build_provider_slots()
         primary_provider = self._primary_provider_name()
         primary_model = self._primary_model_name(primary_provider)
@@ -216,7 +222,7 @@ class AutonomousTradingAgentService:
         raw_decision, used_provider, used_model = self._decide_with_fallback(
             system_prompt=build_candidate_decision_system_prompt(
                 self._build_runtime_skill_prompt(context.get("agent_protocol")),
-                self._build_runtime_claim_prompt(context.get("agent_protocol")),
+                self._build_runtime_supporting_memory_prompt(context.get("agent_protocol")),
             ),
             user_prompt=user_prompt,
             response_json_schema=candidate_decision_schema(),
@@ -231,7 +237,9 @@ class AutonomousTradingAgentService:
             signal_payload=signal_payload,
             market_context=market_context or {},
             decision=decision,
+            runtime_skills=self._extract_runtime_skills(context),
             runtime_claims=self._extract_runtime_claims(context),
+            runtime_distillations=self._extract_runtime_distillations(context),
             context_budget=self._extract_context_budget(context),
         )
         self.runtime.last_decision_at = datetime.now(timezone.utc)
@@ -429,7 +437,7 @@ class AutonomousTradingAgentService:
         raw_decision, used_provider, used_model = self._decide_with_fallback(
             system_prompt=build_position_management_system_prompt(
                 self._build_runtime_skill_prompt(context.get("agent_protocol")),
-                self._build_runtime_claim_prompt(context.get("agent_protocol")),
+                self._build_runtime_supporting_memory_prompt(context.get("agent_protocol")),
             ),
             user_prompt=user_prompt,
             response_json_schema=position_management_schema(),
@@ -451,7 +459,9 @@ class AutonomousTradingAgentService:
             decision=decision,
             provider=used_provider,
             model=used_model,
+            runtime_skills=self._extract_runtime_skills(context),
             runtime_claims=self._extract_runtime_claims(context),
+            runtime_distillations=self._extract_runtime_distillations(context),
             context_budget=self._extract_context_budget(context),
         )
         self.runtime.last_decision_at = datetime.now(timezone.utc)
@@ -986,27 +996,16 @@ class AutonomousTradingAgentService:
             market_context=market_context,
             persisted_market_state=self.market_state_service.get_latest_protocol_market_state(session),
         )
-        runtime_skill_selection = self.skill_lifecycle_service.build_runtime_selection(
-            session,
-            skill_context=skill_context,
-            max_packets=self.settings.ai_runtime_skill_limit,
-            max_steps_per_packet=self.settings.ai_runtime_skill_step_limit,
-        )
-        runtime_claim_selection = self.knowledge_claim_service.build_runtime_selection(
+        runtime_selection = self.runtime_memory_service.build_selection(
             session,
             ticker=ticker,
             strategy_version_id=strategy_version_id,
-            max_packets=self.settings.ai_runtime_claim_limit,
-            max_evidence_per_packet=self.settings.ai_runtime_claim_evidence_limit,
+            skill_context=skill_context,
         )
-        runtime_skills = [item for item in runtime_skill_selection.get("packets", []) if isinstance(item, dict)]
-        runtime_claims = [item for item in runtime_claim_selection.get("packets", []) if isinstance(item, dict)]
-        protocol_context["runtime_skills"] = runtime_skills
-        protocol_context["runtime_claims"] = runtime_claims
-        protocol_context["context_budget"] = self._build_runtime_context_budget(
-            skill_budget=runtime_skill_selection.get("budget"),
-            claim_budget=runtime_claim_selection.get("budget"),
-        )
+        protocol_context["runtime_skills"] = list(runtime_selection.get("runtime_skills") or [])
+        protocol_context["runtime_claims"] = list(runtime_selection.get("runtime_claims") or [])
+        protocol_context["runtime_distillations"] = list(runtime_selection.get("runtime_distillations") or [])
+        protocol_context["context_budget"] = dict(runtime_selection.get("context_budget") or {})
         recent_journal = list(
             session.scalars(
                 select(JournalEntry).order_by(JournalEntry.event_time.desc()).limit(self.settings.ai_journal_limit)
@@ -1117,27 +1116,16 @@ class AutonomousTradingAgentService:
             market_snapshot=market_snapshot,
             persisted_market_state=self.market_state_service.get_latest_protocol_market_state(session),
         )
-        runtime_skill_selection = self.skill_lifecycle_service.build_runtime_selection(
-            session,
-            skill_context=skill_context,
-            max_packets=self.settings.ai_runtime_skill_limit,
-            max_steps_per_packet=self.settings.ai_runtime_skill_step_limit,
-        )
-        runtime_claim_selection = self.knowledge_claim_service.build_runtime_selection(
+        runtime_selection = self.runtime_memory_service.build_selection(
             session,
             ticker=position.ticker,
             strategy_version_id=position.strategy_version_id,
-            max_packets=self.settings.ai_runtime_claim_limit,
-            max_evidence_per_packet=self.settings.ai_runtime_claim_evidence_limit,
+            skill_context=skill_context,
         )
-        runtime_skills = [item for item in runtime_skill_selection.get("packets", []) if isinstance(item, dict)]
-        runtime_claims = [item for item in runtime_claim_selection.get("packets", []) if isinstance(item, dict)]
-        protocol_context["runtime_skills"] = runtime_skills
-        protocol_context["runtime_claims"] = runtime_claims
-        protocol_context["context_budget"] = self._build_runtime_context_budget(
-            skill_budget=runtime_skill_selection.get("budget"),
-            claim_budget=runtime_claim_selection.get("budget"),
-        )
+        protocol_context["runtime_skills"] = list(runtime_selection.get("runtime_skills") or [])
+        protocol_context["runtime_claims"] = list(runtime_selection.get("runtime_claims") or [])
+        protocol_context["runtime_distillations"] = list(runtime_selection.get("runtime_distillations") or [])
+        protocol_context["context_budget"] = dict(runtime_selection.get("context_budget") or {})
         recent_journal = list(
             session.scalars(
                 select(JournalEntry).order_by(JournalEntry.event_time.desc()).limit(self.settings.ai_journal_limit)
@@ -1211,35 +1199,6 @@ class AutonomousTradingAgentService:
             ],
         }
 
-    def _build_runtime_context_budget(self, *, skill_budget: dict | None, claim_budget: dict | None) -> dict:
-        normalized_skill_budget = dict(skill_budget or {})
-        normalized_claim_budget = dict(claim_budget or {})
-        available_runtime_skill_count = int(normalized_skill_budget.get("available_count") or 0)
-        loaded_runtime_skill_count = int(normalized_skill_budget.get("loaded_count") or 0)
-        available_runtime_claim_count = int(normalized_claim_budget.get("available_count") or 0)
-        loaded_runtime_claim_count = int(normalized_claim_budget.get("loaded_count") or 0)
-        return {
-            "runtime_skills_enabled": bool(normalized_skill_budget.get("enabled")),
-            "max_runtime_skills": self.settings.ai_runtime_skill_limit,
-            "max_steps_per_skill": self.settings.ai_runtime_skill_step_limit,
-            "available_runtime_skill_count": available_runtime_skill_count,
-            "loaded_runtime_skill_count": loaded_runtime_skill_count,
-            "truncated_runtime_skill_count": max(available_runtime_skill_count - loaded_runtime_skill_count, 0),
-            "runtime_claims_enabled": bool(normalized_claim_budget.get("enabled")),
-            "max_runtime_claims": self.settings.ai_runtime_claim_limit,
-            "max_evidence_per_claim": self.settings.ai_runtime_claim_evidence_limit,
-            "available_runtime_claim_count": available_runtime_claim_count,
-            "loaded_runtime_claim_count": loaded_runtime_claim_count,
-            "truncated_runtime_claim_count": max(available_runtime_claim_count - loaded_runtime_claim_count, 0),
-            "runtime_skills": normalized_skill_budget,
-            "runtime_claims": normalized_claim_budget,
-            "available_runtime_item_count": available_runtime_skill_count + available_runtime_claim_count,
-            "loaded_runtime_item_count": loaded_runtime_skill_count + loaded_runtime_claim_count,
-            "policy": (
-                "load only context-relevant procedural skills and durable claims; reserve most model context for live market evidence"
-            ),
-        }
-
     def _build_runtime_skill_prompt(self, agent_protocol: dict | None) -> str:
         if not isinstance(agent_protocol, dict):
             return ""
@@ -1252,6 +1211,29 @@ class AutonomousTradingAgentService:
         runtime_claims = agent_protocol.get("runtime_claims")
         return self.knowledge_claim_service.render_runtime_claim_prompt(runtime_claims)
 
+    def _build_runtime_distillation_prompt(self, agent_protocol: dict | None) -> str:
+        if not isinstance(agent_protocol, dict):
+            return ""
+        runtime_distillations = agent_protocol.get("runtime_distillations")
+        return self._learning_memory_distillation_service().render_runtime_distillation_prompt(runtime_distillations)
+
+    def _build_runtime_supporting_memory_prompt(self, agent_protocol: dict | None) -> str:
+        fragments = [
+            self._build_runtime_claim_prompt(agent_protocol),
+            self._build_runtime_distillation_prompt(agent_protocol),
+        ]
+        return "\n\n".join(fragment.strip() for fragment in fragments if isinstance(fragment, str) and fragment.strip())
+
+    @staticmethod
+    def _extract_runtime_skills(context: dict | None) -> list[dict]:
+        if not isinstance(context, dict):
+            return []
+        agent_protocol = context.get("agent_protocol")
+        if not isinstance(agent_protocol, dict):
+            return []
+        runtime_skills = agent_protocol.get("runtime_skills")
+        return [item for item in runtime_skills if isinstance(item, dict)] if isinstance(runtime_skills, list) else []
+
     @staticmethod
     def _extract_runtime_claims(context: dict | None) -> list[dict]:
         if not isinstance(context, dict):
@@ -1263,6 +1245,20 @@ class AutonomousTradingAgentService:
         return [item for item in runtime_claims if isinstance(item, dict)] if isinstance(runtime_claims, list) else []
 
     @staticmethod
+    def _extract_runtime_distillations(context: dict | None) -> list[dict]:
+        if not isinstance(context, dict):
+            return []
+        agent_protocol = context.get("agent_protocol")
+        if not isinstance(agent_protocol, dict):
+            return []
+        runtime_distillations = agent_protocol.get("runtime_distillations")
+        return (
+            [item for item in runtime_distillations if isinstance(item, dict)]
+            if isinstance(runtime_distillations, list)
+            else []
+        )
+
+    @staticmethod
     def _extract_context_budget(context: dict | None) -> dict:
         if not isinstance(context, dict):
             return {}
@@ -1271,6 +1267,12 @@ class AutonomousTradingAgentService:
             return {}
         context_budget = agent_protocol.get("context_budget")
         return context_budget if isinstance(context_budget, dict) else {}
+
+    @staticmethod
+    def _learning_memory_distillation_service():
+        from app.domains.learning.services import LearningMemoryDistillationService
+
+        return LearningMemoryDistillationService()
 
     def _parse_decision(self, payload: dict, allowed_actions: set[str] | None = None) -> AgentDecision:
         allowed_actions = allowed_actions or {"paper_enter", "watch", "discard"}
@@ -1367,10 +1369,14 @@ class AutonomousTradingAgentService:
         signal_payload: dict,
         market_context: dict,
         decision: AgentDecision,
+        runtime_skills: list[dict] | None = None,
         runtime_claims: list[dict] | None = None,
+        runtime_distillations: list[dict] | None = None,
         context_budget: dict | None = None,
     ) -> None:
+        skill_payload = [item for item in (runtime_skills or []) if isinstance(item, dict)]
         claim_payload = [item for item in (runtime_claims or []) if isinstance(item, dict)]
+        distillation_payload = [item for item in (runtime_distillations or []) if isinstance(item, dict)]
         budget_payload = dict(context_budget or {})
         session.add(
             JournalEntry(
@@ -1402,7 +1408,9 @@ class AutonomousTradingAgentService:
                     "reasons_not_to_act": decision.reasons_not_to_act,
                     "claims_applied": decision.claims_applied,
                     "risks": decision.risks,
+                    "runtime_skills": skill_payload,
                     "runtime_claims": claim_payload,
+                    "runtime_distillations": distillation_payload,
                     "context_budget": budget_payload,
                     "raw_payload": decision.raw_payload,
                 },
@@ -1431,7 +1439,9 @@ class AutonomousTradingAgentService:
                     "claims_applied": decision.claims_applied,
                     "risks": decision.risks,
                     "lessons_applied": decision.lessons_applied,
+                    "runtime_skills": skill_payload,
                     "runtime_claims": claim_payload,
+                    "runtime_distillations": distillation_payload,
                     "context_budget": budget_payload,
                 },
                 importance=max(0.55, decision.confidence),
@@ -1448,10 +1458,14 @@ class AutonomousTradingAgentService:
         decision: AgentDecision,
         provider: str,
         model: str,
+        runtime_skills: list[dict] | None = None,
         runtime_claims: list[dict] | None = None,
+        runtime_distillations: list[dict] | None = None,
         context_budget: dict | None = None,
     ) -> None:
+        skill_payload = [item for item in (runtime_skills or []) if isinstance(item, dict)]
         claim_payload = [item for item in (runtime_claims or []) if isinstance(item, dict)]
+        distillation_payload = [item for item in (runtime_distillations or []) if isinstance(item, dict)]
         budget_payload = dict(context_budget or {})
         session.add(
             JournalEntry(
@@ -1479,7 +1493,9 @@ class AutonomousTradingAgentService:
                     "reasons_not_to_act": decision.reasons_not_to_act,
                     "claims_applied": decision.claims_applied,
                     "risks": decision.risks,
+                    "runtime_skills": skill_payload,
                     "runtime_claims": claim_payload,
+                    "runtime_distillations": distillation_payload,
                     "context_budget": budget_payload,
                     "raw_payload": decision.raw_payload,
                 },
@@ -1509,7 +1525,9 @@ class AutonomousTradingAgentService:
                     "claims_applied": decision.claims_applied,
                     "risks": decision.risks,
                     "lessons_applied": decision.lessons_applied,
+                    "runtime_skills": skill_payload,
                     "runtime_claims": claim_payload,
+                    "runtime_distillations": distillation_payload,
                     "context_budget": budget_payload,
                 },
                 importance=max(0.55, decision.confidence),

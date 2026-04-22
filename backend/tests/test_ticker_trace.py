@@ -104,6 +104,21 @@ def test_ticker_trace_unifies_signal_journal_and_positions(client, session) -> N
         reasoning="AI context budget loaded one skill and one claim.",
         decision="watch",
         observations={
+            "runtime_skills": [
+                {
+                    "skill_code": "detect_risk_off_conditions",
+                    "selection_reason": "Macro uncertainty is degrading breakout quality.",
+                    "instruction_source": "catalog_plus_active_revision",
+                    "validated_revision_id": 77,
+                }
+            ],
+            "runtime_distillations": [
+                {
+                    "key": "distill:skill-gap:lzm-breakout",
+                    "distillation_type": "skill_gap_digest",
+                    "review_action": "collapse",
+                }
+            ],
             "context_budget": {
                 "runtime_skills": {
                     "available_count": 2,
@@ -114,6 +129,11 @@ def test_ticker_trace_unifies_signal_journal_and_positions(client, session) -> N
                     "available_count": 2,
                     "loaded_count": 1,
                     "truncated_count": 1,
+                },
+                "runtime_distillations": {
+                    "available_count": 1,
+                    "loaded_count": 1,
+                    "truncated_count": 0,
                 },
             }
         },
@@ -147,6 +167,8 @@ def test_ticker_trace_unifies_signal_journal_and_positions(client, session) -> N
     assert summary["latest_loaded_runtime_skill_count"] == 1
     assert summary["latest_available_runtime_claim_count"] == 2
     assert summary["latest_loaded_runtime_claim_count"] == 1
+    assert summary["latest_available_runtime_distillation_count"] == 1
+    assert summary["latest_loaded_runtime_distillation_count"] == 1
     assert summary["latest_runtime_budget_truncated"] is True
     assert "macro_uncertainty" in summary["latest_guard_reason"]
 
@@ -168,6 +190,8 @@ def test_ticker_trace_unifies_signal_journal_and_positions(client, session) -> N
     )
     assert ai_journal_event["details"]["context_budget"]["runtime_skills"]["loaded_count"] == 1
     assert ai_journal_event["details"]["context_budget"]["runtime_claims"]["truncated_count"] == 1
+    assert ai_journal_event["details"]["runtime_skills"][0]["skill_code"] == "detect_risk_off_conditions"
+    assert ai_journal_event["details"]["runtime_distillations"][0]["key"] == "distill:skill-gap:lzm-breakout"
 
     journal_event = next(
         item

@@ -36,6 +36,10 @@ from app.domains.learning.schemas import (
     MacroContextRead,
     MacroSignalCreate,
     MacroSignalRead,
+    MemoryDistillationRequest,
+    MemoryDistillationReviewRequest,
+    MemoryDistillationReviewResult,
+    MemoryDistillationResult,
     MemoryItemCreate,
     MemoryItemRead,
     OrchestratorActResponse,
@@ -49,6 +53,7 @@ from app.domains.learning.schemas import (
     OperatorDisagreementSummaryRead,
     PDCACycleCreate,
     PDCACycleRead,
+    RuntimeMemoryInspectionRead,
     SkillCandidateRead,
     SkillCandidateValidationRequest,
     SkillCandidateValidationResult,
@@ -56,6 +61,12 @@ from app.domains.learning.schemas import (
     SkillDashboardRead,
     SkillGapRead,
     SkillGapReviewRequest,
+    SkillPortableArtifactRead,
+    SkillPortableImportRequest,
+    SkillPortableImportResult,
+    SkillProposalRead,
+    SkillProposalReviewRequest,
+    SkillProposalReviewResult,
     SkillProvenanceRead,
     SkillRevisionRead,
     SkillValidationCompareRead,
@@ -66,13 +77,16 @@ from app.domains.learning.schemas import (
 from app.domains.learning.claims import ClaimEvidenceSeed, ClaimSeed, KnowledgeClaimService
 from app.domains.learning.conversations import ChatConversationService
 from app.domains.learning.operator_feedback import OperatorDisagreementService
-from app.domains.learning.skills import SkillCatalogService, SkillGapService, SkillLifecycleService
+from app.domains.learning.portable_skills import SkillPortableArtifactService
+from app.domains.learning.runtime_memory import LearningRuntimeMemoryService
+from app.domains.learning.skills import SkillCatalogService, SkillGapService, SkillLifecycleService, SkillWorkshopService
 from app.domains.learning.workflows import LearningWorkflowService
 from app.domains.learning.services import (
     AutoReviewService,
     BotChatService,
     FailureAnalysisService,
     JournalService,
+    LearningMemoryDistillationService,
     MemoryService,
     OrchestratorService,
     PDCACycleService,
@@ -99,6 +113,7 @@ feedback_router = APIRouter()
 journal_service = JournalService()
 ticker_trace_service = TickerDecisionTraceService()
 memory_service = MemoryService()
+learning_memory_distillation_service = LearningMemoryDistillationService()
 failure_analysis_service = FailureAnalysisService()
 auto_review_service = AutoReviewService()
 pdca_service = PDCACycleService()
@@ -110,7 +125,16 @@ market_state_service = MarketStateService()
 agent_tool_gateway_service = AgentToolGatewayService()
 skill_catalog_service = SkillCatalogService()
 skill_lifecycle_service = SkillLifecycleService(catalog_service=skill_catalog_service)
+skill_workshop_service = SkillWorkshopService(catalog_service=skill_catalog_service)
+skill_portable_service = SkillPortableArtifactService(
+    catalog_service=skill_catalog_service,
+    skill_lifecycle_service=skill_lifecycle_service,
+)
 knowledge_claim_service = KnowledgeClaimService()
+runtime_memory_service = LearningRuntimeMemoryService(
+    skill_lifecycle_service=skill_lifecycle_service,
+    knowledge_claim_service=knowledge_claim_service,
+)
 learning_workflow_service = LearningWorkflowService()
 operator_disagreement_service = OperatorDisagreementService()
 
@@ -207,6 +231,112 @@ async def retrieve_memory_context(
 @memory_router.post("", response_model=MemoryItemRead, status_code=status.HTTP_201_CREATED)
 async def create_memory_item(payload: MemoryItemCreate, session: Session = Depends(get_db_session)) -> MemoryItemRead:
     return memory_service.create_item(session, payload)
+
+
+@memory_router.get("/runtime-inspect", response_model=RuntimeMemoryInspectionRead, status_code=status.HTTP_200_OK)
+async def inspect_runtime_memory(
+    ticker: str | None = Query(default=None, max_length=12),
+    strategy_version_id: int | None = Query(default=None, ge=1),
+    skill_codes: str | None = Query(default=None, max_length=400),
+    phase: str | None = Query(default=None, max_length=32),
+    session: Session = Depends(get_db_session),
+) -> RuntimeMemoryInspectionRead:
+    parsed_skill_codes = [
+        part.strip()
+        for part in str(skill_codes or "").split(",")
+        if str(part).strip()
+    ]
+    if not ticker and strategy_version_id is None and not parsed_skill_codes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Runtime memory inspection requires ticker, strategy_version_id or skill_codes.",
+        )
+    payload = runtime_memory_service.inspect_selection(
+        session,
+        ticker=ticker,
+        strategy_version_id=strategy_version_id,
+        skill_codes=parsed_skill_codes,
+        phase=phase,
+    )
+    return RuntimeMemoryInspectionRead.model_validate(payload)
+
+
+@memory_router.post("/maintenance/distill", response_model=MemoryDistillationResult, status_code=status.HTTP_200_OK)
+async def distill_memory_items(
+    payload: MemoryDistillationRequest,
+    session: Session = Depends(get_db_session),
+) -> MemoryDistillationResult:
+    try:
+        result = learning_memory_distillation_service.distill_memory(
+            session,
+            dry_run=payload.dry_run,
+            include_claim_reviews=payload.include_claim_reviews,
+            include_operator_feedback=payload.include_operator_feedback,
+            include_skill_gaps=payload.include_skill_gaps,
+            include_skill_candidates=payload.include_skill_candidates,
+            claim_limit=payload.claim_limit,
+            disagreement_limit=payload.disagreement_limit,
+            skill_gap_limit=payload.skill_gap_limit,
+            skill_candidate_limit=payload.skill_candidate_limit,
+            min_group_size=payload.min_group_size,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return MemoryDistillationResult.model_validate(result)
+
+
+@memory_router.get("/maintenance/digests", response_model=list[MemoryItemRead], status_code=status.HTTP_200_OK)
+async def list_memory_distillation_digests(
+    distillation_type: str | None = Query(default=None),
+    include_reviewed: bool = Query(default=True),
+    limit: int = Query(default=100, ge=1, le=200),
+    session: Session = Depends(get_db_session),
+) -> list[MemoryItemRead]:
+    return learning_memory_distillation_service.list_digests(
+        session,
+        limit=limit,
+        distillation_type=distillation_type,
+        include_reviewed=include_reviewed,
+    )
+
+
+@memory_router.get("/maintenance/digests/{digest_id}", response_model=MemoryItemRead, status_code=status.HTTP_200_OK)
+async def get_memory_distillation_digest(
+    digest_id: int,
+    session: Session = Depends(get_db_session),
+) -> MemoryItemRead:
+    digest = learning_memory_distillation_service.get_digest(session, digest_id=digest_id)
+    if digest is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Learning distillation digest not found.")
+    return digest
+
+
+@memory_router.post(
+    "/maintenance/digests/{digest_id}/review",
+    response_model=MemoryDistillationReviewResult,
+    status_code=status.HTTP_200_OK,
+)
+async def review_memory_distillation_digest(
+    digest_id: int,
+    payload: MemoryDistillationReviewRequest,
+    session: Session = Depends(get_db_session),
+) -> MemoryDistillationReviewResult:
+    try:
+        result = learning_memory_distillation_service.review_digest(
+            session,
+            digest_id=digest_id,
+            action=payload.action,
+            summary=payload.summary,
+            keep_entity_id=payload.keep_entity_id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = status.HTTP_404_NOT_FOUND if "not found" in detail.lower() else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return MemoryDistillationReviewResult(
+        digest=MemoryItemRead.model_validate(result["digest"]),
+        effect=dict(result.get("effect") or {}),
+    )
 
 
 @feedback_router.get("", response_model=list[OperatorDisagreementRead], status_code=status.HTTP_200_OK)
@@ -458,10 +588,18 @@ async def list_learning_workflows(
     include_resolved: bool = Query(default=True),
     limit: int = Query(default=10, ge=1, le=50),
     history_limit: int = Query(default=4, ge=1, le=20),
+    run_limit: int = Query(default=2, ge=0, le=10),
+    artifact_limit: int = Query(default=4, ge=0, le=20),
     session: Session = Depends(get_db_session),
 ) -> list[LearningWorkflowRead]:
     return [
-        learning_workflow_service.to_read_model(item, history_limit=history_limit)
+        learning_workflow_service.to_read_model(
+            session,
+            item,
+            history_limit=history_limit,
+            run_limit=run_limit,
+            artifact_limit=artifact_limit,
+        )
         for item in learning_workflow_service.list_workflows(
             session,
             sync=sync,
@@ -475,19 +613,36 @@ async def list_learning_workflows(
 async def get_learning_workflow(
     workflow_id: int,
     history_limit: int = Query(default=12, ge=1, le=50),
+    run_limit: int = Query(default=6, ge=0, le=20),
+    artifact_limit: int = Query(default=6, ge=0, le=20),
     session: Session = Depends(get_db_session),
 ) -> LearningWorkflowRead:
     workflow = learning_workflow_service.get_workflow(session, workflow_id=workflow_id)
     if workflow is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Learning workflow not found.")
-    return learning_workflow_service.to_read_model(workflow, history_limit=history_limit)
+    return learning_workflow_service.to_read_model(
+        session,
+        workflow,
+        history_limit=history_limit,
+        run_limit=run_limit,
+        artifact_limit=artifact_limit,
+    )
 
 
 @workflows_router.post("/sync", response_model=list[LearningWorkflowRead], status_code=status.HTTP_200_OK)
 async def sync_learning_workflows(session: Session = Depends(get_db_session)) -> list[LearningWorkflowRead]:
     return [
-        learning_workflow_service.to_read_model(item, history_limit=6)
-        for item in learning_workflow_service.sync_default_workflows(session)
+        learning_workflow_service.to_read_model(
+            session,
+            item,
+            history_limit=6,
+            run_limit=4,
+            artifact_limit=6,
+        )
+        for item in learning_workflow_service.sync_default_workflows(
+            session,
+            trigger_source="api_sync_endpoint",
+        )
     ]
 
 
@@ -505,13 +660,23 @@ async def apply_learning_workflow_action(
             entity_id=payload.entity_id,
             action=payload.action,
             summary=payload.summary,
+            claims=payload.claims,
+            research_tasks=payload.research_tasks,
+            skill_gaps=payload.skill_gaps,
+            skill_candidates=payload.skill_candidates,
         )
     except ValueError as exc:
         detail = str(exc)
         status_code = status.HTTP_404_NOT_FOUND if "not found" in detail.lower() else status.HTTP_400_BAD_REQUEST
         raise HTTPException(status_code=status_code, detail=detail) from exc
     return LearningWorkflowActionResult(
-        workflow=learning_workflow_service.to_read_model(workflow, history_limit=12),
+        workflow=learning_workflow_service.to_read_model(
+            session,
+            workflow,
+            history_limit=12,
+            run_limit=6,
+            artifact_limit=6,
+        ),
         effect=effect,
     )
 
@@ -519,6 +684,71 @@ async def apply_learning_workflow_action(
 @skills_router.get("/catalog", response_model=list[SkillDefinitionRead], status_code=status.HTTP_200_OK)
 async def list_skill_catalog(session: Session = Depends(get_db_session)) -> list[SkillDefinitionRead]:
     return [SkillDefinitionRead.model_validate(item) for item in skill_lifecycle_service.list_catalog(session)]
+
+
+@skills_router.get("/proposals", response_model=list[SkillProposalRead], status_code=status.HTTP_200_OK)
+async def list_skill_proposals(
+    sync: bool = Query(default=False),
+    include_resolved: bool = Query(default=False),
+    limit: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_db_session),
+) -> list[SkillProposalRead]:
+    if sync:
+        return [
+            SkillProposalRead.model_validate(item)
+            for item in skill_workshop_service.sync_proposals(session, limit_per_source=min(limit, 50))
+        ]
+    return [
+        SkillProposalRead.model_validate(item)
+        for item in skill_workshop_service.list_proposals(
+            session,
+            limit=limit,
+            include_resolved=include_resolved,
+        )
+    ]
+
+
+@skills_router.post("/proposals/sync", response_model=list[SkillProposalRead], status_code=status.HTTP_200_OK)
+async def sync_skill_proposals(
+    limit_per_source: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_db_session),
+) -> list[SkillProposalRead]:
+    return [
+        SkillProposalRead.model_validate(item)
+        for item in skill_workshop_service.sync_proposals(session, limit_per_source=limit_per_source)
+    ]
+
+
+@skills_router.get("/proposals/{proposal_id}", response_model=SkillProposalRead, status_code=status.HTTP_200_OK)
+async def get_skill_proposal(proposal_id: int, session: Session = Depends(get_db_session)) -> SkillProposalRead:
+    proposal = skill_workshop_service.get_proposal(session, proposal_id=proposal_id)
+    if proposal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill proposal not found.")
+    return SkillProposalRead.model_validate(proposal)
+
+
+@skills_router.post(
+    "/proposals/{proposal_id}/review",
+    response_model=SkillProposalReviewResult,
+    status_code=status.HTTP_200_OK,
+)
+async def review_skill_proposal(
+    proposal_id: int,
+    payload: SkillProposalReviewRequest,
+    session: Session = Depends(get_db_session),
+) -> SkillProposalReviewResult:
+    try:
+        result = skill_workshop_service.review_proposal(
+            session,
+            proposal_id=proposal_id,
+            outcome=payload.outcome,
+            summary=payload.summary,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = status.HTTP_404_NOT_FOUND if "not found" in detail.lower() else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return SkillProposalReviewResult.model_validate(result)
 
 
 @skills_router.get("/candidates", response_model=list[SkillCandidateRead], status_code=status.HTTP_200_OK)
@@ -564,6 +794,51 @@ async def get_skill_revision(revision_id: int, session: Session = Depends(get_db
     if revision is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill revision not found.")
     return SkillRevisionRead.model_validate(revision)
+
+
+@skills_router.get(
+    "/revisions/{revision_id}/portable",
+    response_model=SkillPortableArtifactRead,
+    status_code=status.HTTP_200_OK,
+)
+async def export_skill_revision_portable_artifact(
+    revision_id: int,
+    session: Session = Depends(get_db_session),
+) -> SkillPortableArtifactRead:
+    try:
+        artifact = skill_portable_service.export_revision(session, revision_id=revision_id)
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = status.HTTP_404_NOT_FOUND if "not found" in detail.lower() else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return SkillPortableArtifactRead.model_validate(artifact)
+
+
+@skills_router.post("/portable/import", response_model=SkillPortableImportResult, status_code=status.HTTP_200_OK)
+async def import_portable_skill_artifact(
+    payload: SkillPortableImportRequest,
+    session: Session = Depends(get_db_session),
+) -> SkillPortableImportResult:
+    try:
+        result = skill_portable_service.import_artifact(
+            session,
+            format=payload.format,
+            content=payload.content,
+            import_as=payload.import_as,
+            scope=payload.scope,
+            key=payload.key,
+            summary=payload.summary,
+            target_skill_code=payload.target_skill_code,
+            candidate_action=payload.candidate_action,
+            ticker=payload.ticker,
+            strategy_version_id=payload.strategy_version_id,
+            candidate_id=payload.candidate_id,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        status_code = status.HTTP_404_NOT_FOUND if "not found" in detail.lower() else status.HTTP_400_BAD_REQUEST
+        raise HTTPException(status_code=status_code, detail=detail) from exc
+    return SkillPortableImportResult.model_validate(result)
 
 
 @skills_router.get("/validations", response_model=list[SkillValidationRecordRead], status_code=status.HTTP_200_OK)
