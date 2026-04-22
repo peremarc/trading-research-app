@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
@@ -11,6 +11,10 @@ from app.domains.market.schemas import (
     MarketSnapshotRead,
     NewsArticleRead,
     OHLCVCandleRead,
+    ResearchBacktestBatchSyncRead,
+    ResearchBacktestCreate,
+    ResearchBacktestProviderContextRead,
+    ResearchBacktestRead,
     ResearchTaskComplete,
     ResearchTaskCreate,
     ResearchTaskRead,
@@ -18,6 +22,11 @@ from app.domains.market.schemas import (
     TradeSignalRead,
     TradeSignalStatusUpdate,
     WorkQueueRead,
+)
+from app.domains.market.backtesting import (
+    ResearchBacktestDependencyError,
+    ResearchBacktestNotFoundError,
+    ResearchBacktestService,
 )
 from app.domains.market.analysis import FusedAnalysisService, normalize_chart_timeframe
 from app.domains.market.services import (
@@ -30,6 +39,7 @@ from app.domains.market.services import (
     WorkQueueService,
 )
 from app.providers.calendar import CalendarProviderError
+from app.providers.backtesting import BacktestingProviderError
 from app.providers.news import NewsProviderError
 
 analysis_router = APIRouter()
@@ -47,11 +57,20 @@ signal_service = SignalService()
 research_service = ResearchService()
 work_queue_service = WorkQueueService()
 news_service = NewsService()
+research_backtest_service = ResearchBacktestService()
 calendar_service = CalendarService()
 
 
 def _get_fused_analysis_service():
     return FusedAnalysisService()
+
+
+def get_research_backtest_service(request: Request) -> ResearchBacktestService:
+    service = getattr(request.app.state, "market_backtest_service", None)
+    if service is None:
+        service = research_backtest_service
+        request.app.state.market_backtest_service = service
+    return service
 
 
 @analysis_router.get("", response_model=list[AnalysisRunRead])
@@ -144,6 +163,100 @@ async def complete_research_task(
         return research_service.complete_task(session, task_id, payload.result_summary)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@research_router.get("/backtests", response_model=list[ResearchBacktestRead])
+async def list_research_backtests(
+    status_filter: str | None = Query(default=None, alias="status"),
+    strategy_id: int | None = None,
+    research_task_id: int | None = None,
+    skill_candidate_id: int | None = None,
+    session: Session = Depends(get_db_session),
+    backtest_service: ResearchBacktestService = Depends(get_research_backtest_service),
+) -> list[ResearchBacktestRead]:
+    return backtest_service.list_runs(
+        session,
+        status=status_filter,
+        strategy_id=strategy_id,
+        research_task_id=research_task_id,
+        skill_candidate_id=skill_candidate_id,
+    )
+
+
+@research_router.post("/backtests", response_model=ResearchBacktestRead, status_code=status.HTTP_202_ACCEPTED)
+async def create_research_backtest(
+    payload: ResearchBacktestCreate,
+    session: Session = Depends(get_db_session),
+    backtest_service: ResearchBacktestService = Depends(get_research_backtest_service),
+) -> ResearchBacktestRead:
+    try:
+        return backtest_service.submit_run(session, payload)
+    except ResearchBacktestDependencyError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except BacktestingProviderError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+
+@research_router.get("/backtests/provider/context", response_model=ResearchBacktestProviderContextRead)
+async def get_research_backtesting_context(
+    backtest_service: ResearchBacktestService = Depends(get_research_backtest_service),
+) -> ResearchBacktestProviderContextRead:
+    try:
+        return backtest_service.provider_context()
+    except BacktestingProviderError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+
+@research_router.post("/backtests/sync-pending", response_model=ResearchBacktestBatchSyncRead)
+async def sync_pending_research_backtests(
+    limit: int | None = Query(default=None, ge=1, le=100),
+    session: Session = Depends(get_db_session),
+    backtest_service: ResearchBacktestService = Depends(get_research_backtest_service),
+) -> ResearchBacktestBatchSyncRead:
+    try:
+        return backtest_service.sync_non_terminal_runs(session, limit=limit, emit_events=True)
+    except BacktestingProviderError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+
+@research_router.get("/backtests/{backtest_id}", response_model=ResearchBacktestRead)
+async def get_research_backtest(
+    backtest_id: int,
+    session: Session = Depends(get_db_session),
+    backtest_service: ResearchBacktestService = Depends(get_research_backtest_service),
+) -> ResearchBacktestRead:
+    try:
+        return backtest_service.get_run(session, backtest_id)
+    except ResearchBacktestNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@research_router.post("/backtests/{backtest_id}/sync", response_model=ResearchBacktestRead)
+async def sync_research_backtest(
+    backtest_id: int,
+    session: Session = Depends(get_db_session),
+    backtest_service: ResearchBacktestService = Depends(get_research_backtest_service),
+) -> ResearchBacktestRead:
+    try:
+        return backtest_service.sync_run(session, backtest_id)
+    except ResearchBacktestNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except BacktestingProviderError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+
+@research_router.post("/backtests/{backtest_id}/cancel", response_model=ResearchBacktestRead)
+async def cancel_research_backtest(
+    backtest_id: int,
+    session: Session = Depends(get_db_session),
+    backtest_service: ResearchBacktestService = Depends(get_research_backtest_service),
+) -> ResearchBacktestRead:
+    try:
+        return backtest_service.cancel_run(session, backtest_id)
+    except ResearchBacktestNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except BacktestingProviderError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
 
 @news_router.get("", response_model=list[NewsArticleRead])

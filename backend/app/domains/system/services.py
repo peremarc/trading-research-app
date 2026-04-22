@@ -610,6 +610,22 @@ class LearningGovernanceRuntimeState:
     last_open_items: int = 0
 
 
+@dataclass
+class BacktestingReconciliationRuntimeState:
+    enabled: bool = False
+    status: str = "idle"
+    interval_seconds: int = 30
+    batch_size: int = 10
+    last_sync_started_at: datetime | None = None
+    last_sync_completed_at: datetime | None = None
+    sync_runs: int = 0
+    last_error: str | None = None
+    last_attempted: int = 0
+    last_updated: int = 0
+    last_terminal: int = 0
+    last_failed: int = 0
+
+
 class SchedulerService:
     MARKET_DATA_PROBE_TICKER = "SPY"
 
@@ -623,6 +639,7 @@ class SchedulerService:
         market_data_service: MarketDataService | None = None,
         learning_workflow_service: LearningWorkflowService | None = None,
         journal_service: JournalService | None = None,
+        research_backtest_service: object | None = None,
     ) -> None:
         self.settings = settings
         self.market_data_service = market_data_service or MarketDataService(cache_ttl_seconds=15)
@@ -635,6 +652,7 @@ class SchedulerService:
         self.event_log_service = event_log_service or EventLogService()
         self.learning_workflow_service = learning_workflow_service or LearningWorkflowService()
         self.journal_service = journal_service or JournalService()
+        self.research_backtest_service = research_backtest_service
         self.realtime_monitor_service = realtime_monitor_service or IBKRRealtimePositionMonitorService(settings)
         self.market_hours_service = USMarketHoursService()
         self.scheduler = BackgroundScheduler(timezone=settings.scheduler_timezone)
@@ -643,6 +661,11 @@ class SchedulerService:
         self.learning_governance = LearningGovernanceRuntimeState(
             enabled=bool(settings.learning_workflow_governance_enabled),
             interval_minutes=max(int(settings.learning_workflow_governance_interval_minutes), 1),
+        )
+        self.backtesting_reconciliation = BacktestingReconciliationRuntimeState(
+            enabled=bool(settings.backtesting_enabled and settings.backtesting_reconcile_enabled),
+            interval_seconds=max(int(settings.backtesting_reconcile_interval_seconds), 1),
+            batch_size=max(int(settings.backtesting_reconcile_batch_size), 1),
         )
 
     def configure(self) -> None:
@@ -681,6 +704,17 @@ class SchedulerService:
                 coalesce=True,
                 next_run_time=datetime.now(timezone.utc),
             )
+        if self.backtesting_reconciliation.enabled:
+            self.scheduler.add_job(
+                self._run_backtesting_reconciliation_job,
+                "interval",
+                seconds=self.backtesting_reconciliation.interval_seconds,
+                id="backtesting_reconciliation_job",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                next_run_time=datetime.now(timezone.utc),
+            )
         self._configured = True
 
     def boot(self) -> None:
@@ -699,6 +733,11 @@ class SchedulerService:
         self.learning_governance = LearningGovernanceRuntimeState(
             enabled=bool(self.settings.learning_workflow_governance_enabled),
             interval_minutes=max(int(self.settings.learning_workflow_governance_interval_minutes), 1),
+        )
+        self.backtesting_reconciliation = BacktestingReconciliationRuntimeState(
+            enabled=bool(self.settings.backtesting_enabled and self.settings.backtesting_reconcile_enabled),
+            interval_seconds=max(int(self.settings.backtesting_reconcile_interval_seconds), 1),
+            batch_size=max(int(self.settings.backtesting_reconcile_batch_size), 1),
         )
         self.trading_agent_service.reset_runtime_state()
 
@@ -831,6 +870,7 @@ class SchedulerService:
             },
             "ai": ai_payload,
             "learning_governance": self._get_learning_governance_status_payload(),
+            "backtesting_reconciliation": self._get_backtesting_reconciliation_status_payload(),
             "market_data": self._get_market_data_status_payload(),
             "monitor": self.realtime_monitor_service.get_status_payload(),
         }
@@ -905,6 +945,34 @@ class SchedulerService:
         self.learning_governance.last_open_workflows = report.open_workflow_count
         self.learning_governance.last_open_items = report.open_item_count
 
+    def _run_backtesting_reconciliation_job(self) -> None:
+        if not self.backtesting_reconciliation.enabled:
+            return
+
+        self.backtesting_reconciliation.status = "running"
+        self.backtesting_reconciliation.last_sync_started_at = datetime.now(timezone.utc)
+        self.backtesting_reconciliation.last_error = None
+        try:
+            with SessionLocal() as session:
+                result = self._get_research_backtest_service().sync_non_terminal_runs(
+                    session,
+                    limit=self.backtesting_reconciliation.batch_size,
+                    emit_events=True,
+                )
+        except Exception as exc:
+            self.backtesting_reconciliation.status = "error"
+            self.backtesting_reconciliation.last_error = str(exc)
+            return
+
+        self.backtesting_reconciliation.status = "idle"
+        self.backtesting_reconciliation.last_sync_completed_at = datetime.now(timezone.utc)
+        self.backtesting_reconciliation.sync_runs += 1
+        self.backtesting_reconciliation.last_attempted = result.attempted
+        self.backtesting_reconciliation.last_updated = result.updated
+        self.backtesting_reconciliation.last_terminal = result.terminal
+        self.backtesting_reconciliation.last_failed = result.failed
+        self.backtesting_reconciliation.last_error = result.errors[0].error if result.errors else None
+
     def _schedule_next_cycle(self) -> None:
         if self.settings.scheduler_mode != "continuous":
             return
@@ -944,6 +1012,13 @@ class SchedulerService:
         except Exception:
             return
 
+    def _get_research_backtest_service(self):
+        if self.research_backtest_service is None:
+            from app.domains.market.backtesting import ResearchBacktestService
+
+            self.research_backtest_service = ResearchBacktestService(settings=self.settings)
+        return self.research_backtest_service
+
     def _request_cycle_run(self) -> None:
         run_date = datetime.now(timezone.utc)
         if self.settings.scheduler_mode == "continuous":
@@ -966,6 +1041,26 @@ class SchedulerService:
             max_instances=1,
             coalesce=True,
         )
+
+    def _get_backtesting_reconciliation_status_payload(self) -> dict:
+        return {
+            "enabled": self.backtesting_reconciliation.enabled,
+            "status": self.backtesting_reconciliation.status,
+            "interval_seconds": self.backtesting_reconciliation.interval_seconds,
+            "batch_size": self.backtesting_reconciliation.batch_size,
+            "last_sync_started_at": self.backtesting_reconciliation.last_sync_started_at.isoformat()
+            if self.backtesting_reconciliation.last_sync_started_at
+            else None,
+            "last_sync_completed_at": self.backtesting_reconciliation.last_sync_completed_at.isoformat()
+            if self.backtesting_reconciliation.last_sync_completed_at
+            else None,
+            "sync_runs": self.backtesting_reconciliation.sync_runs,
+            "last_error": self.backtesting_reconciliation.last_error,
+            "last_attempted": self.backtesting_reconciliation.last_attempted,
+            "last_updated": self.backtesting_reconciliation.last_updated,
+            "last_terminal": self.backtesting_reconciliation.last_terminal,
+            "last_failed": self.backtesting_reconciliation.last_failed,
+        }
 
     def _execute_automation_cycle(self) -> None:
         autonomous_orchestrator = self.orchestrator_service

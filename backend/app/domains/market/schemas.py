@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -145,6 +146,73 @@ class ResearchTaskRead(BaseModel):
     completed_at: datetime | None
 
     model_config = {"from_attributes": True}
+
+
+class ResearchBacktestCreate(BaseModel):
+    requested_by: str | None = None
+    reason: str | None = None
+    strategy_id: int | None = None
+    strategy_version_id: int | None = None
+    research_task_id: int | None = None
+    skill_candidate_id: int | None = None
+    linked_entity_type: str | None = None
+    linked_entity_id: str | None = None
+    spec: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchBacktestRead(BaseModel):
+    id: int
+    remote_run_id: str
+    provider: str
+    status: str
+    engine: str | None = None
+    spec_version: str | None = None
+    dataset_version: str | None = None
+    strategy_id: int | None = None
+    strategy_version_id: int | None = None
+    research_task_id: int | None = None
+    skill_candidate_id: int | None = None
+    linked_entity_type: str | None = None
+    linked_entity_id: str | None = None
+    target_type: str | None = None
+    target_code: str | None = None
+    target_version: str | None = None
+    requested_by: str | None = None
+    source_app: str | None = None
+    latest_run_payload: dict[str, Any] = Field(default_factory=dict)
+    summary_metrics: dict[str, Any] = Field(default_factory=dict)
+    artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+    backtest_spec: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+    submitted_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    last_synced_at: datetime | None = None
+    updated_at: datetime
+    remote_urls: dict[str, str] = Field(default_factory=dict)
+
+
+class ResearchBacktestProviderContextRead(BaseModel):
+    configured: bool
+    provider: str
+    base_url: str | None = None
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    ai_context: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchBacktestSyncErrorRead(BaseModel):
+    backtest_id: int
+    remote_run_id: str
+    error: str
+
+
+class ResearchBacktestBatchSyncRead(BaseModel):
+    attempted: int
+    updated: int
+    terminal: int
+    failed: int
+    items: list[ResearchBacktestRead] = Field(default_factory=list)
+    errors: list[ResearchBacktestSyncErrorRead] = Field(default_factory=list)
 
 
 class NewsArticleRead(BaseModel):

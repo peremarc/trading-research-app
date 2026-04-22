@@ -137,6 +137,21 @@ class LearningGovernanceRuntimeRead(BaseModel):
     last_open_items: int = 0
 
 
+class BacktestingReconciliationRuntimeRead(BaseModel):
+    enabled: bool
+    status: str
+    interval_seconds: int
+    batch_size: int
+    last_sync_started_at: str | None = None
+    last_sync_completed_at: str | None = None
+    sync_runs: int
+    last_error: str | None = None
+    last_attempted: int = 0
+    last_updated: int = 0
+    last_terminal: int = 0
+    last_failed: int = 0
+
+
 class SchedulerStatusRead(BaseModel):
     enabled: bool
     running: bool
@@ -144,5 +159,6 @@ class SchedulerStatusRead(BaseModel):
     bot: BotRuntimeRead
     ai: AIAgentRuntimeRead
     learning_governance: LearningGovernanceRuntimeRead
+    backtesting_reconciliation: BacktestingReconciliationRuntimeRead
     market_data: MarketDataRuntimeRead
     monitor: MarketMonitorRuntimeRead
